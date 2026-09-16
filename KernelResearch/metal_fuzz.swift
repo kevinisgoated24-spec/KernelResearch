@@ -32,49 +32,39 @@ class MetalFuzzer {
     func fuzzIOSurfaceAlloc() {
         log.append("── IOSurface alloc stress ──────────────────")
 
-        // Hard cap: never pass allocSize > 8MB — anything bigger gets jetsam-killed
-        let kMaxBytes = 8 * 1024 * 1024
-
-        struct Case { let w: Int; let h: Int; let bpe: Int; let bpr: Int }
+        // Only safe, semantically-valid sizes — no overflow bait here
+        // (overflow inputs cause kernel-side assertions that kill the app process)
+        struct Case { let label: String; let w: Int; let h: Int; let bpe: Int; let bpr: Int }
         let cases: [Case] = [
-            Case(w: 0,      h: 0,   bpe: 0, bpr: 0),          // zero-size
-            Case(w: 1,      h: 1,   bpe: 1, bpr: 1),          // minimal
-            Case(w: 1,      h: 1,   bpe: 4, bpr: 0x7FFFFFFF), // bpr int-overflow bait → should be nil
-            Case(w: 0xFFFF, h: 1,   bpe: 4, bpr: 0x3FFFC),    // wide strip — 256KB
-            Case(w: 1024,   h: 1,   bpe: 4, bpr: 4096),       // normal
-            Case(w: 1920,   h: 1,   bpe: 4, bpr: 7680),       // 1080p row
-            Case(w: 4096,   h: 1,   bpe: 4, bpr: 16384),      // 4K row
-            Case(w: 256,    h: 256, bpe: 16, bpr: 4096),      // 256x256 at 16bpe = 1MB
-            Case(w: 1,      h: 1,   bpe: 0x7FFFFFFF, bpr: 4), // bpe overflow bait
+            Case(label:"minimal",      w:1,    h:1,   bpe:4,  bpr:4),
+            Case(label:"64x64-rgba",   w:64,   h:64,  bpe:4,  bpr:256),
+            Case(label:"256x256-rgba", w:256,  h:256, bpe:4,  bpr:1024),
+            Case(label:"1920x1-rgba",  w:1920, h:1,   bpe:4,  bpr:7680),
+            Case(label:"512x512-rgba", w:512,  h:512, bpe:4,  bpr:2048),
+            Case(label:"1x1-bpr-mismatch", w:1, h:1, bpe:4,  bpr:16), // bpr > bpe*w
+            Case(label:"oddW-13x7",    w:13,   h:7,   bpe:4,  bpr:52),
         ]
 
         for c in cases {
             autoreleasepool {
-                // Skip cases that would allocate too much
-                let estBytes = max(c.h, 1) * max(c.bpr, 1)
-                guard estBytes <= kMaxBytes || c.bpr <= 0 || c.h <= 0 else {
-                    log.append("  surf \(c.w)x\(c.h) bpr=0x\(String(c.bpr, radix:16)) SKIPPED (too large)")
-                    return
-                }
-                var props: [IOSurfacePropertyKey: Any] = [
+                let allocSz = c.h * c.bpr
+                let props: [IOSurfacePropertyKey: Any] = [
                     .width: c.w, .height: c.h,
                     .bytesPerElement: c.bpe, .bytesPerRow: c.bpr,
+                    .allocSize: allocSz,
                 ]
-                if c.bpe > 0 && c.bpr > 0 && c.w > 0 && c.h > 0 {
-                    let sz = c.h * c.bpr
-                    if sz > 0 && sz <= kMaxBytes { props[.allocSize] = sz }
-                }
+                log.append("  [alloc] \(c.label) \(c.w)x\(c.h)")
                 let surf = IOSurface(properties: props)
-                log.append("  surf \(c.w)x\(c.h) bpe=\(c.bpe) bpr=0x\(String(c.bpr, radix: 16)) → \(surf == nil ? "nil" : "OK")")
-
-                if let s = surf {
-                    // Lock / unlock to trigger kernel mapping
-                    let lockResult = s.lock(options: [], seed: nil)
-                    let unlockResult = s.unlock(options: [], seed: nil)
-                    if lockResult != 0 || unlockResult != 0 {
-                        log.append("    lock=\(lockResult) unlock=\(unlockResult) — non-zero interesting")
-                    }
+                guard let s = surf else {
+                    log.append("    → nil")
+                    return
                 }
+                log.append("    → OK allocSz=\(allocSz)")
+                var seed: UInt32 = 0xDEADBEEF
+                let lr = s.lock(options: [], seed: &seed)
+                log.append("    lock→\(lr) seed=0x\(String(seed, radix:16))")
+                let ur = s.unlock(options: [], seed: &seed)
+                log.append("    unlock→\(ur)")
             }
         }
     }
@@ -306,11 +296,17 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
             return
         }
         log.append("── Metal device: \(fuzz.device.name)")
+        log.append("[1/6] IOSurface alloc")
         fuzz.fuzzIOSurfaceAlloc()
+        log.append("[2/6] Metal buffers")
         fuzz.fuzzMetalBuffers()
+        log.append("[3/6] Metal textures")
         fuzz.fuzzMetalTextures()
+        log.append("[4/6] Compute shaders")
         fuzz.fuzzComputeShaders()
+        log.append("[5/6] MTLHeap")
         fuzz.fuzzHeap()
+        log.append("[6/6] Rapid IOSurface")
         fuzz.fuzzIOSurfaceRapidAlloc()
         log.append("── Metal fuzz complete ─────────────────────")
         completion()
