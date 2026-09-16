@@ -68,38 +68,58 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
       - name: Install XcodeGen
         run: brew install xcodegen
+
       - name: Generate project
         run: xcodegen generate --spec project.yml
 
-      - name: Archive unsigned arm64e
+      # xcodebuild archive ALWAYS requires a signing identity even with
+      # CODE_SIGNING_ALLOWED=NO — fails with "** ARCHIVE FAILED **".
+      # Fix: plain 'build' targeting generic/platform=iOS, then manually
+      # zip .app into Payload/ to produce a valid unsigned IPA.
+      - name: Build for device (unsigned arm64e)
         run: |
-          xcodebuild archive \
+          BUILD_DIR="$RUNNER_TEMP/build"
+          xcodebuild build \
             -project KernelResearch.xcodeproj \
             -scheme KernelResearch \
             -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/KernelResearch.xcarchive" \
+            CONFIGURATION_BUILD_DIR="$BUILD_DIR" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             COMPILER_INDEX_STORE_ENABLE=NO \
             | xcpretty
 
-      - name: Package unsigned IPA
+      - name: Package as unsigned IPA
         run: |
-          APP_PATH=$(find "$RUNNER_TEMP/KernelResearch.xcarchive" \
-            -name "*.app" | head -1)
-          echo "[*] Found .app: $APP_PATH"
-          mkdir -p "$RUNNER_TEMP/ipa_root/Payload"
-          cp -r "$APP_PATH" "$RUNNER_TEMP/ipa_root/Payload/"
-          cd "$RUNNER_TEMP/ipa_root"
-          zip -r "$RUNNER_TEMP/KernelResearch-unsigned.ipa" Payload/
-          echo "[+] IPA size:"
-          ls -lh "$RUNNER_TEMP/KernelResearch-unsigned.ipa"
+          BUILD_DIR="$RUNNER_TEMP/build"
+          IPA_ROOT="$RUNNER_TEMP/ipa_root"
+          IPA_OUT="$RUNNER_TEMP/KernelResearch-unsigned.ipa"
 
-      - uses: actions/upload-artifact@v4
+          APP_PATH=$(find "$BUILD_DIR" -maxdepth 2 -name "*.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: .app not found in $BUILD_DIR"
+            find "$BUILD_DIR" || true
+            exit 1
+          fi
+          echo "[*] .app: $APP_PATH"
+
+          mkdir -p "$IPA_ROOT/Payload"
+          cp -r "$APP_PATH" "$IPA_ROOT/Payload/"
+
+          cd "$IPA_ROOT"
+          zip -r "$IPA_OUT" Payload/
+
+          echo "[+] IPA:"
+          ls -lh "$IPA_OUT"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
         with:
           name: KernelResearch-unsigned-ipa
           path: "${{ runner.temp }}/KernelResearch-unsigned.ipa"
