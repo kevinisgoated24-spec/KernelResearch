@@ -1,6 +1,6 @@
 #pragma once
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 // Wraps makeTexture(descriptor:iosurface:plane:) in an ObjC @try/@catch.
 // Returns the texture on success, nil on any exception.
