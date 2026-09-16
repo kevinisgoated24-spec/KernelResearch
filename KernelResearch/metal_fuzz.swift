@@ -32,30 +32,37 @@ class MetalFuzzer {
     func fuzzIOSurfaceAlloc() {
         log.append("── IOSurface alloc stress ──────────────────")
 
+        // Hard cap: never pass allocSize > 8MB — anything bigger gets jetsam-killed
+        let kMaxBytes = 8 * 1024 * 1024
+
         struct Case { let w: Int; let h: Int; let bpe: Int; let bpr: Int }
         let cases: [Case] = [
-            Case(w: 0,          h: 0,       bpe: 0,  bpr: 0),
-            Case(w: 1,          h: 1,       bpe: 1,  bpr: 1),
-            Case(w: 0xFFFF,     h: 0xFFFF,  bpe: 4,  bpr: 0x3FFFC),   // huge
-            Case(w: 0x10000,    h: 1,       bpe: 4,  bpr: 0x40000),   // 256 KB wide
-            Case(w: 1,          h: 1,       bpe: 4,  bpr: 0x7FFFFFFF),// bpr overflow
-            Case(w: 0x1000,     h: 0x1000,  bpe: 16, bpr: 0x10000),   // 64 MB surface
-            Case(w: 1,          h: 1,       bpe: 0x7FFFFFFF, bpr: 0x7FFFFFFF), // int overflow bait
+            Case(w: 0,      h: 0,   bpe: 0, bpr: 0),          // zero-size
+            Case(w: 1,      h: 1,   bpe: 1, bpr: 1),          // minimal
+            Case(w: 1,      h: 1,   bpe: 4, bpr: 0x7FFFFFFF), // bpr int-overflow bait → should be nil
+            Case(w: 0xFFFF, h: 1,   bpe: 4, bpr: 0x3FFFC),    // wide strip — 256KB
+            Case(w: 1024,   h: 1,   bpe: 4, bpr: 4096),       // normal
+            Case(w: 1920,   h: 1,   bpe: 4, bpr: 7680),       // 1080p row
+            Case(w: 4096,   h: 1,   bpe: 4, bpr: 16384),      // 4K row
+            Case(w: 256,    h: 256, bpe: 16, bpr: 4096),      // 256x256 at 16bpe = 1MB
+            Case(w: 1,      h: 1,   bpe: 0x7FFFFFFF, bpr: 4), // bpe overflow bait
         ]
 
         for c in cases {
             autoreleasepool {
+                // Skip cases that would allocate too much
+                let estBytes = max(c.h, 1) * max(c.bpr, 1)
+                guard estBytes <= kMaxBytes || c.bpr <= 0 || c.h <= 0 else {
+                    log.append("  surf \(c.w)x\(c.h) bpr=0x\(String(c.bpr, radix:16)) SKIPPED (too large)")
+                    return
+                }
                 var props: [IOSurfacePropertyKey: Any] = [
-                    .width:          c.w,
-                    .height:         c.h,
-                    .bytesPerElement: c.bpe,
-                    .bytesPerRow:    c.bpr,
+                    .width: c.w, .height: c.h,
+                    .bytesPerElement: c.bpe, .bytesPerRow: c.bpr,
                 ]
-                if c.w > 0 && c.h > 0 && c.bpe > 0 && c.bpr > 0 {
-                    let allocSize = c.h * c.bpr
-                    if allocSize > 0 && allocSize < 512 * 1024 * 1024 {
-                        props[.allocSize] = allocSize
-                    }
+                if c.bpe > 0 && c.bpr > 0 && c.w > 0 && c.h > 0 {
+                    let sz = c.h * c.bpr
+                    if sz > 0 && sz <= kMaxBytes { props[.allocSize] = sz }
                 }
                 let surf = IOSurface(properties: props)
                 log.append("  surf \(c.w)x\(c.h) bpe=\(c.bpe) bpr=0x\(String(c.bpr, radix: 16)) → \(surf == nil ? "nil" : "OK")")
@@ -274,7 +281,7 @@ class MetalFuzzer {
         ]
         var created = 0
         var failed = 0
-        for _ in 0..<200 {
+        for _ in 0..<30 {
             autoreleasepool {
                 if let s = IOSurface(properties: props) {
                     let _ = s.lock(options: [], seed: nil)
