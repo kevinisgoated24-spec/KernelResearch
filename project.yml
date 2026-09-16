@@ -40,7 +40,7 @@ targets:
         AD_HOC_CODE_SIGNING_ALLOWED: YES
         GENERATE_INFOPLIST_FILE: NO
         # Link IOKit as an iOS SDK framework (not the macOS system path)
-        OTHER_LDFLAGS: "-framework IOKit"
+        OTHER_LDFLAGS: "-framework IOKit -framework Metal -framework IOSurface"
     scheme:
       testTargets: []
       gatherCoverageData: false

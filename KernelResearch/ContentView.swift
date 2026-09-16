@@ -46,6 +46,7 @@ struct ContentView: View {
                         ActionBtn("Fuzz AGX\nDriver",   color: .red)   { runFuzzAGX() }
                         ActionBtn("Fuzz\nIOSurface",    color: .purple) { runFuzzIOSurface() }
                         ActionBtn("Fuzz\nFramebuffer",  color: .teal)  { runFuzzFramebuffer() }
+                        ActionBtn("Fuzz\nMetal",        color: .green) { runFuzzMetal() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
                     }
                     .padding()
@@ -197,6 +198,15 @@ struct ContentView: View {
 
             Unmanaged<CallbackBox>.fromOpaque(boxPtr).release()
             self.log.append("── IOSurface done. Hits: \(hits)")
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runFuzzMetal() {
+        guard !running else { return }
+        running = true
+        log.append("── Metal + IOSurface Framework Fuzz ────────")
+        runMetalFuzz(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
