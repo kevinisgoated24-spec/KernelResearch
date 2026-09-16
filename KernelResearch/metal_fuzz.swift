@@ -238,7 +238,7 @@ class MetalFuzzer {
                 let heap = device.makeHeap(descriptor: hd)
                 log.append("  heap 0x\(String(sz, radix: 16)) → \(heap == nil ? "nil" : "OK sz=\(heap!.size)")")
 
-                guard let h = heap, h.size > 0 else { continue }
+                guard let h = heap, h.size > 0 else { return }
 
                 // Suballocate, free all, reallocate — UAF window
                 var bufs: [MTLBuffer] = []
