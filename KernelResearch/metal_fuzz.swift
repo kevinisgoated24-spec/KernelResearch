@@ -77,25 +77,34 @@ class MetalFuzzer {
     func fuzzMetalBuffers() {
         log.append("── Metal buffer extremes ───────────────────")
 
+        // Cap at 32MB max — anything bigger kills the process via jetsam/assertion
         let sizes: [Int] = [
-            0, 1, 3, 7,
-            0x3FFF, 0x4000, 0x3FFFF, 0x40000,   // page boundary
-            0xFFFFF, 0x100000,                   // 1 MB
-            0x3FFFFFF,                           // 64 MB
-            0x7FFFFFFF,                          // 2 GB — should fail gracefully
+            1, 3, 7,
+            0x3FFF, 0x4000,           // page boundaries
+            0x3FFFF, 0x40000,
+            0xFFFFF, 0x100000,        // 1 MB
+            0x3FFFFFF,                // 64 MB — likely refused, but won't crash
         ]
         for sz in sizes {
             autoreleasepool {
-                let buf = device.makeBuffer(length: max(sz, 1), options: .storageModeShared)
+                let buf = device.makeBuffer(length: sz, options: .storageModeShared)
                 if let b = buf {
-                    log.append("  buf sz=0x\(String(sz, radix: 16)) OK len=\(b.length)")
-                    // Write pattern to first/last bytes to see if length is honoured
+                    log.append("  buf 0x\(String(sz, radix: 16)) OK len=\(b.length)")
                     let ptr = b.contents().assumingMemoryBound(to: UInt8.self)
                     ptr[0] = 0xAA
                     if b.length > 1 { ptr[b.length - 1] = 0xBB }
                 } else {
-                    log.append("  buf sz=0x\(String(sz, radix: 16)) → nil (refused)")
+                    log.append("  buf 0x\(String(sz, radix: 16)) → nil (refused)")
                 }
+            }
+        }
+
+        // Deliberately misaligned sizes (not multiples of 4 / page)
+        let misaligned = [1, 3, 5, 13, 4097, 8191, 16385]
+        for sz in misaligned {
+            autoreleasepool {
+                let buf = device.makeBuffer(length: sz, options: .storageModeShared)
+                log.append("  buf-misalign 0x\(String(sz, radix: 16)) → actualLen=\(buf?.length ?? -1)")
             }
         }
     }
@@ -172,25 +181,45 @@ class MetalFuzzer {
         }
         log.append("  shader compiled OK threadExecWidth=\(pso.threadExecutionWidth)")
 
-        // Fuzz dispatch sizes — including 0, overflow, huge
-        let dispatchCounts: [Int] = [0, 1, 64, 1024, 0x10000, 0x100000]
+        // Fuzz dispatch sizes — skip 0 (Metal asserts), cap at 256K threads
+        let dispatchCounts: [Int] = [1, 64, 1024, 0x10000, 0x40000]
+        let twg = pso.threadExecutionWidth  // typically 32 on A16
         for count in dispatchCounts {
             autoreleasepool {
-                let bufLen = max(count * 4, 4)
+                let bufLen = count * 4   // exactly sized — no slack
                 guard let buf = device.makeBuffer(length: bufLen, options: .storageModeShared),
                       let cmd = queue.makeCommandBuffer(),
                       let enc = cmd.makeComputeCommandEncoder() else { return }
                 enc.setComputePipelineState(pso)
                 enc.setBuffer(buf, offset: 0, index: 0)
-                let tg = MTLSize(width: max(count, 1), height: 1, depth: 1)
-                let tgs = MTLSize(width: pso.threadExecutionWidth, height: 1, depth: 1)
-                enc.dispatchThreads(tg, threadsPerThreadgroup: tgs)
+                // dispatchThreadgroups instead of dispatchThreads — avoids internal assertion on size
+                let groups = MTLSize(width: max(count / twg, 1), height: 1, depth: 1)
+                let tgs   = MTLSize(width: twg, height: 1, depth: 1)
+                enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tgs)
                 enc.endEncoding()
                 cmd.commit()
                 cmd.waitUntilCompleted()
-                let status = cmd.status
-                log.append("  dispatch \(count) → \(status == .completed ? "OK" : "ERR \(status.rawValue)")")
+                log.append("  dispatch \(count) → \(cmd.status == .completed ? "OK" : "ERR \(cmd.status.rawValue)")")
             }
+        }
+
+        // Off-by-one: dispatch exactly `bufLen/4` threads to read last element,
+        // then dispatch bufLen/4 + 1 — that last thread reads OOB from the GPU's POV
+        log.append("  OOB dispatch test (buf=256 bytes, 64 uint32s):")
+        autoreleasepool {
+            guard let buf = device.makeBuffer(length: 256, options: .storageModeShared),
+                  let cmd = queue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else { return }
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(buf, offset: 0, index: 0)
+            // 65 threads, buf only has 64 uint32s — thread 64 reads one past the end
+            let groups = MTLSize(width: 3, height: 1, depth: 1)   // 3 * 32 = 96 threads > 64
+            let tgs    = MTLSize(width: twg, height: 1, depth: 1)
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tgs)
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            log.append("  OOB dispatch → \(cmd.status == .completed ? "OK (note OOB threads)" : "ERR \(cmd.status.rawValue)")")
         }
     }
 
@@ -199,27 +228,28 @@ class MetalFuzzer {
     func fuzzHeap() {
         log.append("── MTLHeap stress ──────────────────────────")
 
-        let heapSizes: [Int] = [0, 4096, 0x100000, 0x4000000]
+        // Skip size=0 — Metal asserts internally, crashes the app, not the kernel
+        let heapSizes: [Int] = [4096, 0x10000, 0x100000, 0x1000000]
         for sz in heapSizes {
             autoreleasepool {
                 let hd = MTLHeapDescriptor()
                 hd.size = sz
                 hd.storageMode = .shared
                 let heap = device.makeHeap(descriptor: hd)
-                log.append("  heap sz=0x\(String(sz, radix: 16)) → \(heap == nil ? "nil" : "OK size=\(heap!.size)")")
+                log.append("  heap 0x\(String(sz, radix: 16)) → \(heap == nil ? "nil" : "OK sz=\(heap!.size)")")
 
-                if let h = heap, h.size > 0 {
-                    // Suballocate from heap and immediately free — race bait
-                    var bufs: [MTLBuffer] = []
-                    for _ in 0..<8 {
-                        if let b = h.makeBuffer(length: 512, options: .storageModeShared) {
-                            bufs.append(b)
-                        }
+                guard let h = heap, h.size > 0 else { continue }
+
+                // Suballocate, free all, reallocate — UAF window
+                var bufs: [MTLBuffer] = []
+                for _ in 0..<16 {
+                    if let b = h.makeBuffer(length: 256, options: .storageModeShared) {
+                        bufs.append(b)
                     }
-                    // Release all suballocations, then do another alloc — UAF window
-                    bufs.removeAll()
-                    let _ = h.makeBuffer(length: 256, options: .storageModeShared)
                 }
+                bufs.removeAll()  // release all suballocations
+                let b2 = h.makeBuffer(length: 128, options: .storageModeShared)
+                log.append("    post-free realloc → \(b2 == nil ? "nil" : "OK")")
             }
         }
     }
