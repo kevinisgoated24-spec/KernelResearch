@@ -8,25 +8,16 @@ on:
 
 jobs:
 
-  # ── Job 1: Simulator build (no signing, always runs) ────────────────────────
   build-sim:
-    name: Build for iOS Simulator (A16 target)
+    name: Build for iOS Simulator
     runs-on: macos-15
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
-
-      - name: Generate Xcode project
+      - name: Generate project
         run: xcodegen generate --spec project.yml
-
-      - name: Show available simulators
-        run: xcrun simctl list devices available | grep -E "iPhone 15|iPhone 16" || true
-
-      - name: Build (iPhone 15 Simulator)
+      - name: Build Simulator
         run: |
           xcodebuild build \
             -project KernelResearch.xcodeproj \
@@ -44,22 +35,16 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO
 
-  # ── Job 2: Clang static analysis ────────────────────────────────────────────
   analyze:
     name: Clang Static Analysis
     runs-on: macos-15
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
-
-      - name: Generate Xcode project
+      - name: Generate project
         run: xcodegen generate --spec project.yml
-
-      - name: Clang Static Analyze
+      - name: Analyze
         run: |
           xcodebuild analyze \
             -project KernelResearch.xcodeproj \
@@ -68,10 +53,9 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
-            | xcpretty --report html --output clang-analysis-report.html || true
-
-      - name: Upload analysis report
-        uses: actions/upload-artifact@v4
+            | xcpretty --report html \
+              --output clang-analysis-report.html || true
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: clang-analysis-report
@@ -79,146 +63,45 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  # ── Job 3: Build signed IPA ──────────────────────────────────────────────────
-  # Requires 4 GitHub repository secrets (Settings → Secrets → Actions):
-  #
-  #   CERTIFICATE_BASE64          — your .p12 dev cert, base64 encoded
-  #   CERTIFICATE_PASSWORD        — password you set when exporting the .p12
-  #   PROVISIONING_PROFILE_BASE64 — your .mobileprovision, base64 encoded
-  #   TEAM_ID                     — your 10-char Apple Team ID (e.g. AB1CD2EF3G)
-  #
-  # How to get these — see README_SETUP.txt → "GITHUB SECRETS SETUP" section.
-  #
-  # This job is SKIPPED if the secrets are not set (safe for forks/PRs).
   build-ipa:
-    name: Build Signed IPA (device)
+    name: Build Unsigned IPA (device)
     runs-on: macos-15
-    # Only run when secrets exist — check TEAM_ID as proxy
-    if: ${{ vars.HAS_SIGNING_SECRETS == 'true' || github.event_name == 'push' }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
-
-      - name: Generate Xcode project
+      - name: Generate project
         run: xcodegen generate --spec project.yml
 
-      # ── Import signing certificate ──
-      - name: Import certificate into keychain
-        env:
-          CERTIFICATE_BASE64: ${{ secrets.CERTIFICATE_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+      - name: Archive unsigned arm64e
         run: |
-          if [ -z "$CERTIFICATE_BASE64" ]; then
-            echo "CERTIFICATE_BASE64 secret not set — skipping IPA build"
-            exit 0
-          fi
-
-          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
-          KEYCHAIN_PASSWORD="ci-keychain-$(date +%s)"
-
-          # Create a temp keychain
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Decode + import the .p12
-          echo "$CERTIFICATE_BASE64" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" \
-            -k "$KEYCHAIN_PATH" \
-            -P "$CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/security
-
-          # Allow codesign to use the key without prompting
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Make it the default/search list
-          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
-
-      # ── Import provisioning profile ──
-      - name: Install provisioning profile
-        env:
-          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
-        run: |
-          if [ -z "$PROVISIONING_PROFILE_BASE64" ]; then
-            echo "PROVISIONING_PROFILE_BASE64 secret not set — skipping"
-            exit 0
-          fi
-          PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
-          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode -o "$PP_PATH"
-
-          # Extract UUID from the profile to use as filename
-          UUID=$(/usr/libexec/PlistBuddy \
-            -c "Print :UUID" \
-            /dev/stdin <<< $(security cms -D -i "$PP_PATH"))
-
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp "$PP_PATH" \
-            ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID".mobileprovision
-          echo "Installed profile UUID: $UUID"
-
-      # ── xcodebuild archive ──
-      - name: Archive
-        env:
-          TEAM_ID: ${{ secrets.TEAM_ID }}
-        run: |
-          if [ -z "$TEAM_ID" ]; then
-            echo "TEAM_ID secret not set — skipping archive"
-            exit 0
-          fi
-
           xcodebuild archive \
             -project KernelResearch.xcodeproj \
             -scheme KernelResearch \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/KernelResearch.xcarchive" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             COMPILER_INDEX_STORE_ENABLE=NO \
             | xcpretty
 
-      # ── Export IPA ──
-      - name: Export IPA
-        env:
-          TEAM_ID: ${{ secrets.TEAM_ID }}
+      - name: Package unsigned IPA
         run: |
-          if [ -z "$TEAM_ID" ]; then
-            echo "TEAM_ID secret not set — skipping export"
-            exit 0
-          fi
+          APP_PATH=$(find "$RUNNER_TEMP/KernelResearch.xcarchive" \
+            -name "*.app" | head -1)
+          echo "[*] Found .app: $APP_PATH"
+          mkdir -p "$RUNNER_TEMP/ipa_root/Payload"
+          cp -r "$APP_PATH" "$RUNNER_TEMP/ipa_root/Payload/"
+          cd "$RUNNER_TEMP/ipa_root"
+          zip -r "$RUNNER_TEMP/KernelResearch-unsigned.ipa" Payload/
+          echo "[+] IPA size:"
+          ls -lh "$RUNNER_TEMP/KernelResearch-unsigned.ipa"
 
-          # Patch the ExportOptions.plist with the real team ID
-          sed "s/\$(TEAM_ID)/$TEAM_ID/g" ExportOptions.plist \
-            > "$RUNNER_TEMP/ExportOptions_final.plist"
-
-          xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/KernelResearch.xcarchive" \
-            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions_final.plist" \
-            -exportPath "$RUNNER_TEMP/ipa_output" \
-            | xcpretty
-
-          ls -lh "$RUNNER_TEMP/ipa_output/" || true
-
-      # ── Upload IPA as artifact ──
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: KernelResearch-device-ipa
-          path: "${{ runner.temp }}/ipa_output/*.ipa"
-          if-no-files-found: ignore
-          retention-days: 7
-
-      # Cleanup keychain
-      - name: Cleanup keychain
-        if: always()
-        run: |
-          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
-          if [ -f "$KEYCHAIN_PATH" ]; then
-            security delete-keychain "$KEYCHAIN_PATH" || true
-          fi
+          name: KernelResearch-unsigned-ipa
+          path: "${{ runner.temp }}/KernelResearch-unsigned.ipa"
+          if-no-files-found: error
+          retention-days: 14
