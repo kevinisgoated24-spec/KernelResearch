@@ -26,6 +26,14 @@
 #include <unistd.h>
 #include <pthread.h>
 
+// kIOMasterPortDefault was renamed kIOMainPortDefault in iOS 15 / macOS 12
+// and removed from the iOS SDK. Use MACH_PORT_NULL which is equivalent.
+#if !defined(kIOMainPortDefault)
+#  define kIOMainPortDefault MACH_PORT_NULL
+#endif
+#undef  kIOMasterPortDefault
+#define kIOMasterPortDefault kIOMainPortDefault
+
 // ── Interesting integer seeds ────────────────────────────────────────────────
 
 static const uint64_t kSeeds[] = {

