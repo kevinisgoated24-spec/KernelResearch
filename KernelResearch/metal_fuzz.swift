@@ -72,88 +72,97 @@ class MetalFuzzer {
         }
     }
 
-    // MARK: - Metal buffer extreme sizes
+    // MARK: - Metal buffer edge cases (stay under 4MB total)
 
     func fuzzMetalBuffers() {
-        log.append("── Metal buffer extremes ───────────────────")
+        log.append("── Metal buffer edge cases ─────────────────")
 
-        // Cap at 32MB max — anything bigger kills the process via jetsam/assertion
-        let sizes: [Int] = [
-            1, 3, 7,
-            0x3FFF, 0x4000,           // page boundaries
-            0x3FFFF, 0x40000,
-            0xFFFFF, 0x100000,        // 1 MB
-            0x3FFFFFF,                // 64 MB — likely refused, but won't crash
-        ]
+        // Page boundary straddles — interesting for VA allocator
+        let sizes: [Int] = [1, 3, 7, 0x3FFF, 0x4000, 0x4001, 0x3FFFF, 0x40000, 0x40001, 0x100000]
         for sz in sizes {
             autoreleasepool {
                 let buf = device.makeBuffer(length: sz, options: .storageModeShared)
                 if let b = buf {
-                    log.append("  buf 0x\(String(sz, radix: 16)) OK len=\(b.length)")
+                    // Check actual rounded length vs requested — mismatch = interesting
+                    let rounded = b.length
+                    let extra = rounded - sz
                     let ptr = b.contents().assumingMemoryBound(to: UInt8.self)
                     ptr[0] = 0xAA
-                    if b.length > 1 { ptr[b.length - 1] = 0xBB }
+                    ptr[rounded - 1] = 0xBB   // write to actual last byte
+                    log.append("  buf req=0x\(String(sz, radix: 16)) actual=0x\(String(rounded, radix: 16)) pad=\(extra)")
                 } else {
-                    log.append("  buf 0x\(String(sz, radix: 16)) → nil (refused)")
+                    log.append("  buf 0x\(String(sz, radix: 16)) → nil")
                 }
             }
         }
 
-        // Deliberately misaligned sizes (not multiples of 4 / page)
-        let misaligned = [1, 3, 5, 13, 4097, 8191, 16385]
-        for sz in misaligned {
+        // storageMode variants on same size
+        let modes: [(MTLResourceOptions, String)] = [
+            (.storageModeShared,   "shared"),
+            (.storageModePrivate,  "private"),
+        ]
+        for (mode, name) in modes {
             autoreleasepool {
-                let buf = device.makeBuffer(length: sz, options: .storageModeShared)
-                log.append("  buf-misalign 0x\(String(sz, radix: 16)) → actualLen=\(buf?.length ?? -1)")
+                let buf = device.makeBuffer(length: 4096, options: mode)
+                log.append("  buf 4096 \(name) → \(buf == nil ? "nil" : "OK")")
             }
         }
     }
 
-    // MARK: - Texture extreme dimensions + IOSurface-backed textures
+    // MARK: - Texture edge cases + IOSurface-backed textures (stay under 16MB)
 
     func fuzzMetalTextures() {
-        log.append("── Metal texture extremes ──────────────────")
+        log.append("── Metal texture edge cases ────────────────")
 
-        struct TexCase { let w: Int; let h: Int; let fmt: MTLPixelFormat }
+        struct TexCase { let w: Int; let h: Int; let fmt: MTLPixelFormat; let label: String }
+        // Max safe: 2048x2048 RGBA = 16MB
         let cases: [TexCase] = [
-            TexCase(w: 1,      h: 1,      fmt: .rgba8Unorm),
-            TexCase(w: 16384,  h: 1,      fmt: .rgba8Unorm),   // max dimension boundary
-            TexCase(w: 16385,  h: 1,      fmt: .rgba8Unorm),   // over max — should fail
-            TexCase(w: 16384,  h: 16384,  fmt: .rgba8Unorm),   // 1 GB texture
-            TexCase(w: 0,      h: 0,      fmt: .rgba8Unorm),   // zero-size
-            TexCase(w: 65535,  h: 65535,  fmt: .r8Unorm),      // huge
+            TexCase(w: 1,     h: 1,    fmt: .rgba8Unorm,  label: "1x1"),
+            TexCase(w: 2048,  h: 1,    fmt: .rgba8Unorm,  label: "2048x1-strip"),
+            TexCase(w: 2048,  h: 2048, fmt: .r8Unorm,     label: "2048x2048-r8"),   // 4MB
+            TexCase(w: 4096,  h: 1024, fmt: .r8Unorm,     label: "4096x1024-r8"),   // 4MB
+            TexCase(w: 8192,  h: 1,    fmt: .r8Unorm,     label: "8192x1-strip"),
+            TexCase(w: 16383, h: 1,    fmt: .r8Unorm,     label: "16383x1"),         // just under 16K
+            TexCase(w: 16384, h: 1,    fmt: .r8Unorm,     label: "16384x1-maxdim"),  // at limit
+            TexCase(w: 16385, h: 1,    fmt: .r8Unorm,     label: "16385x1-over"),    // over limit
         ]
 
         for c in cases {
             autoreleasepool {
                 let td = MTLTextureDescriptor.texture2DDescriptor(
-                    pixelFormat: c.fmt,
-                    width:  max(c.w, 1),
-                    height: max(c.h, 1),
-                    mipmapped: false)
+                    pixelFormat: c.fmt, width: c.w, height: c.h, mipmapped: false)
                 td.storageMode = .shared
                 let tex = device.makeTexture(descriptor: td)
-                log.append("  tex \(c.w)x\(c.h) → \(tex == nil ? "nil" : "OK w=\(tex!.width)")")
+                log.append("  tex \(c.label) → \(tex == nil ? "nil" : "OK actual=\(tex!.width)x\(tex!.height)")")
             }
         }
 
-        // IOSurface-backed texture — the bridge between Metal and IOSurface allocators
-        log.append("  IOSurface-backed tex test:")
+        // IOSurface-backed texture — bridge between Metal and IOSurface allocators
+        // Mismatched pixelFormat between surface and texture is the interesting case
+        log.append("  IOSurface-backed tex (matched format):")
         autoreleasepool {
-            let surfProps: [IOSurfacePropertyKey: Any] = [
-                .width: 256, .height: 256,
-                .bytesPerElement: 4, .bytesPerRow: 1024,
-                .pixelFormat: 0x42475241,   // ARGB big-endian
-            ]
-            guard let surf = IOSurface(properties: surfProps) else {
-                log.append("  surface alloc failed")
-                return
-            }
+            let surf = IOSurface(properties: [
+                .width: 256, .height: 256, .bytesPerElement: 4, .bytesPerRow: 1024,
+            ])
+            guard let s = surf else { log.append("  surf alloc nil"); return }
             let td = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm, width: 256, height: 256, mipmapped: false)
             td.storageMode = .shared
-            let tex = device.makeTexture(descriptor: td, iosurface: surf, plane: 0)
-            log.append("  IOSurface-backed tex → \(tex == nil ? "nil" : "OK")")
+            let tex = device.makeTexture(descriptor: td, iosurface: s, plane: 0)
+            log.append("  → \(tex == nil ? "nil" : "OK")")
+        }
+
+        log.append("  IOSurface-backed tex (mismatched size — surf 128x128, tex 256x256):")
+        autoreleasepool {
+            let surf = IOSurface(properties: [
+                .width: 128, .height: 128, .bytesPerElement: 4, .bytesPerRow: 512,
+            ])
+            guard let s = surf else { return }
+            let td = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: 256, height: 256, mipmapped: false)
+            td.storageMode = .shared
+            let tex = device.makeTexture(descriptor: td, iosurface: s, plane: 0)
+            log.append("  → \(tex == nil ? "nil (size check OK)" : "OK (no size check — interesting!)")")
         }
     }
 
