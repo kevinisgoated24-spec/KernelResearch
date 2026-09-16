@@ -163,69 +163,58 @@ class MetalFuzzer {
         }
     }
 
-    // MARK: - Compute shader submission
+    // MARK: - Metal command buffer stress (no inline shader compilation)
 
     func fuzzComputeShaders() {
-        log.append("── Metal compute fuzzing ───────────────────")
+        log.append("── Metal command buffer stress ─────────────")
 
-        // Simple compute kernel that reads from a buffer
-        let shaderSrc = """
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void fuzz_read(device uint *buf [[buffer(0)]],
-                              uint idx [[thread_position_in_grid]]) {
-            uint v = buf[idx];  // kernel reads buf[idx]
-            buf[idx] = v ^ 0xDEADBEEF;
-        }
-        """
-
-        guard let lib = try? device.makeLibrary(source: shaderSrc, options: nil),
-              let fn  = lib.makeFunction(name: "fuzz_read"),
-              let pso = try? device.makeComputePipelineState(function: fn) else {
-            log.append("  shader compile failed")
-            return
-        }
-        log.append("  shader compiled OK threadExecWidth=\(pso.threadExecutionWidth)")
-
-        // Fuzz dispatch sizes — skip 0 (Metal asserts), cap at 256K threads
-        let dispatchCounts: [Int] = [1, 64, 1024, 0x10000, 0x40000]
-        let twg = pso.threadExecutionWidth  // typically 32 on A16
-        for count in dispatchCounts {
-            autoreleasepool {
-                let bufLen = count * 4   // exactly sized — no slack
-                guard let buf = device.makeBuffer(length: bufLen, options: .storageModeShared),
-                      let cmd = queue.makeCommandBuffer(),
-                      let enc = cmd.makeComputeCommandEncoder() else { return }
-                enc.setComputePipelineState(pso)
-                enc.setBuffer(buf, offset: 0, index: 0)
-                // dispatchThreadgroups instead of dispatchThreads — avoids internal assertion on size
-                let groups = MTLSize(width: max(count / twg, 1), height: 1, depth: 1)
-                let tgs   = MTLSize(width: twg, height: 1, depth: 1)
-                enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tgs)
-                enc.endEncoding()
-                cmd.commit()
-                cmd.waitUntilCompleted()
-                log.append("  dispatch \(count) → \(cmd.status == .completed ? "OK" : "ERR \(cmd.status.rawValue)")")
-            }
-        }
-
-        // Off-by-one: dispatch exactly `bufLen/4` threads to read last element,
-        // then dispatch bufLen/4 + 1 — that last thread reads OOB from the GPU's POV
-        log.append("  OOB dispatch test (buf=256 bytes, 64 uint32s):")
+        // Empty command buffer — commit with nothing encoded
         autoreleasepool {
-            guard let buf = device.makeBuffer(length: 256, options: .storageModeShared),
+            guard let cmd = queue.makeCommandBuffer() else { return }
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            log.append("  empty cmdbuf → \(cmd.status == .completed ? "OK" : "status=\(cmd.status.rawValue)")")
+        }
+
+        // Blit encoder: copy buffer to itself (self-copy, may be undefined)
+        autoreleasepool {
+            guard let buf = device.makeBuffer(length: 4096, options: .storageModeShared),
                   let cmd = queue.makeCommandBuffer(),
-                  let enc = cmd.makeComputeCommandEncoder() else { return }
-            enc.setComputePipelineState(pso)
-            enc.setBuffer(buf, offset: 0, index: 0)
-            // 65 threads, buf only has 64 uint32s — thread 64 reads one past the end
-            let groups = MTLSize(width: 3, height: 1, depth: 1)   // 3 * 32 = 96 threads > 64
-            let tgs    = MTLSize(width: twg, height: 1, depth: 1)
-            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tgs)
+                  let enc = cmd.makeBlitCommandEncoder() else { return }
+            // Overlapping self-copy — behavior is implementation-defined
+            enc.copy(from: buf, sourceOffset: 0, to: buf, destinationOffset: 128, size: 256)
             enc.endEncoding()
             cmd.commit()
             cmd.waitUntilCompleted()
-            log.append("  OOB dispatch → \(cmd.status == .completed ? "OK (note OOB threads)" : "ERR \(cmd.status.rawValue)")")
+            log.append("  self-copy blit → \(cmd.status == .completed ? "OK" : "ERR \(cmd.status.rawValue)")")
+        }
+
+        // Blit: fill buffer with pattern then verify
+        autoreleasepool {
+            guard let buf = device.makeBuffer(length: 1024, options: .storageModeShared),
+                  let cmd = queue.makeCommandBuffer(),
+                  let enc = cmd.makeBlitCommandEncoder() else { return }
+            enc.fill(buffer: buf, range: 0..<1024, value: 0xAB)
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            let ptr = buf.contents().assumingMemoryBound(to: UInt8.self)
+            let ok = ptr[0] == 0xAB && ptr[1023] == 0xAB
+            log.append("  fill+verify → \(ok ? "OK pattern match" : "MISMATCH — interesting")")
+        }
+
+        // Multiple encoders on one command buffer (stress the command allocator)
+        autoreleasepool {
+            guard let cmd = queue.makeCommandBuffer() else { return }
+            for i in 0..<8 {
+                guard let buf = device.makeBuffer(length: 256, options: .storageModeShared),
+                      let enc = cmd.makeBlitCommandEncoder() else { break }
+                enc.fill(buffer: buf, range: 0..<256, value: UInt8(i & 0xFF))
+                enc.endEncoding()
+            }
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            log.append("  8-encoder cmdbuf → \(cmd.status == .completed ? "OK" : "ERR \(cmd.status.rawValue)")")
         }
     }
 
