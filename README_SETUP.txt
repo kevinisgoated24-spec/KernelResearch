@@ -155,3 +155,74 @@ NEXT STEPS (kernel r/w research)
    → Filter for "Kernel" process type
 
 ===============================================================================
+GITHUB SECRETS SETUP — for the "Build Signed IPA" Actions job
+===============================================================================
+
+The build-ipa job needs 4 secrets set in:
+  GitHub → KernelResearch repo → Settings → Secrets and variables → Actions → New secret
+
+─────────────────────────────────────────────────────────────────────
+SECRET 1: CERTIFICATE_BASE64
+─────────────────────────────────────────────────────────────────────
+On your Mac:
+  1. Open Keychain Access
+  2. Find your "Apple Development: ..." certificate under "My Certificates"
+  3. Right-click → Export → save as cert.p12 (set any password, e.g. "1234")
+  4. In Terminal:
+       base64 -i ~/Desktop/cert.p12 | pbcopy
+  5. Paste the clipboard as the secret value
+
+SECRET 2: CERTIFICATE_PASSWORD
+  The password you set in step 3 above (e.g. "1234")
+
+─────────────────────────────────────────────────────────────────────
+SECRET 3: PROVISIONING_PROFILE_BASE64
+─────────────────────────────────────────────────────────────────────
+Option A — From Xcode (easiest):
+  1. In Xcode → open the KernelResearch project
+  2. Target → Signing & Capabilities → make sure your device is registered
+  3. The profile is auto-downloaded. Find it:
+       ls ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision
+  4. Identify the right one (check with):
+       /usr/libexec/PlistBuddy -c "Print :Name" /dev/stdin \
+         <<< $(security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/XXXX.mobileprovision)
+  5. Encode it:
+       base64 -i ~/Library/MobileDevice/Provisioning\ Profiles/XXXX.mobileprovision | pbcopy
+
+Option B — developer.apple.com:
+  1. Go to https://developer.apple.com/account/resources/profiles/list
+  2. Download the Development profile for your app
+  3. base64 -i ~/Downloads/KernelResearch_Dev.mobileprovision | pbcopy
+
+SECRET 4: TEAM_ID
+  Your 10-character Apple Team ID.
+  Find it at: https://developer.apple.com/account → Membership → Team ID
+  Example: AB1CD2EF3G
+
+─────────────────────────────────────────────────────────────────────
+ENABLE THE IPA JOB
+─────────────────────────────────────────────────────────────────────
+After adding all 4 secrets, go to:
+  Settings → Secrets and variables → Actions → Variables tab → New variable
+  Name:  HAS_SIGNING_SECRETS
+  Value: true
+
+This flag tells the workflow it's safe to attempt signing.
+Push any commit → "Build Signed IPA" job runs → IPA appears as artifact.
+
+─────────────────────────────────────────────────────────────────────
+INSTALL THE IPA ON DEVICE (Windows — Sideloadly)
+─────────────────────────────────────────────────────────────────────
+  1. Actions run finishes → Download artifact "KernelResearch-device-ipa"
+  2. Extract the .ipa from the zip
+  3. Open Sideloadly (sideloadly.io) on Windows
+  4. Plug in iPhone 15 via USB
+  5. Drag the .ipa into Sideloadly
+  6. Enter your Apple ID — Sideloadly signs it with your free dev cert
+  7. Hit Start → installs on device
+  8. On iPhone: Settings → General → VPN & Device Management → trust your cert
+  9. Launch KernelResearch
+
+Re-sign every 7 days (free cert expiry) by repeating steps 5-8.
+
+===============================================================================

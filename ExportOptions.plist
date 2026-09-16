@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- "development" = free dev account cert, installs on UDID-registered devices -->
+    <!-- Change to "ad-hoc" if you have a paid account + ad-hoc profile -->
+    <key>method</key>
+    <string>development</string>
+
+    <key>teamID</key>
+    <string>$(TEAM_ID)</string>
+
+    <key>compileBitcode</key>
+    <false/>
+
+    <key>thinning</key>
+    <string>&lt;none&gt;</string>
+
+    <key>signingStyle</key>
+    <string>manual</string>
+
+    <key>signingCertificate</key>
+    <string>Apple Development</string>
+
+    <key>stripSwiftSymbols</key>
+    <true/>
+</dict>
+</plist>
