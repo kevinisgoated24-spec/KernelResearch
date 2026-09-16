@@ -16,25 +16,32 @@ settings:
     IPHONEOS_DEPLOYMENT_TARGET: "18.0"
     SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
     TARGETED_DEVICE_FAMILY: "1"
+    # Xcode 14+ defaults GENERATE_INFOPLIST_FILE=YES which ignores INFOPLIST_FILE
+    # and generates a minimal stub with no custom keys → invalid bundle.
+    GENERATE_INFOPLIST_FILE: NO
 
 targets:
   KernelResearch:
     type: application
     platform: iOS
+    # Explicit info plist — XcodeGen uses the `info` key to wire INFOPLIST_FILE
+    # AND exclude the plist from Compile Sources (which would double-process it)
+    info:
+      path: KernelResearch/Info.plist
     sources:
       - path: KernelResearch
         excludes:
           - "**/*.txt"
           - "**/*.md"
+          - "**/Info.plist"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kevinisgoated24spec.KernelResearch
-        INFOPLIST_FILE: KernelResearch/Info.plist
         CODE_SIGN_ENTITLEMENTS: KernelResearch/KernelResearch.entitlements
-        # Simulator builds: no signing required
         CODE_SIGNING_ALLOWED: YES
         CODE_SIGNING_REQUIRED: NO
         AD_HOC_CODE_SIGNING_ALLOWED: YES
+        GENERATE_INFOPLIST_FILE: NO
     dependencies:
       - framework: System/Library/Frameworks/IOKit.framework
         implicit: true

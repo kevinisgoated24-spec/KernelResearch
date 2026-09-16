@@ -25,6 +25,7 @@ jobs:
             -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            GENERATE_INFOPLIST_FILE=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             | xcpretty || \
           xcodebuild build \
@@ -33,6 +34,7 @@ jobs:
             -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            GENERATE_INFOPLIST_FILE=NO \
             COMPILER_INDEX_STORE_ENABLE=NO
 
   analyze:
@@ -52,6 +54,7 @@ jobs:
             -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            GENERATE_INFOPLIST_FILE=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             | xcpretty --report html \
               --output clang-analysis-report.html || true
@@ -75,39 +78,47 @@ jobs:
       - name: Generate project
         run: xcodegen generate --spec project.yml
 
-      # xcodebuild archive ALWAYS requires a signing identity even with
-      # CODE_SIGNING_ALLOWED=NO — fails with "** ARCHIVE FAILED **".
-      # Fix: plain 'build' targeting generic/platform=iOS, then manually
-      # zip .app into Payload/ to produce a valid unsigned IPA.
       - name: Build for device (unsigned arm64e)
         run: |
-          BUILD_DIR="$RUNNER_TEMP/build"
+          # Use -derivedDataPath so the full .app bundle (including Info.plist)
+          # lands in a predictable location. CONFIGURATION_BUILD_DIR can cause
+          # the Info.plist copy phase to resolve relative paths incorrectly.
           xcodebuild build \
             -project KernelResearch.xcodeproj \
             -scheme KernelResearch \
             -destination 'generic/platform=iOS' \
-            CONFIGURATION_BUILD_DIR="$BUILD_DIR" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             EXPANDED_CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            GENERATE_INFOPLIST_FILE=NO \
             COMPILER_INDEX_STORE_ENABLE=NO \
             | xcpretty
 
-      - name: Package as unsigned IPA
+      - name: Verify Info.plist exists in .app
         run: |
-          BUILD_DIR="$RUNNER_TEMP/build"
-          IPA_ROOT="$RUNNER_TEMP/ipa_root"
-          IPA_OUT="$RUNNER_TEMP/KernelResearch-unsigned.ipa"
-
-          APP_PATH=$(find "$BUILD_DIR" -maxdepth 2 -name "*.app" -type d | head -1)
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" -type d \
+            ! -path "*/Index.noindex/*" | head -1)
+          echo "[*] .app: $APP_PATH"
           if [ -z "$APP_PATH" ]; then
-            echo "ERROR: .app not found in $BUILD_DIR"
-            find "$BUILD_DIR" || true
+            echo "ERROR: no .app found"; find "$RUNNER_TEMP/DerivedData" -type d; exit 1
+          fi
+          if [ ! -f "$APP_PATH/Info.plist" ]; then
+            echo "ERROR: Info.plist missing from bundle"
+            ls -la "$APP_PATH/"
             exit 1
           fi
-          echo "[*] .app: $APP_PATH"
+          echo "[+] Info.plist present:"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist"
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
+
+      - name: Package as unsigned IPA
+        run: |
+          IPA_ROOT="$RUNNER_TEMP/ipa_root"
+          IPA_OUT="$RUNNER_TEMP/KernelResearch-unsigned.ipa"
 
           mkdir -p "$IPA_ROOT/Payload"
           cp -r "$APP_PATH" "$IPA_ROOT/Payload/"
@@ -115,8 +126,7 @@ jobs:
           cd "$IPA_ROOT"
           zip -r "$IPA_OUT" Payload/
 
-          echo "[+] IPA:"
-          ls -lh "$IPA_OUT"
+          echo "[+] IPA size: $(du -sh "$IPA_OUT" | cut -f1)"
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
