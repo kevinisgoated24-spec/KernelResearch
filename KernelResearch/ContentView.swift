@@ -47,7 +47,7 @@ struct ContentView: View {
                         ActionBtn("Fuzz\nIOSurface",    color: .purple) { runFuzzIOSurface() }
                         ActionBtn("Fuzz\nFramebuffer",  color: .teal)  { runFuzzFramebuffer() }
                         ActionBtn("Fuzz\nMetal",        color: .green)   { runFuzzMetal() }
-                        ActionBtn("MISMATCH\nTest",     color: .red)     { runMismatchTest() }
+                        ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
                     }
@@ -223,7 +223,7 @@ struct ContentView: View {
         }
     }
 
-    private func runMismatchTest() {
+    private func triggerMismatch() {
         log.append("⚠ MISMATCH TEST — app WILL crash — check Crash Log after reopen")
         runMismatchTest(log: log)
     }
