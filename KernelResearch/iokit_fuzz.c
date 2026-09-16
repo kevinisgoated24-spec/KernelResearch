@@ -307,3 +307,9 @@ int iokit_fuzz_agx(FuzzCallback cb, void *ctx) {
 int iokit_fuzz_iosurface(FuzzCallback cb, void *ctx) {
     return iokit_fuzz_service("IOSurfaceRoot", 127, 16, cb, ctx);
 }
+
+int iokit_fuzz_framebuffer(FuzzCallback cb, void *ctx) {
+    // IOMobileFramebuffer — display driver, openable from sandbox on iOS 26.x
+    // Selectors 0..63, 16 rounds. Historically crash-prone (CVE-2021-30983 was here).
+    return iokit_fuzz_service("IOMobileFramebuffer", 63, 16, cb, ctx);
+}

@@ -13,6 +13,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
+#include <os/log.h>
+
+// Diagnostic log — readable via Console.app on macOS, or oslog on device
+#define BQ_LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "[bad_query] " fmt, ##__VA_ARGS__)
 
 // Opaque types for container_query API
 typedef void* container_query_t;
@@ -46,7 +50,11 @@ static fp_consume_extension       _consume_extension      = NULL;
 static int _load_lib(void) {
     if (g_mgr) return 0;
     g_mgr = dlopen("/usr/lib/system/libsystem_containermanager.dylib", RTLD_NOW | RTLD_LOCAL);
-    if (!g_mgr) return -1;
+    if (!g_mgr) {
+        BQ_LOG("dlopen failed: %s", dlerror());
+        return -1;
+    }
+    BQ_LOG("dlopen OK");
 
     _query_create         = (fp_query_create)         dlsym(g_mgr, "container_query_create");
     _query_set_class      = (fp_query_set_class)      dlsym(g_mgr, "container_query_set_class");
@@ -59,8 +67,14 @@ static int _load_lib(void) {
     _copy_token           = (fp_copy_sandbox_token)   dlsym(g_mgr, "container_copy_sandbox_token");
     _consume_extension    = (fp_consume_extension)    dlsym(g_mgr, "sandbox_extension_consume");
 
+    BQ_LOG("syms: create=%p set_class=%p set_part=%p set_part_domain=%p get_result=%p copy_token=%p consume=%p",
+           (void*)_query_create, (void*)_query_set_class, (void*)_query_set_part,
+           (void*)_query_set_part_domain, (void*)_query_get_result,
+           (void*)_copy_token, (void*)_consume_extension);
+
     if (!_query_create || !_query_set_class || !_query_set_part ||
         !_query_set_part_domain || !_query_get_result || !_copy_token || !_consume_extension) {
+        BQ_LOG("one or more required symbols NULL — API changed?");
         dlclose(g_mgr);
         g_mgr = NULL;
         return -1;
@@ -110,17 +124,28 @@ int64_t bad_query(char* path, bool create, char *group_identifier, bool is_group
     _query_set_part_domain(query, traversal);
     free(traversal);
 
+    BQ_LOG("querying path traversal: %s", traversal ? traversal : "(null)");
+
     container_query_result_t result = _query_get_result(query);
     _query_free(query);
 
-    if (!result) return -1;
+    if (!result) {
+        BQ_LOG("get_result returned NULL — query denied by containermanagerd (patched or wrong flags)");
+        return -2;
+    }
+    BQ_LOG("get_result OK: %p", result);
 
     char *token = _copy_token(result);
-    if (!token) return -1;
+    if (!token) {
+        BQ_LOG("copy_sandbox_token returned NULL");
+        return -3;
+    }
+    BQ_LOG("token: %.40s...", token);
 
     // consume_extension → sandbox_extension_consume
     // Returns a positive integer handle; our app sandbox now allows access to `path`
     int64_t handle = _consume_extension(token);
+    BQ_LOG("consume returned: %lld", handle);
     free(token);
 
     return handle;

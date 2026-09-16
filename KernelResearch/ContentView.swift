@@ -45,6 +45,7 @@ struct ContentView: View {
                         ActionBtn("Enumerate\nServices", color: .blue)  { runEnumerate() }
                         ActionBtn("Fuzz AGX\nDriver",   color: .red)   { runFuzzAGX() }
                         ActionBtn("Fuzz\nIOSurface",    color: .purple) { runFuzzIOSurface() }
+                        ActionBtn("Fuzz\nFramebuffer",  color: .teal)  { runFuzzFramebuffer() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
                     }
                     .padding()
@@ -102,7 +103,10 @@ struct ContentView: View {
                     }
                     bad_query_release(handle)
                 } else {
-                    self.log.append("✗ \(p) → failed")
+                    // Diagnostic: -1=load fail, -2=query denied (patched?), -3=no token
+                    let reason = handle == -2 ? "query denied (patched?)" :
+                                 handle == -3 ? "no sandbox token" : "load fail"
+                    self.log.append("✗ \(p) → \(reason) [code=\(handle)]")
                 }
             }
             DispatchQueue.main.async { self.running = false }
@@ -188,6 +192,38 @@ struct ContentView: View {
 
             Unmanaged<CallbackBox>.fromOpaque(boxPtr).release()
             self.log.append("── IOSurface done. Hits: \(hits)")
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runFuzzFramebuffer() {
+        guard !running else { return }
+        running = true
+        log.append("── Fuzzing IOMobileFramebuffer ────────────")
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let box = CallbackBox(self.log)
+            let boxPtr = Unmanaged.passRetained(box).toOpaque()
+
+            let hits = iokit_fuzz_framebuffer({ entryPtr, ctx in
+                guard let ep = entryPtr, let ctx = ctx else { return 0 }
+                let b = Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue()
+                let entry = ep.pointee
+                let detail = cArrayToString(entry.detail)
+                switch entry.result {
+                case FUZZ_RESULT_PANIC:
+                    b.log.append("*** FRAMEBUFFER CRASH  sel=\(entry.selector) — PORT DIED")
+                case FUZZ_RESULT_OK:
+                    b.log.append("  FB OK   \(detail)")
+                case FUZZ_RESULT_ERROR:
+                    b.log.append("  FB ERR  \(detail)")
+                default: break
+                }
+                return 0
+            }, boxPtr)
+
+            Unmanaged<CallbackBox>.fromOpaque(boxPtr).release()
+            self.log.append("── Framebuffer done. Hits: \(hits)")
             DispatchQueue.main.async { self.running = false }
         }
     }

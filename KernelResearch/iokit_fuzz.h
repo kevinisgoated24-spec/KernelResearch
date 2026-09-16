@@ -51,6 +51,9 @@ int iokit_fuzz_agx(FuzzCallback cb, void *ctx);
 // Fuzz IOSurfaceRoot — surface management, often reachable without entitlements.
 int iokit_fuzz_iosurface(FuzzCallback cb, void *ctx);
 
+// Fuzz IOMobileFramebuffer — display driver, historically vulnerable (Starlight family).
+int iokit_fuzz_framebuffer(FuzzCallback cb, void *ctx);
+
 // Run structured struct-in/struct-out fuzzing on a given service+selector.
 // Sends blobs of size `struct_size` filled with patterns: all-zero, all-0xFF,
 // canonical integers, and random bytes.
