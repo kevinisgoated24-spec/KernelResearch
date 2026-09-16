@@ -102,27 +102,9 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
             let tex = device.makeTexture(descriptor: td, iosurface: surf, plane: 0)
             step("    tex=\(tex==nil ? "nil" : "OK")")
         }
-        autoreleasepool {
-            step("  [tex] MISMATCH surf64 tex256 — surf alloc")
-            guard let surf = IOSurface(properties: [
-                .width:64,.height:64,.bytesPerElement:4,.bytesPerRow:256,.allocSize:16384
-            ]) else { step("    surf nil"); return }
-            step("  [tex] MISMATCH — makeTexture(surf64, desc256) via safe trampoline")
-            let td = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat:.bgra8Unorm, width:256, height:256, mipmapped:false)
-            td.storageMode = .shared
-            var excPtr: UnsafeMutablePointer<CChar>? = nil
-            let tex = metal_make_texture_safe(device, td, surf as! IOSurfaceRef, 0, &excPtr)
-            if let ep = excPtr {
-                let msg = String(cString: ep); free(ep)
-                step("    *** EXCEPTION CAUGHT: \(msg)")
-                step("    *** makeTexture CRASHED on mismatch — Metal bounds-checks via exception")
-            } else if tex == nil {
-                step("    → nil (silently bounds-checked — no exception)")
-            } else {
-                step("    → *** OK NO BOUNDS CHECK — GPU can OOB read 16x past alloc ***")
-            }
-        }
+        // MISMATCH test skipped in auto-flow — it calls abort() (SIGABRT), not catchable.
+        // Use the dedicated "MISMATCH" button to run it deliberately.
+        step("  [tex] MISMATCH skipped — use MISMATCH button (kills process via abort)")
 
         // ── 4. Blit encoder ──────────────────────────────────────────────
         step("[4/6] Blit encoder")
@@ -197,4 +179,25 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         step("── Metal fuzz complete ─────────────────────")
         completion()
     }
+}
+
+// Deliberately trigger the mismatch crash — call this from its own button.
+// WARNING: this WILL kill the process. Check crash log on next launch.
+func runMismatchTest(log: FuzzLog) {
+    let sl = SyncLog()
+    func step(_ s: String) { sl.write(s); log.append(s) }
+    guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); return }
+    step("⚠ MISMATCH TEST — surf64 tex256 — process will die")
+    guard let surf = IOSurface(properties: [
+        .width:64,.height:64,.bytesPerElement:4,.bytesPerRow:256,.allocSize:16384
+    ]) else { step("surf nil"); return }
+    step("surf alloc OK — calling makeTexture with desc256 — GOODBYE")
+    let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.bgra8Unorm, width:256, height:256, mipmapped:false)
+    td.storageMode = .shared
+    var excPtr: UnsafeMutablePointer<CChar>? = nil
+    let tex = metal_make_texture_safe(device, td, surf as! IOSurfaceRef, 0, &excPtr)
+    // If we're still alive (shouldn't happen):
+    if let ep = excPtr { let m = String(cString: ep); free(ep); step("EXCEPTION: \(m)") }
+    else if tex == nil { step("nil — no crash, bounds-checked silently") }
+    else { step("*** OK — NO BOUNDS CHECK — OOB confirmed ***") }
 }

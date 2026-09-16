@@ -46,8 +46,9 @@ struct ContentView: View {
                         ActionBtn("Fuzz AGX\nDriver",   color: .red)   { runFuzzAGX() }
                         ActionBtn("Fuzz\nIOSurface",    color: .purple) { runFuzzIOSurface() }
                         ActionBtn("Fuzz\nFramebuffer",  color: .teal)  { runFuzzFramebuffer() }
-                        ActionBtn("Fuzz\nMetal",        color: .green) { runFuzzMetal() }
-                        ActionBtn("Crash\nLog",         color: .cyan)  { loadCrashLog() }
+                        ActionBtn("Fuzz\nMetal",        color: .green)   { runFuzzMetal() }
+                        ActionBtn("MISMATCH\nTest",     color: .red)     { runMismatchTest() }
+                        ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
                     }
                     .padding()
@@ -220,6 +221,11 @@ struct ContentView: View {
         runMetalFuzz(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
+    }
+
+    private func runMismatchTest() {
+        log.append("⚠ MISMATCH TEST — app WILL crash — check Crash Log after reopen")
+        runMismatchTest(log: log)
     }
 
     private func runFuzzFramebuffer() {
