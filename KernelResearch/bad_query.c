@@ -47,14 +47,32 @@ static fp_query_free              _query_free             = NULL;
 static fp_copy_sandbox_token      _copy_token             = NULL;
 static fp_consume_extension       _consume_extension      = NULL;
 
+// Known paths for libsystem_containermanager across iOS versions
+static const char *kContainerMgrPaths[] = {
+    "/usr/lib/system/libsystem_containermanager.dylib",   // iOS ≤25
+    "/usr/lib/libsystem_containermanager.dylib",           // iOS 26 possible relocation
+    "/System/Library/PrivateFrameworks/ContainerManager.framework/ContainerManager",
+    "/System/Library/PrivateFrameworks/ContainerManager.framework/Support/libcontainermanager.dylib",
+    NULL
+};
+
 static int _load_lib(void) {
     if (g_mgr) return 0;
-    g_mgr = dlopen("/usr/lib/system/libsystem_containermanager.dylib", RTLD_NOW | RTLD_LOCAL);
-    if (!g_mgr) {
-        BQ_LOG("dlopen failed: %s", dlerror());
-        return -1;
+
+    for (int i = 0; kContainerMgrPaths[i]; i++) {
+        g_mgr = dlopen(kContainerMgrPaths[i], RTLD_NOW | RTLD_LOCAL);
+        if (g_mgr) {
+            BQ_LOG("dlopen OK: %s", kContainerMgrPaths[i]);
+            break;
+        }
+        BQ_LOG("dlopen miss: %s — %s", kContainerMgrPaths[i], dlerror());
     }
-    BQ_LOG("dlopen OK");
+
+    if (!g_mgr) {
+        // Last resort: symbols might already be loaded in our process (iOS dynamic linker quirk)
+        g_mgr = RTLD_DEFAULT;
+        BQ_LOG("falling back to RTLD_DEFAULT");
+    }
 
     _query_create         = (fp_query_create)         dlsym(g_mgr, "container_query_create");
     _query_set_class      = (fp_query_set_class)      dlsym(g_mgr, "container_query_set_class");
@@ -74,8 +92,10 @@ static int _load_lib(void) {
 
     if (!_query_create || !_query_set_class || !_query_set_part ||
         !_query_set_part_domain || !_query_get_result || !_copy_token || !_consume_extension) {
-        BQ_LOG("one or more required symbols NULL — API changed?");
-        dlclose(g_mgr);
+        BQ_LOG("missing syms: create=%p set_part_domain=%p get_result=%p copy_token=%p consume=%p",
+               (void*)_query_create, (void*)_query_set_part_domain,
+               (void*)_query_get_result, (void*)_copy_token, (void*)_consume_extension);
+        if (g_mgr != RTLD_DEFAULT) dlclose(g_mgr);
         g_mgr = NULL;
         return -1;
     }

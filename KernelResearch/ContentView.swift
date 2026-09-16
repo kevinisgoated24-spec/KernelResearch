@@ -104,8 +104,9 @@ struct ContentView: View {
                     bad_query_release(handle)
                 } else {
                     // Diagnostic: -1=load fail, -2=query denied (patched?), -3=no token
-                    let reason = handle == -2 ? "query denied (patched?)" :
-                                 handle == -3 ? "no sandbox token" : "load fail"
+                    let reason = handle == -2 ? "query denied by cmgrd (patched?)" :
+                                 handle == -3 ? "no sandbox token" :
+                                 handle == -4 ? "consume_extension failed" : "dylib not found (iOS 26 path?)"
                     self.log.append("✗ \(p) → \(reason) [code=\(handle)]")
                 }
             }
