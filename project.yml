@@ -16,16 +16,13 @@ settings:
     IPHONEOS_DEPLOYMENT_TARGET: "18.0"
     SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
     TARGETED_DEVICE_FAMILY: "1"
-    # Xcode 14+ defaults GENERATE_INFOPLIST_FILE=YES which ignores INFOPLIST_FILE
-    # and generates a minimal stub with no custom keys → invalid bundle.
+    # Xcode 14+ auto-generates a stub plist and ignores INFOPLIST_FILE unless this is NO
     GENERATE_INFOPLIST_FILE: NO
 
 targets:
   KernelResearch:
     type: application
     platform: iOS
-    # Explicit info plist — XcodeGen uses the `info` key to wire INFOPLIST_FILE
-    # AND exclude the plist from Compile Sources (which would double-process it)
     info:
       path: KernelResearch/Info.plist
     sources:
@@ -42,9 +39,8 @@ targets:
         CODE_SIGNING_REQUIRED: NO
         AD_HOC_CODE_SIGNING_ALLOWED: YES
         GENERATE_INFOPLIST_FILE: NO
-    dependencies:
-      - framework: System/Library/Frameworks/IOKit.framework
-        implicit: true
+        # Link IOKit as an iOS SDK framework (not the macOS system path)
+        OTHER_LDFLAGS: "-framework IOKit"
     scheme:
       testTargets: []
       gatherCoverageData: false

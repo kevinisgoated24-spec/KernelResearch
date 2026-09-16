@@ -19,6 +19,7 @@ jobs:
         run: xcodegen generate --spec project.yml
       - name: Build Simulator
         run: |
+          set -o pipefail
           xcodebuild build \
             -project KernelResearch.xcodeproj \
             -scheme KernelResearch \
@@ -78,14 +79,14 @@ jobs:
       - name: Generate project
         run: xcodegen generate --spec project.yml
 
+      # Raw xcodebuild output — no xcpretty so errors are visible
       - name: Build for device (unsigned arm64e)
         run: |
-          # Use -derivedDataPath so the full .app bundle (including Info.plist)
-          # lands in a predictable location. CONFIGURATION_BUILD_DIR can cause
-          # the Info.plist copy phase to resolve relative paths incorrectly.
+          set -o pipefail
           xcodebuild build \
             -project KernelResearch.xcodeproj \
             -scheme KernelResearch \
+            -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
@@ -94,39 +95,40 @@ jobs:
             EXPANDED_CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
             GENERATE_INFOPLIST_FILE=NO \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            | xcpretty
+            COMPILER_INDEX_STORE_ENABLE=NO
 
-      - name: Verify Info.plist exists in .app
+      - name: Verify bundle and package IPA
         run: |
-          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "*.app" -type d \
-            ! -path "*/Index.noindex/*" | head -1)
-          echo "[*] .app: $APP_PATH"
+          # Find the .app — Release-iphoneos subfolder
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData/Build/Products" \
+            -name "KernelResearch.app" -type d | head -1)
+
+          echo "=== Bundle contents ==="
+          ls -la "$APP_PATH/" || true
+
           if [ -z "$APP_PATH" ]; then
-            echo "ERROR: no .app found"; find "$RUNNER_TEMP/DerivedData" -type d; exit 1
+            echo "ERROR: no .app found"
+            find "$RUNNER_TEMP/DerivedData" -type d | head -40
+            exit 1
           fi
+
           if [ ! -f "$APP_PATH/Info.plist" ]; then
-            echo "ERROR: Info.plist missing from bundle"
+            echo "ERROR: Info.plist missing"
             ls -la "$APP_PATH/"
             exit 1
           fi
-          echo "[+] Info.plist present:"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist"
-          echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
 
-      - name: Package as unsigned IPA
-        run: |
+          echo "[+] Info.plist OK"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist"
+
+          # Package
           IPA_ROOT="$RUNNER_TEMP/ipa_root"
           IPA_OUT="$RUNNER_TEMP/KernelResearch-unsigned.ipa"
-
           mkdir -p "$IPA_ROOT/Payload"
           cp -r "$APP_PATH" "$IPA_ROOT/Payload/"
-
           cd "$IPA_ROOT"
           zip -r "$IPA_OUT" Payload/
-
-          echo "[+] IPA size: $(du -sh "$IPA_OUT" | cut -f1)"
+          echo "[+] IPA: $(du -sh "$IPA_OUT" | cut -f1)"
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
