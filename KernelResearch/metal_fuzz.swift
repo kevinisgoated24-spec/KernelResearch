@@ -2,16 +2,54 @@ import Metal
 import IOSurface
 import Foundation
 
+// Synchronous file logger — survives app crashes.
+// Writes to Documents/metal_crash_log.txt before each operation.
+// If the app crashes mid-fuzz, this file shows the last line executed.
+class SyncLog {
+    private let handle: FileHandle?
+    static let logURL: URL = {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("metal_crash_log.txt")
+    }()
+
+    init() {
+        FileManager.default.createFile(atPath: Self.logURL.path, contents: "=== Metal Fuzz Log ===\n".data(using: .utf8))
+        handle = try? FileHandle(forWritingTo: Self.logURL)
+        handle?.seekToEndOfFile()
+    }
+
+    func write(_ s: String) {
+        guard let h = handle else { return }
+        if let data = (s + "\n").data(using: .utf8) {
+            h.write(data)
+            h.synchronizeFile()   // flush to kernel immediately
+        }
+    }
+
+    deinit { try? handle?.close() }
+
+    static func read() -> String {
+        (try? String(contentsOf: logURL, encoding: .utf8)) ?? "(no crash log found)"
+    }
+}
+
 func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+
+        func step(_ s: String) {
+            sl.write(s)
+            log.append(s)
+        }
+
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue  = device.makeCommandQueue() else {
-            log.append("✗ No Metal device"); completion(); return
+            step("✗ No Metal device"); completion(); return
         }
-        log.append("Metal: \(device.name)")
+        step("Metal: \(device.name)")
 
-        // ── 1. IOSurface — valid but edge-case props ─────────────────────
-        log.append("[1/6] IOSurface alloc")
+        // ── 1. IOSurface alloc ───────────────────────────────────────────
+        step("[1/6] IOSurface alloc")
         let surfCases: [(String, [IOSurfacePropertyKey: Any])] = [
             ("1x1",    [.width:1,   .height:1,   .bytesPerElement:4, .bytesPerRow:4,    .allocSize:4]),
             ("64x64",  [.width:64,  .height:64,  .bytesPerElement:4, .bytesPerRow:256,  .allocSize:16384]),
@@ -20,114 +58,123 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         ]
         for (label, props) in surfCases {
             autoreleasepool {
-                log.append("  [surf] \(label)")
+                step("  [surf] \(label) — allocating")
                 guard let s = IOSurface(properties: props) else {
-                    log.append("    nil"); return
+                    step("    nil"); return
                 }
-                log.append("    OK")
+                step("    alloc OK — locking")
                 var seed: UInt32 = 0xCAFEBABE
                 let lk = s.lock(options: [], seed: &seed)
+                step("    lock=\(lk) — unlocking")
                 let uk = s.unlock(options: [], seed: &seed)
-                log.append("    lock=\(lk) unlock=\(uk) seed=0x\(String(seed,radix:16))")
+                step("    unlock=\(uk) seed=0x\(String(seed,radix:16))")
             }
         }
 
-        // ── 2. Buffer page-boundary straddles ────────────────────────────
-        log.append("[2/6] Buffer boundaries")
-        for sz in [0x3FFF, 0x4000, 0x4001, 0x7FFF, 0x8000, 0xFFFF, 0x100000] {
+        // ── 2. Buffer page boundaries ────────────────────────────────────
+        step("[2/6] Buffer boundaries")
+        for sz in [0x3FFF, 0x4000, 0x4001, 0xFFFF, 0x100000] {
             autoreleasepool {
-                log.append("  [buf] 0x\(String(sz,radix:16))")
+                step("  [buf] 0x\(String(sz,radix:16)) — makeBuffer")
                 guard let buf = device.makeBuffer(length: sz, options: .storageModeShared) else {
-                    log.append("    nil"); return
+                    step("    nil"); return
                 }
                 let actual = buf.length
+                step("    actual=0x\(String(actual,radix:16)) — writing boundary bytes")
                 let ptr = buf.contents().assumingMemoryBound(to: UInt8.self)
                 ptr[sz - 1] = 0xEE
                 if actual > sz { ptr[actual - 1] = 0xFF }
-                log.append("    actual=0x\(String(actual,radix:16)) pad=\(actual-sz)")
+                step("    done pad=\(actual-sz)")
             }
         }
 
-        // ── 3. IOSurface-backed texture — matched size only ───────────────
-        log.append("[3/6] IOSurface-backed texture")
+        // ── 3. IOSurface-backed texture ──────────────────────────────────
+        step("[3/6] IOSurface-backed textures")
         autoreleasepool {
-            log.append("  [tex] matched 128x128")
+            step("  [tex] matched 128x128 — surf alloc")
             guard let surf = IOSurface(properties: [
                 .width:128,.height:128,.bytesPerElement:4,.bytesPerRow:512,.allocSize:65536
-            ]) else { log.append("    surf nil"); return }
+            ]) else { step("    surf nil"); return }
+            step("  [tex] matched — makeTexture")
             let td = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat:.bgra8Unorm, width:128, height:128, mipmapped:false)
             td.storageMode = .shared
             let tex = device.makeTexture(descriptor: td, iosurface: surf, plane: 0)
-            log.append("    tex → \(tex == nil ? "nil" : "OK")")
+            step("    tex=\(tex==nil ? "nil" : "OK")")
         }
-        // MISMATCH: surf 64x64 (16KB), tex 256x256 (262KB) — the key test
         autoreleasepool {
-            log.append("  [tex] MISMATCH surf64 tex256")
+            step("  [tex] MISMATCH surf64 tex256 — surf alloc")
             guard let surf = IOSurface(properties: [
                 .width:64,.height:64,.bytesPerElement:4,.bytesPerRow:256,.allocSize:16384
-            ]) else { log.append("    surf nil"); return }
+            ]) else { step("    surf nil"); return }
+            step("  [tex] MISMATCH — makeTexture(surf64, desc256)")
             let td = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat:.bgra8Unorm, width:256, height:256, mipmapped:false)
             td.storageMode = .shared
             let tex = device.makeTexture(descriptor: td, iosurface: surf, plane: 0)
-            log.append("    → \(tex == nil ? "nil (size-checked OK)" : "*** OK no bounds check ***")")
+            step("    → \(tex==nil ? "nil (bounds-checked)" : "*** OK NO BOUNDS CHECK ***")")
         }
 
         // ── 4. Blit encoder ──────────────────────────────────────────────
-        log.append("[4/6] Blit encoder")
-        // Fill + verify pattern
+        step("[4/6] Blit encoder")
         autoreleasepool {
-            log.append("  [blit] fill+verify")
+            step("  [blit] fill 4096 — makeCommandBuffer")
             guard let buf = device.makeBuffer(length: 4096, options: .storageModeShared),
                   let cmd = queue.makeCommandBuffer(),
-                  let enc = cmd.makeBlitCommandEncoder() else { return }
+                  let enc = cmd.makeBlitCommandEncoder() else { step("  setup nil"); return }
+            step("  [blit] fill — encoding")
             enc.fill(buffer: buf, range: 0..<4096, value: 0xAB)
-            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            enc.endEncoding()
+            step("  [blit] fill — commit")
+            cmd.commit(); cmd.waitUntilCompleted()
             let ptr = buf.contents().assumingMemoryBound(to: UInt8.self)
-            log.append("    \(ptr[0]==0xAB && ptr[4095]==0xAB ? "OK" : "MISMATCH")")
+            step("  fill result: \(ptr[0]==0xAB && ptr[4095]==0xAB ? "OK" : "MISMATCH")")
         }
-        // Non-overlapping copy
         autoreleasepool {
-            log.append("  [blit] copy non-overlap")
+            step("  [blit] copy — setup")
             guard let src = device.makeBuffer(length: 4096, options: .storageModeShared),
                   let dst = device.makeBuffer(length: 4096, options: .storageModeShared),
                   let cmd = queue.makeCommandBuffer(),
                   let enc = cmd.makeBlitCommandEncoder() else { return }
             src.contents().assumingMemoryBound(to: UInt8.self)[0] = 0x42
+            step("  [blit] copy — encoding")
             enc.copy(from: src, sourceOffset: 0, to: dst, destinationOffset: 0, size: 4096)
-            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            enc.endEncoding()
+            step("  [blit] copy — commit")
+            cmd.commit(); cmd.waitUntilCompleted()
             let ok = dst.contents().assumingMemoryBound(to: UInt8.self)[0] == 0x42
-            log.append("    status=\(cmd.status.rawValue) verify=\(ok)")
+            step("  copy status=\(cmd.status.rawValue) verify=\(ok)")
         }
 
-        // ── 5. MTLHeap suballoc / UAF stress ────────────────────────────
-        log.append("[5/6] MTLHeap")
-        for sz in [4096, 0x10000, 0x100000] {
+        // ── 5. MTLHeap ───────────────────────────────────────────────────
+        step("[5/6] MTLHeap")
+        for sz in [4096, 0x10000] {
             autoreleasepool {
-                log.append("  [heap] 0x\(String(sz,radix:16))")
+                step("  [heap] 0x\(String(sz,radix:16)) — makeHeap")
                 let hd = MTLHeapDescriptor(); hd.size = sz; hd.storageMode = .shared
                 guard let heap = device.makeHeap(descriptor: hd) else {
-                    log.append("    nil"); return
+                    step("    nil"); return
                 }
+                step("  [heap] actual=\(heap.size) — suballoc x16")
                 var bufs: [MTLBuffer] = []
                 for _ in 0..<16 {
-                    if let b = heap.makeBuffer(length: 256, options: .storageModeShared) {
-                        bufs.append(b)
-                    }
+                    if let b = heap.makeBuffer(length: 256, options: .storageModeShared) { bufs.append(b) }
                 }
                 let n = bufs.count
+                step("  [heap] sub=\(n) — releasing all")
                 bufs.removeAll()
+                step("  [heap] — realloc after free")
                 let b2 = heap.makeBuffer(length: 128, options: .storageModeShared)
-                log.append("    actual=\(heap.size) sub=\(n) realloc=\(b2==nil ? "nil":"OK")")
+                step("    realloc=\(b2==nil ? "nil":"OK")")
             }
         }
 
-        // ── 6. Rapid IOSurface create/lock/free ─────────────────────────
-        log.append("[6/6] Rapid IOSurface 512x512 x30")
+        // ── 6. Rapid IOSurface ───────────────────────────────────────────
+        step("[6/6] Rapid IOSurface 512x512 x30")
         var ok = 0; var fail = 0
-        for _ in 0..<30 {
+        for i in 0..<30 {
             autoreleasepool {
+                step("  [rapid] iter \(i)")
                 guard let s = IOSurface(properties: [
                     .width:512,.height:512,.bytesPerElement:4,.bytesPerRow:2048,.allocSize:1048576
                 ]) else { fail += 1; return }
@@ -137,9 +184,8 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
                 ok += 1
             }
         }
-        log.append("  created=\(ok) failed=\(fail)")
-
-        log.append("── Metal fuzz complete ─────────────────────")
+        step("  created=\(ok) failed=\(fail)")
+        step("── Metal fuzz complete ─────────────────────")
         completion()
     }
 }

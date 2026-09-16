@@ -47,6 +47,7 @@ struct ContentView: View {
                         ActionBtn("Fuzz\nIOSurface",    color: .purple) { runFuzzIOSurface() }
                         ActionBtn("Fuzz\nFramebuffer",  color: .teal)  { runFuzzFramebuffer() }
                         ActionBtn("Fuzz\nMetal",        color: .green) { runFuzzMetal() }
+                        ActionBtn("Crash\nLog",         color: .cyan)  { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
                     }
                     .padding()
@@ -200,6 +201,16 @@ struct ContentView: View {
             self.log.append("── IOSurface done. Hits: \(hits)")
             DispatchQueue.main.async { self.running = false }
         }
+    }
+
+    private func loadCrashLog() {
+        let content = SyncLog.read()
+        log.append("═══ CRASH LOG ═══════════════════════════")
+        content.components(separatedBy: "\n")
+            .filter { !$0.isEmpty }
+            .reversed()
+            .forEach { log.append($0) }
+        log.append("═════════════════════════════════════════")
     }
 
     private func runFuzzMetal() {
