@@ -154,8 +154,8 @@ struct ContentView: View {
                     b.log.append("*** AGX CRASH  sel=\(entry.selector) — PORT DIED")
                 case FUZZ_RESULT_OK:
                     b.log.append("  AGX OK    \(detail)")
-                case FUZZ_RESULT_ERROR:
-                    b.log.append("  AGX ERR   \(detail)")
+                case FUZZ_RESULT_INTERESTING, FUZZ_RESULT_ERROR:
+                    b.log.append("  AGX: \(detail)")
                 default: break
                 }
                 return 0
@@ -186,6 +186,10 @@ struct ContentView: View {
                     b.log.append("*** IOSurface CRASH  sel=\(entry.selector) — PORT DIED")
                 case FUZZ_RESULT_OK:
                     b.log.append("  Surface OK  \(detail)")
+                case FUZZ_RESULT_INTERESTING:
+                    b.log.append("  \(detail)")
+                case FUZZ_RESULT_ERROR:
+                    b.log.append("  \(detail)")
                 default: break
                 }
                 return 0
@@ -216,8 +220,8 @@ struct ContentView: View {
                     b.log.append("*** FRAMEBUFFER CRASH  sel=\(entry.selector) — PORT DIED")
                 case FUZZ_RESULT_OK:
                     b.log.append("  FB OK   \(detail)")
-                case FUZZ_RESULT_ERROR:
-                    b.log.append("  FB ERR  \(detail)")
+                case FUZZ_RESULT_INTERESTING, FUZZ_RESULT_ERROR:
+                    b.log.append("  FB: \(detail)")
                 default: break
                 }
                 return 0

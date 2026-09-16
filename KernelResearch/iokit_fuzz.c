@@ -147,6 +147,21 @@ int iokit_enumerate_services(char **log_out) {
 
 // ── Core scalar fuzzer ────────────────────────────────────────────────────────
 
+// Try to open a service with multiple type values; returns the conn that worked.
+// Reports back which type succeeded so the caller can log it.
+static io_connect_t _open_best_type(io_service_t svc, uint32_t *type_out) {
+    static const uint32_t kTypes[] = {0, 1, 2, 3, 5, 10};
+    for (int i = 0; i < (int)(sizeof(kTypes)/sizeof(kTypes[0])); i++) {
+        io_connect_t conn = IO_OBJECT_NULL;
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), kTypes[i], &conn);
+        if (kr == KERN_SUCCESS && conn != IO_OBJECT_NULL) {
+            if (type_out) *type_out = kTypes[i];
+            return conn;
+        }
+    }
+    return IO_OBJECT_NULL;
+}
+
 int iokit_fuzz_service(const char *service_name,
                        uint32_t    max_selector,
                        uint32_t    rounds_per_selector,
@@ -160,18 +175,29 @@ int iokit_fuzz_service(const char *service_name,
     io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, match);
     if (svc == IO_OBJECT_NULL) return -1;
 
-    io_connect_t conn = IO_OBJECT_NULL;
-    kern_return_t open_kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+    uint32_t open_type = 0;
+    io_connect_t conn = _open_best_type(svc, &open_type);
     IOObjectRelease(svc);
+    if (conn == IO_OBJECT_NULL) return -1;
 
-    if (open_kr != KERN_SUCCESS || conn == IO_OBJECT_NULL) return -1;
+    // Log opening info via callback (type 3 = FUZZ_RESULT_INTERESTING repurposed as info)
+    {
+        FuzzEntry info = {0};
+        info.service_name = service_name;
+        info.result = FUZZ_RESULT_INTERESTING;
+        snprintf(info.detail, sizeof(info.detail),
+                 "opened %s type=%u conn=0x%x", service_name, open_type, conn);
+        if (cb) cb(&info, ctx);
+    }
 
     int interesting = 0;
+    // Track first kIOReturnNotPrivileged so we know if sandbox is blocking
+    int first_priv_denied = -1;
+    int first_unsupported = -1;
 
     for (uint32_t sel = 0; sel <= max_selector; sel++) {
         for (uint32_t round = 0; round < rounds_per_selector; round++) {
-            // Build fuzzed scalar input — vary count each round
-            uint32_t in_cnt  = (uint32_t)(_lcg_next() % 9); // 0..8 scalars
+            uint32_t in_cnt  = (uint32_t)(_lcg_next() % 9);
             uint32_t out_cnt = 8;
             uint64_t inputs[8]  = {0};
             uint64_t outputs[8] = {0};
@@ -181,12 +207,11 @@ int iokit_fuzz_service(const char *service_name,
             }
 
             kern_return_t kr = IOConnectCallMethod(
-                conn,
-                sel,
-                inputs,  in_cnt,
-                NULL, 0,                // no struct-in
+                conn, sel,
+                inputs, in_cnt,
+                NULL, 0,
                 outputs, &out_cnt,
-                NULL, NULL              // no struct-out
+                NULL, NULL
             );
 
             FuzzEntry entry = {0};
@@ -197,7 +222,6 @@ int iokit_fuzz_service(const char *service_name,
             memcpy(entry.inputs, inputs, sizeof(uint64_t) * in_cnt);
 
             if (kr == KERN_SUCCESS) {
-                // Any successful method call is worth logging on first hit per selector
                 if (round == 0) {
                     entry.result = FUZZ_RESULT_OK;
                     snprintf(entry.detail, sizeof(entry.detail),
@@ -206,20 +230,31 @@ int iokit_fuzz_service(const char *service_name,
                     interesting++;
                     if (cb) { if (cb(&entry, ctx)) goto done; }
                 }
-            } else if (kr == kIOReturnNotPrivileged || kr == kIOReturnUnsupported) {
-                // Expected sandbox rejection or unimplemented selector — skip
-                (void)0;
+            } else if (kr == kIOReturnNotPrivileged) {
+                // Log first occurrence — tells us sandbox is blocking method calls
+                if (first_priv_denied < 0 && round == 0) {
+                    first_priv_denied = (int)sel;
+                    entry.result = FUZZ_RESULT_ERROR;
+                    snprintf(entry.detail, sizeof(entry.detail),
+                             "sel=%-3u SANDBOX_DENIED (kIOReturnNotPrivileged) — first of many", sel);
+                    if (cb) cb(&entry, ctx);
+                }
+            } else if (kr == kIOReturnUnsupported) {
+                if (first_unsupported < 0 && round == 0) {
+                    first_unsupported = (int)sel;
+                    entry.result = FUZZ_RESULT_ERROR;
+                    snprintf(entry.detail, sizeof(entry.detail),
+                             "sel=%-3u UNSUPPORTED (method not impl) — first of many", sel);
+                    if (cb) cb(&entry, ctx);
+                }
             } else if (kr == MACH_SEND_INVALID_DEST || kr == MACH_RCV_PORT_DIED) {
-                // Port died → service crashed → KERNEL PANIC or driver OOPs
                 entry.result = FUZZ_RESULT_PANIC;
                 snprintf(entry.detail, sizeof(entry.detail),
                          "PORT_DIED sel=%-3u in_cnt=%u  ***CRASH***", sel, in_cnt);
                 interesting++;
                 if (cb) cb(&entry, ctx);
-                // Service is dead, bail
                 goto done;
             } else {
-                // Any other error on first round — log it
                 if (round == 0) {
                     entry.result = FUZZ_RESULT_ERROR;
                     snprintf(entry.detail, sizeof(entry.detail),
@@ -228,6 +263,17 @@ int iokit_fuzz_service(const char *service_name,
                 }
             }
         }
+    }
+
+    // Summary of denied selectors
+    if (first_priv_denied >= 0 || first_unsupported >= 0) {
+        FuzzEntry summary = {0};
+        summary.service_name = service_name;
+        summary.result = FUZZ_RESULT_ERROR;
+        snprintf(summary.detail, sizeof(summary.detail),
+                 "sandbox denied from sel %d / unsupported from sel %d",
+                 first_priv_denied, first_unsupported);
+        if (cb) cb(&summary, ctx);
     }
 
 done:
