@@ -107,12 +107,21 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
             guard let surf = IOSurface(properties: [
                 .width:64,.height:64,.bytesPerElement:4,.bytesPerRow:256,.allocSize:16384
             ]) else { step("    surf nil"); return }
-            step("  [tex] MISMATCH — makeTexture(surf64, desc256)")
+            step("  [tex] MISMATCH — makeTexture(surf64, desc256) via safe trampoline")
             let td = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat:.bgra8Unorm, width:256, height:256, mipmapped:false)
             td.storageMode = .shared
-            let tex = device.makeTexture(descriptor: td, iosurface: surf, plane: 0)
-            step("    → \(tex==nil ? "nil (bounds-checked)" : "*** OK NO BOUNDS CHECK ***")")
+            var excPtr: UnsafeMutablePointer<CChar>? = nil
+            let tex = metal_make_texture_safe(device, td, surf as! IOSurfaceRef, 0, &excPtr)
+            if let ep = excPtr {
+                let msg = String(cString: ep); free(ep)
+                step("    *** EXCEPTION CAUGHT: \(msg)")
+                step("    *** makeTexture CRASHED on mismatch — Metal bounds-checks via exception")
+            } else if tex == nil {
+                step("    → nil (silently bounds-checked — no exception)")
+            } else {
+                step("    → *** OK NO BOUNDS CHECK — GPU can OOB read 16x past alloc ***")
+            }
         }
 
         // ── 4. Blit encoder ──────────────────────────────────────────────
