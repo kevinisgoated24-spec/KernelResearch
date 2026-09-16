@@ -58,7 +58,7 @@ class MetalFuzzer {
                     }
                 }
                 let surf = IOSurface(properties: props)
-                log.append("  surf \(c.w)x\(c.h) bpe=\(c.bpe) bpr=0x\(String(c.bpr, radix: 16)) → \(surf == nil ? "nil" : "OK id=\(surf!.id)")")
+                log.append("  surf \(c.w)x\(c.h) bpe=\(c.bpe) bpr=0x\(String(c.bpr, radix: 16)) → \(surf == nil ? "nil" : "OK")")
 
                 if let s = surf {
                     // Lock / unlock to trigger kernel mapping
