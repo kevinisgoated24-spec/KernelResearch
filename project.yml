@@ -1,0 +1,43 @@
+name: KernelResearch
+options:
+  bundleIdPrefix: com.kevinisgoated24spec
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    ENABLE_BITCODE: NO
+    DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+    SWIFT_OBJC_BRIDGING_HEADER: KernelResearch/KernelResearch-Bridging-Header.h
+    OTHER_CFLAGS: "-Wno-deprecated-declarations"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+    TARGETED_DEVICE_FAMILY: "1"
+
+targets:
+  KernelResearch:
+    type: application
+    platform: iOS
+    sources:
+      - path: KernelResearch
+        excludes:
+          - "**/*.txt"
+          - "**/*.md"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kevinisgoated24spec.KernelResearch
+        INFOPLIST_FILE: KernelResearch/Info.plist
+        CODE_SIGN_ENTITLEMENTS: KernelResearch/KernelResearch.entitlements
+        # Simulator builds: no signing required
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGNING_REQUIRED: NO
+        AD_HOC_CODE_SIGNING_ALLOWED: YES
+    dependencies:
+      - framework: System/Library/Frameworks/IOKit.framework
+        implicit: true
+    scheme:
+      testTargets: []
+      gatherCoverageData: false

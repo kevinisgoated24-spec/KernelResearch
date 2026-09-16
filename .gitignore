@@ -1,0 +1,23 @@
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+*.xcscmblueprint
+
+# Build
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# OS
+.DS_Store
+Thumbs.db

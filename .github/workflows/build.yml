@@ -1,0 +1,105 @@
+name: iOS Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build for iOS Simulator (A16 target)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # XcodeGen generates the .xcodeproj from project.yml
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      # List available simulators for reference
+      - name: Show available simulators
+        run: xcrun simctl list devices available | grep -E "iPhone 15|iPhone 16" || true
+
+      # Build for iPhone 15 simulator — no signing cert required
+      - name: Build (iPhone 15 Simulator)
+        run: |
+          xcodebuild build \
+            -project KernelResearch.xcodeproj \
+            -scheme KernelResearch \
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            | xcpretty || xcodebuild build \
+              -project KernelResearch.xcodeproj \
+              -scheme KernelResearch \
+              -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              COMPILER_INDEX_STORE_ENABLE=NO
+
+      # Archive the .app for inspection
+      - name: Archive build artifacts
+        if: success()
+        run: |
+          BUILD_DIR=$(xcodebuild -project KernelResearch.xcodeproj \
+            -scheme KernelResearch \
+            -showBuildSettings \
+            CODE_SIGNING_ALLOWED=NO 2>/dev/null \
+            | grep " BUILT_PRODUCTS_DIR " | head -1 | awk '{print $3}')
+          echo "Build dir: $BUILD_DIR"
+          if [ -d "$BUILD_DIR" ]; then
+            ls -la "$BUILD_DIR/"
+            zip -r KernelResearch-sim.zip "$BUILD_DIR/KernelResearch.app" 2>/dev/null || true
+          fi
+
+      - name: Upload simulator .app
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: KernelResearch-simulator-app
+          path: "*.zip"
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Separate job: static analysis of the C kernel research code
+  analyze:
+    name: Clang Static Analysis
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      # Run clang static analyzer on the C files — catches memory bugs, null derefs, etc.
+      - name: Clang Static Analyze
+        run: |
+          xcodebuild analyze \
+            -project KernelResearch.xcodeproj \
+            -scheme KernelResearch \
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            | xcpretty --report html --output clang-analysis-report.html || true
+
+      - name: Upload analysis report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clang-analysis-report
+          path: clang-analysis-report.html
+          if-no-files-found: ignore
+          retention-days: 14

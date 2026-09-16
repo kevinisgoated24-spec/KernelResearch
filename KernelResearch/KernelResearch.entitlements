@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required by bad_query for App Group container path (is_group=true path).
+         If you don't have this group registered, bad_query still works for the
+         system path (group_identifier=NULL) which needs no app group entitlement. -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.cc.forcequit.bad-query</string>
+    </array>
+
+    <!-- Allow spawning background threads for IOKit fuzzer -->
+    <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+    <true/>
+
+    <!-- Needed for IOKit connection in some iOS versions -->
+    <key>com.apple.private.iokit.user-client-cross-endian</key>
+    <false/>
+</dict>
+</plist>
