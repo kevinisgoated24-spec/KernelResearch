@@ -54,6 +54,7 @@ struct ContentView: View {
                         ActionBtn("Alloc\nConfusion",   color: .indigo)  { runAllocConfusion() }
                         ActionBtn("ArgBuf\nCorrupt",    color: .cyan)    { runArgBufCorrupt() }
                         ActionBtn("Indirect\nDispatch", color: .orange)  { runIndirectDispatch() }
+                        ActionBtn("Precision\nCorrupt", color: .purple)  { runPrecisionCorrupt() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
@@ -253,6 +254,15 @@ struct ContentView: View {
         running = true
         log.append("── GPU Indirect Dispatch Corruption ────────")
         runGPUIndirectDispatch(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runPrecisionCorrupt() {
+        guard !running else { return }
+        running = true
+        log.append("── Precision Corruption ────────────────────")
+        runPrecisionCorruption(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
