@@ -181,6 +181,77 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Two-heap adjacency test.
+// Alloc heap1 and heap2 back-to-back. Write sentinel pattern into heap2's
+// buffer via heap2 API. Then read heap1's OOB region (past hd.size up to
+// actual) — if the sentinel appears, heap1's OOB region physically overlaps
+// heap2's backing store. That means heap1 OOB write → heap2 data corruption.
+func runHeapAdjacency(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        step("── Heap Adjacency Test ─────────────────────")
+
+        // Try multiple pairs — allocator placement varies
+        for trial in 0..<8 {
+            autoreleasepool {
+                step("  [trial \(trial)]")
+                let hd1 = MTLHeapDescriptor(); hd1.size = 4096; hd1.storageMode = .shared
+                let hd2 = MTLHeapDescriptor(); hd2.size = 4096; hd2.storageMode = .shared
+                guard let h1 = device.makeHeap(descriptor: hd1),
+                      let h2 = device.makeHeap(descriptor: hd2) else { step("  heap nil"); return }
+
+                let actual1 = h1.size
+                let actual2 = h2.size
+                step("  h1.actual=\(actual1) h2.actual=\(actual2)")
+
+                // Allocate full-actual buffer from each heap
+                guard let buf1 = h1.makeBuffer(length: actual1, options: .storageModeShared),
+                      let buf2 = h2.makeBuffer(length: actual2, options: .storageModeShared) else {
+                    step("  bufs nil"); return
+                }
+
+                let p1 = buf1.contents().assumingMemoryBound(to: UInt8.self)
+                let p2 = buf2.contents().assumingMemoryBound(to: UInt8.self)
+
+                // Clear heap1 OOB region with 0x00
+                for i in 0..<actual1 { p1[i] = 0x00 }
+
+                // Write distinct sentinel pattern into ALL of heap2
+                let sentinel: UInt8 = 0xAD
+                for i in 0..<actual2 { p2[i] = sentinel }
+
+                // Now scan heap1's OOB region (bytes 4096..<actual1) for sentinel
+                var hits = 0
+                for i in 4096..<actual1 {
+                    if p1[i] == sentinel { hits += 1 }
+                }
+
+                if hits > 0 {
+                    step("  *** ADJACENT: heap1 OOB reads \(hits)/\(actual1-4096) bytes of heap2 ***")
+                    step("  *** heap1 OOB WRITE can corrupt heap2 memory ***")
+
+                    // Confirm write: stamp 0xBE into heap1 OOB, check heap2
+                    for i in 4096..<actual1 { p1[i] = 0xBE }
+                    var writeHits = 0
+                    for i in 0..<actual2 { if p2[i] == 0xBE { writeHits += 1 } }
+                    step("  *** WRITE CONFIRM: \(writeHits) bytes of heap2 now read 0xBE via heap1 OOB ***")
+                } else {
+                    // Log VA distance — still useful
+                    let va1 = UInt(bitPattern: p1)
+                    let va2 = UInt(bitPattern: p2)
+                    let dist = va2 > va1 ? va2 - va1 : va1 - va2
+                    step("  not adjacent. VA dist=0x\(String(dist, radix: 16)) hits=\(hits)")
+                }
+            }
+        }
+
+        step("── Heap Adjacency complete ─────────────────")
+        completion()
+    }
+}
+
 // MTLHeap OOB suballoc probe.
 // We observed: makeHeap(size:4096) → actual=16384 (4× roundup).
 // Test: can we suballoc buffers LARGER than hd.size but within actual?

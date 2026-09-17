@@ -48,6 +48,7 @@ struct ContentView: View {
                         ActionBtn("Fuzz\nFramebuffer",  color: .teal)  { runFuzzFramebuffer() }
                         ActionBtn("Fuzz\nMetal",        color: .green)   { runFuzzMetal() }
                         ActionBtn("Heap\nOOB",          color: .yellow)  { runHeapOOBTest() }
+                        ActionBtn("Heap\nAdjacency",    color: .orange)  { runHeapAdjTest() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
@@ -220,6 +221,15 @@ struct ContentView: View {
         running = true
         log.append("── Metal + IOSurface Framework Fuzz ────────")
         runMetalFuzz(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runHeapAdjTest() {
+        guard !running else { return }
+        running = true
+        log.append("── Heap Adjacency Test ─────────────────────")
+        runHeapAdjacency(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
