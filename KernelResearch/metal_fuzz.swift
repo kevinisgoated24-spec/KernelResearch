@@ -525,7 +525,7 @@ private func icbExecute(_ icb: MTLIndirectCommandBuffer,
           let enc = cmd.makeComputeCommandEncoder() else { step("cmd nil"); completion(); return }
     enc.setComputePipelineState(pso)
     enc.useResource(icb, usage: .read)
-    enc.executeCommandsInBuffer(icb, range: NSRange(location: 0, length: 1))
+    enc.executeCommandsInBuffer(icb, range: 0..<1)
     enc.endEncoding()
     let tag = oobCorrupt ? "CORRUPTED ICB EXECUTE" : "CLEAN ICB EXECUTE"
     sl.write("\(tag) — committing")
@@ -594,7 +594,7 @@ func runICBCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
 
         // ── Alloc ICB from h1 (lives in h1 GPU-visible shared memory) ───
         let icbDesc = MTLIndirectCommandBufferDescriptor()
-        icbDesc.commandTypes = .concurrentDispatchThreadgroups
+        icbDesc.commandTypes = .concurrentDispatch
         icbDesc.inheritBuffers = false
         icbDesc.inheritPipelineState = false
         icbDesc.maxKernelBufferBindCount = 1
@@ -619,8 +619,8 @@ func runICBCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
         // ── Encode one compute command into ICB ──────────────────────────
         let cmd0 = icb.indirectComputeCommandAt(0)
         cmd0.setComputePipelineState(pso)
-        cmd0.concurrentDispatchThreadgroups(MTLSize(width:1,height:1,depth:1),
-                                             threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
+        cmd0.concurrentDispatchThreads(MTLSize(width:1,height:1,depth:1),
+                                        threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
         step("encoded 1 compute command into ICB")
 
         // ── Scan h1 for ICB encoded bytes (via h0 OOB) ──────────────────
