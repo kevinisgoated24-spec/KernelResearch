@@ -59,6 +59,7 @@ struct ContentView: View {
                         ActionBtn("ArgBuf\nConfuse",    color: .red)     { runArgBufConfuse() }
                         ActionBtn("SharedEv\nCorrupt",  color: .mint)    { runSharedEvCorrupt() }
                         ActionBtn("ICB\nCorrupt",       color: .orange)  { runICBCorrupt() }
+                        ActionBtn("OOB\nInfo Leak",     color: .yellow)  { runOOBLeak() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
@@ -267,6 +268,15 @@ struct ContentView: View {
         running = true
         log.append("── ICB Corrupt ─────────────────────────────")
         runICBCorruptFuzz(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runOOBLeak() {
+        guard !running else { return }
+        running = true
+        log.append("── OOB Info Leak ───────────────────────────")
+        runOOBInfoLeak(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }

