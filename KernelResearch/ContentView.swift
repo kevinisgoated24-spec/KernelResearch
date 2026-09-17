@@ -266,7 +266,7 @@ struct ContentView: View {
         guard !running else { return }
         running = true
         log.append("── ICB Corrupt ─────────────────────────────")
-        runICBCorrupt(log: log) {
+        runICBCorruptFuzz(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
