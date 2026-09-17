@@ -471,7 +471,7 @@ func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
         do {
             let opts = MTLCompileOptions()
             lib = try device.makeLibrary(source: src, options: opts)
-            guard let f = lib.makeFunction(named: "noop") else { step("fn nil"); completion(); return }
+            guard let f = lib.makeFunction(name: "noop") else { step("fn nil"); completion(); return }
             fn  = f
             pso = try device.makeComputePipelineState(function: fn)
         } catch {
