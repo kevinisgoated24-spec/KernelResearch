@@ -1870,9 +1870,18 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
                     for b in 0..<8 { val |= UInt64(scratch[qw*8 + b]) << (b*8) }
                     guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
 
-                    // Classify
+                    // Classify with strict KTEXT heuristics:
+                    // Real ARM64 kernel text pointers must be 4-byte aligned (low 2 bits == 0)
+                    // and must not be single-byte-fill patterns (RGBA / shader data).
+                    // Giant regions (> 256KB) almost certainly contain shader/framebuffer data,
+                    // not embedded kernel pointers — skip KTEXT classification there.
+                    let lowBitsAligned = (val & 3) == 0
+                    let b0v = UInt8(val & 0xFF)
+                    let isFillPattern = (val == UInt64(b0v) &* 0x0101010101010101)
+                    let regionIsSmall = size <= 0x40000  // ≤ 256 KB
+
                     let cat: String
-                    if val < 0xFFFFFE0100000000 {
+                    if val < 0xFFFFFE0100000000 && lowBitsAligned && !isFillPattern && regionIsSmall {
                         cat = "KTEXT"; rKTEXT += 1; cKTEXT += 1
                         if ktextSamples.count < 30 {
                             ktextSamples.append((region: UInt(addr), offset: qw*8, val: val))
