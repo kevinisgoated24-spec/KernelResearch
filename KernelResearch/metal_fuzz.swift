@@ -1704,7 +1704,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         let props: [IOSurfacePropertyKey: Any] = [
             .width: 256, .height: 4,
             .bytesPerElement: 4, .bytesPerRow: 1024,
-            .pixelFormat: kCVPixelFormatType_32BGRA
+            .pixelFormat: 0x42475241  // 'BGRA' kCVPixelFormatType_32BGRA
         ]
         guard let surface = IOSurface(properties: props) else {
             step("IOSurface create failed"); completion(); return
