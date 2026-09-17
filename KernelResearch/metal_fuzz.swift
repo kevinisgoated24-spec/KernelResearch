@@ -181,6 +181,92 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Heap spray adjacency test.
+// Alloc N heaps, record their VA addresses, find closest pair.
+// If any two heaps land within actual_size bytes of each other → cross-heap write.
+func runHeapSpray(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        step("── Heap Spray Adjacency ────────────────────")
+
+        let N = 64
+        let declaredSize = 4096
+
+        // Alloc N heaps + full-actual buffers, record VA
+        var heaps:  [MTLHeap]   = []
+        var bufs:   [MTLBuffer] = []
+        var addrs:  [UInt]      = []
+
+        for i in 0..<N {
+            autoreleasepool {
+                let hd = MTLHeapDescriptor(); hd.size = declaredSize; hd.storageMode = .shared
+                guard let h = device.makeHeap(descriptor: hd),
+                      let b = h.makeBuffer(length: h.size, options: .storageModeShared) else { return }
+                let va = UInt(bitPattern: b.contents())
+                heaps.append(h); bufs.append(b); addrs.append(va)
+                if i % 16 == 0 { step("  alloc \(i)/\(N) va=0x\(String(va, radix:16))") }
+            }
+        }
+        step("  total heaps=\(heaps.count)")
+
+        // Find closest pair
+        var minDist: UInt = UInt.max
+        var minI = 0, minJ = 0
+        for i in 0..<addrs.count {
+            for j in (i+1)..<addrs.count {
+                let d = addrs[j] > addrs[i] ? addrs[j] - addrs[i] : addrs[i] - addrs[j]
+                if d < minDist { minDist = d; minI = i; minJ = j }
+            }
+        }
+
+        let actual = heaps.first?.size ?? 16384
+        step("  closest pair: heap[\(minI)] heap[\(minJ)] dist=0x\(String(minDist, radix:16)) (\(minDist)B)")
+        step("  actual_size=\(actual) — need dist < \(actual) for overlap")
+
+        if minDist < UInt(actual) {
+            step("  *** OVERLAP FOUND — dist \(minDist) < actual \(actual) ***")
+
+            // Write sentinel to heap[minJ], scan heap[minI]'s OOB region
+            let pI = bufs[minI].contents().assumingMemoryBound(to: UInt8.self)
+            let pJ = bufs[minJ].contents().assumingMemoryBound(to: UInt8.self)
+            let lenI = bufs[minI].length
+            let lenJ = bufs[minJ].length
+
+            for k in 0..<lenJ { pJ[k] = 0xAD }
+            var hits = 0
+            for k in declaredSize..<lenI { if pI[k] == 0xAD { hits += 1 } }
+            step("  sentinel scan: \(hits)/\(lenI - declaredSize) OOB bytes match heap[\(minJ)]")
+
+            if hits > 0 {
+                step("  *** CROSS-HEAP READ CONFIRMED ***")
+                for k in declaredSize..<lenI { pI[k] = 0xBE }
+                var wHits = 0
+                for k in 0..<lenJ { if pJ[k] == 0xBE { wHits += 1 } }
+                step("  *** CROSS-HEAP WRITE CONFIRMED: \(wHits) bytes corrupted ***")
+            }
+        } else {
+            // Log VA distribution — useful for understanding allocator layout
+            let sorted = addrs.sorted()
+            var gaps: [UInt] = []
+            for i in 1..<sorted.count { gaps.append(sorted[i] - sorted[i-1]) }
+            let minGap = gaps.min() ?? 0
+            let maxGap = gaps.max() ?? 0
+            step("  no overlap. gap range: 0x\(String(minGap,radix:16))..0x\(String(maxGap,radix:16))")
+            step("  need \(Int(minGap) / actual)x more heaps to fill one gap")
+            // Log first 8 sorted VAs for pattern analysis
+            for i in 0..<min(8, sorted.count) {
+                step("  va[\(i)]=0x\(String(sorted[i], radix:16))")
+            }
+        }
+
+        heaps.removeAll(); bufs.removeAll()
+        step("── Heap Spray complete ─────────────────────")
+        completion()
+    }
+}
+
 // Two-heap adjacency test.
 // Alloc heap1 and heap2 back-to-back. Write sentinel pattern into heap2's
 // buffer via heap2 API. Then read heap1's OOB region (past hd.size up to
