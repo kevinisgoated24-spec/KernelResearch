@@ -567,9 +567,13 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         do {
             lib = try device.makeLibrary(source: src, options: MTLCompileOptions())
             guard let fn = lib.makeFunction(name: "icbFuzz") else { step("fn nil"); completion(); return }
-            pso = try device.makeComputePipelineState(function: fn)
+            // supportIndirectCommandBuffers required to use this PSO inside an ICB
+            let psoDesc = MTLComputePipelineDescriptor()
+            psoDesc.computeFunction = fn
+            psoDesc.supportIndirectCommandBuffers = true
+            pso = try device.makeComputePipelineState(descriptor: psoDesc, options: [], reflection: nil)
         } catch { step("✗ PSO: \(error.localizedDescription)"); completion(); return }
-        step("icbFuzz PSO compiled")
+        step("icbFuzz PSO compiled (ICB-capable)")
 
         // ICB from device (MTLHeap.makeIndirectCommandBuffer unsupported)
         let icbDesc = MTLIndirectCommandBufferDescriptor()
