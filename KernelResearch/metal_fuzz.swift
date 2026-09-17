@@ -1851,16 +1851,23 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
             let tag      = info.user_tag
 
             if readable && size >= 64 && size <= 32 * 1024 * 1024 {
-                let raw = UnsafeRawPointer(bitPattern: UInt(addr))!
-                    .assumingMemoryBound(to: UInt8.self)
+                // Safe copy via vm_read_overwrite — kernel handles any fault in source VA,
+                // returns error instead of crashing us on guard pages / lazy-mapped regions.
+                var scratch = [UInt8](repeating: 0, count: Int(size))
+                var outBytes: vm_size_t = 0
+                let readKr: kern_return_t = scratch.withUnsafeMutableBytes { buf in
+                    vm_read_overwrite(mach_task_self_, addr, vm_size_t(size),
+                                      vm_address_t(bitPattern: buf.baseAddress!), &outBytes)
+                }
+                guard readKr == KERN_SUCCESS else { addr += size; continue }
 
                 var rKTEXT = 0, rKHEAP = 0, rKMMIO = 0
                 var headerLogged = false
                 var logged = 0
 
-                for qw in 0..<(Int(size) / 8) {
+                for qw in 0..<(Int(outBytes) / 8) {
                     var val: UInt64 = 0
-                    for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
+                    for b in 0..<8 { val |= UInt64(scratch[qw*8 + b]) << (b*8) }
                     guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
 
                     // Classify
