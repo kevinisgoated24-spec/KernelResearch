@@ -362,11 +362,11 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         step("h0 va=0x\(String(va0,radix:16)) (probe base)")
 
         // Create a buffer in h1 — this will be our "argument buffer" target
-        // h1 already has its 64-byte probe; alloc the rest as argBuf
-        let argBufLen = actual - 64
-        guard argBufLen > 0 else { step("no space in h1 for argBuf"); completion(); return }
+        // h1 probe (64 bytes) was rounded up to 4096 internally by Metal's suballocator
+        // so h1 has actual-4096 bytes remaining → use fixed 512 which always fits
+        let argBufLen = 512
         guard let argBuf = h1.makeBuffer(length: argBufLen, options: .storageModeShared) else {
-            step("argBuf nil — h1 full, retry"); completion(); return
+            step("argBuf nil — h1 exhausted (probe alignment ate too much), retry"); completion(); return
         }
         let argVA = UInt(bitPattern: argBuf.contents())
         step("argBuf in h1 va=0x\(String(argVA,radix:16))")
