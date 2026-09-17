@@ -555,7 +555,7 @@ func runSharedEventCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
         step("sprayed \(heapBufs.count) heaps + \(events.count) events")
         guard !heapBufs.isEmpty else { step("no heaps"); done(); return }
 
-        let actual = heapBufs.isEmpty ? 16384 : Int(bitPattern: heapBufs[0].length)
+        let actual = heapBufs[0].length
 
         // Find adjacent heap pair (sort by VA)
         let sortedI = (0..<heapVas.count).sorted { heapVas[$0] < heapVas[$1] }
