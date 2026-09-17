@@ -181,6 +181,76 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// MTLHeap OOB suballoc probe.
+// We observed: makeHeap(size:4096) → actual=16384 (4× roundup).
+// Test: can we suballoc buffers LARGER than hd.size but within actual?
+// If yes → Metal's heap descriptor boundary is decorative, not enforced.
+func runHeapOOB(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        step("── Heap OOB Probe ──────────────────────────")
+
+        let requestedSize = 4096
+        let hd = MTLHeapDescriptor()
+        hd.size = requestedSize
+        hd.storageMode = .shared
+        guard let heap = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+        let actualSize = heap.size
+        step("requested=\(requestedSize) actual=\(actualSize) gap=\(actualSize - requestedSize)")
+
+        // Sizes to probe: just under requested, at requested, 2×, actual-1, actual, actual+1
+        let probes = [
+            requestedSize - 1,
+            requestedSize,
+            requestedSize * 2,
+            actualSize - 1,
+            actualSize,
+            actualSize + 1,
+            actualSize * 2,
+        ]
+
+        for sz in probes {
+            autoreleasepool {
+                step("  suballoc(\(sz)) — attempt")
+                guard let buf = heap.makeBuffer(length: sz, options: .storageModeShared) else {
+                    step("    → nil (refused)")
+                    return
+                }
+                let real = buf.length
+                step("    → OK bufLen=\(real) — writing full range")
+                // Write pattern to entire buffer length Metal gave us
+                let ptr = buf.contents().assumingMemoryBound(to: UInt8.self)
+                for i in stride(from: 0, to: real, by: 256) { ptr[i] = 0xBB }
+                ptr[real - 1] = 0xDD
+                step("    → write OK — buf survives \(real) bytes")
+                if sz > requestedSize && sz <= actualSize {
+                    step("    *** OOB: suballoc past hd.size=\(requestedSize) accepted — allocator boundary not enforced")
+                }
+                if sz > actualSize {
+                    step("    *** PAST actual — this shouldn't be reachable")
+                }
+            }
+        }
+
+        // Exhaustion test: fill heap until nil
+        step("  exhaustion — suballoc 256 until nil")
+        var count = 0
+        var bufs: [MTLBuffer] = []
+        while let b = heap.makeBuffer(length: 256, options: .storageModeShared) {
+            bufs.append(b)
+            count += 1
+            if count > 10000 { break }
+        }
+        step("  filled \(count) × 256B = \(count*256) bytes before nil (actual=\(actualSize))")
+        bufs.removeAll()
+
+        step("── Heap OOB complete ───────────────────────")
+        completion()
+    }
+}
+
 // Deliberately trigger the mismatch crash — call this from its own button.
 // WARNING: this WILL kill the process. Check crash log on next launch.
 func runMismatchTest(log: FuzzLog) {
