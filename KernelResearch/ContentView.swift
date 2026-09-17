@@ -58,6 +58,7 @@ struct ContentView: View {
                         ActionBtn("Heap\nUAF",          color: .green)   { runHeapUAF() }
                         ActionBtn("ArgBuf\nConfuse",    color: .red)     { runArgBufConfuse() }
                         ActionBtn("SharedEv\nCorrupt",  color: .mint)    { runSharedEvCorrupt() }
+                        ActionBtn("ICB\nCorrupt",       color: .orange)  { runICBCorrupt() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
@@ -257,6 +258,15 @@ struct ContentView: View {
         running = true
         log.append("── GPU Indirect Dispatch Corruption ────────")
         runGPUIndirectDispatch(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runICBCorrupt() {
+        guard !running else { return }
+        running = true
+        log.append("── ICB Corrupt ─────────────────────────────")
+        runICBCorrupt(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
