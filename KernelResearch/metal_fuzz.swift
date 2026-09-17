@@ -1827,23 +1827,26 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
 
         while totalRegions < 1500 && kernelPtrs < 150 {
             var size:    vm_size_t = 0
-            var info     = vm_region_basic_info_data_t()
-            var count    = mach_msg_type_number_t(VM_REGION_BASIC_INFO_COUNT)
+            var info     = vm_region_extended_info_data_t()
+            var count    = mach_msg_type_number_t(VM_REGION_EXTENDED_INFO_COUNT)
             var objName: mach_port_t = 0
 
             let kr: kern_return_t = withUnsafeMutablePointer(to: &info) { ip in
                 ip.withMemoryRebound(to: Int32.self, capacity: Int(count)) { rp in
                     vm_region_64(mach_task_self_, &addr, &size,
-                                 VM_REGION_BASIC_INFO, rp, &count, &objName)
+                                 VM_REGION_EXTENDED_INFO, rp, &count, &objName)
                 }
             }
             guard kr == KERN_SUCCESS else { break }
             totalRegions += 1
 
-            let readable = (info.protection & VM_PROT_READ) != 0
+            let readable  = (info.protection & VM_PROT_READ) != 0
+            // share_mode: SM_SHARED=2, SM_TRUESHARED=4, SM_PRIVATE=3
+            let isShared  = info.share_mode != 3
+            // user_tag 12 = VM_MEMORY_IOKIT — AGX ring buffers land here
+            let tag       = info.user_tag
 
             // Scan readable regions between 64 B and 32 MB
-            // Skips huge anonymous regions (stack/heap bulk) but catches IOKit shared pages
             if readable && size >= 64 && size <= 32 * 1024 * 1024 {
                 let raw = UnsafeRawPointer(bitPattern: UInt(addr))!
                     .assumingMemoryBound(to: UInt8.self)
@@ -1856,8 +1859,8 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
 
                     if regionHits == 0 {
                         hotRegions += 1
-                        let sh = info.shared != 0 ? " SHARED" : ""
-                        step("  [REGION 0x\(String(addr, radix:16)) sz=0x\(String(size, radix:16)) prot=\(info.protection)\(sh)]")
+                        let sh = isShared ? " SHARED" : ""
+                        step("  [REGION 0x\(String(addr, radix:16)) sz=0x\(String(size, radix:16)) tag=\(tag)\(sh)]")
                     }
                     step("    +0x\(String(qw*8, radix:16)) = 0x\(String(val, radix:16)) *** KPTR")
                     regionHits += 1
