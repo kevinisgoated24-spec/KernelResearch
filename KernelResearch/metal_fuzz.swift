@@ -587,8 +587,8 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         // Encode 1 compute command into ICB
         let cmd0 = icb.indirectComputeCommandAt(0)
         cmd0.setComputePipelineState(pso)
-        cmd0.setKernelBuffer(icbBuf,  offset: 0, index: 0)
-        cmd0.setKernelBuffer(dataBuf, offset: 0, index: 1)
+        cmd0.setKernelBuffer(icbBuf,  offset: 0, at: 0)
+        cmd0.setKernelBuffer(dataBuf, offset: 0, at: 1)
         cmd0.concurrentDispatchThreads(MTLSize(width:1,height:1,depth:1),
                                         threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
         step("encoded ICB: icbFuzz(icbBuf[h1], dataBuf) dispatch(1,1,1)")
