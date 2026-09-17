@@ -1820,21 +1820,21 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
         _ = device.makeCommandQueue()
         step("AGX init — walking VM regions for kernel ptrs")
 
-        var addr: mach_vm_address_t = 0
+        var addr: vm_address_t = 0
         var totalRegions = 0
         var hotRegions   = 0
         var kernelPtrs   = 0
 
         while totalRegions < 1500 && kernelPtrs < 150 {
-            var size:    mach_vm_size_t  = 0
+            var size:    vm_size_t = 0
             var info     = vm_region_basic_info_data_64_t()
             var count    = mach_msg_type_number_t(VM_REGION_BASIC_INFO_COUNT_64)
-            var objName: mach_port_t     = 0
+            var objName: mach_port_t = 0
 
             let kr: kern_return_t = withUnsafeMutablePointer(to: &info) { ip in
                 ip.withMemoryRebound(to: Int32.self, capacity: Int(count)) { rp in
-                    mach_vm_region(mach_task_self_, &addr, &size,
-                                   VM_REGION_BASIC_INFO_64, rp, &count, &objName)
+                    vm_region_64(mach_task_self_, &addr, &size,
+                                 VM_REGION_BASIC_INFO_64, rp, &count, &objName)
                 }
             }
             guard kr == KERN_SUCCESS else { break }
