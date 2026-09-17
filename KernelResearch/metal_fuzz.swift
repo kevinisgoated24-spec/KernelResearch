@@ -214,9 +214,10 @@ func runAllocatorConfusion(log: FuzzLog, completion: @escaping () -> Void) {
         step("h0 va=0x\(String(va0,radix:16)) actual=\(actual)")
 
         // h1 — leave EMPTY (no suballoc yet — allocator state is pristine)
+        // VA derived: spray confirmed heaps are contiguous at exactly actual_size spacing
         guard let h1 = device.makeHeap(descriptor: hd) else { step("h1 nil"); completion(); return }
-        let va1_heap = UInt(bitPattern: h1.contents)
-        step("h1 heap.contents=0x\(String(va1_heap,radix:16))")
+        let va1_heap = va0 + UInt(actual)
+        step("h1 va (derived)=0x\(String(va1_heap,radix:16))")
 
         // h2 — alloc fully — this is our target VA we want to redirect h1 into
         guard let h2 = device.makeHeap(descriptor: hd) else { step("h2 nil"); completion(); return }
