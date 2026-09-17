@@ -61,6 +61,7 @@ struct ContentView: View {
                         ActionBtn("ICB\nCorrupt",       color: .orange)  { runICBCorrupt() }
                         ActionBtn("OOB\nInfo Leak",     color: .yellow)  { runOOBLeak() }
                         ActionBtn("IOSurf\nLeak",       color: .cyan)    { runIOSurfLeak() }
+                        ActionBtn("VM\nRegion Scan",    color: .green)   { runVMScan() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
@@ -287,6 +288,15 @@ struct ContentView: View {
         running = true
         log.append("── IOSurface Backing Store Leak ────────────")
         runIOSurfaceLeak(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runVMScan() {
+        guard !running else { return }
+        running = true
+        log.append("── VM Region Scan ──────────────────────────")
+        runVMRegionScan(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }

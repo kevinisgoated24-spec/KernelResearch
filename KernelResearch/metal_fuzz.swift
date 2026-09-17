@@ -1803,3 +1803,75 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     }
 }
+
+// VM Region Scanner
+// Walks every readable mapped region in our own process via mach_vm_region.
+// The AGX IOKit user client maps ring buffers and feedback pages into user VA —
+// those shared pages contain kernel pointers that no GPU-side scan can reach.
+// Reports regions that contain kernel-range qwords (≥ 0xFFFFFE0000000000).
+func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+
+        // Initialise AGX so its shared memory regions are mapped into our process
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            step("device nil"); completion(); return
+        }
+        _ = device.makeCommandQueue()
+        step("AGX init — walking VM regions for kernel ptrs")
+
+        var addr: mach_vm_address_t = 0
+        var totalRegions = 0
+        var hotRegions   = 0
+        var kernelPtrs   = 0
+
+        while totalRegions < 1500 && kernelPtrs < 150 {
+            var size:    mach_vm_size_t  = 0
+            var info     = vm_region_basic_info_data_64_t()
+            var count    = mach_msg_type_number_t(VM_REGION_BASIC_INFO_COUNT_64)
+            var objName: mach_port_t     = 0
+
+            let kr: kern_return_t = withUnsafeMutablePointer(to: &info) { ip in
+                ip.withMemoryRebound(to: Int32.self, capacity: Int(count)) { rp in
+                    mach_vm_region(mach_task_self_, &addr, &size,
+                                   VM_REGION_BASIC_INFO_64, rp, &count, &objName)
+                }
+            }
+            guard kr == KERN_SUCCESS else { break }
+            totalRegions += 1
+
+            let readable = (info.protection & VM_PROT_READ) != 0
+
+            // Scan readable regions between 64 B and 32 MB
+            // Skips huge anonymous regions (stack/heap bulk) but catches IOKit shared pages
+            if readable && size >= 64 && size <= 32 * 1024 * 1024 {
+                let raw = UnsafeRawPointer(bitPattern: UInt(addr))!
+                    .assumingMemoryBound(to: UInt8.self)
+                var regionHits = 0
+
+                for qw in 0..<(Int(size) / 8) {
+                    var val: UInt64 = 0
+                    for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
+                    guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
+
+                    if regionHits == 0 {
+                        hotRegions += 1
+                        let sh = info.shared != 0 ? " SHARED" : ""
+                        step("  [REGION 0x\(String(addr, radix:16)) sz=0x\(String(size, radix:16)) prot=\(info.protection)\(sh)]")
+                    }
+                    step("    +0x\(String(qw*8, radix:16)) = 0x\(String(val, radix:16)) *** KPTR")
+                    regionHits += 1
+                    kernelPtrs += 1
+                    if regionHits >= 8 { step("    ..."); break }
+                    if kernelPtrs >= 150 { break }
+                }
+            }
+
+            addr += size
+        }
+
+        step("walked \(totalRegions) regions | \(hotRegions) hot | \(kernelPtrs) kernel ptrs")
+        step("── VM Region Scan complete ─────────────────")
+        completion()
+    }
+}
