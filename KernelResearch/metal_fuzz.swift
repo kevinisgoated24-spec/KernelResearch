@@ -583,8 +583,8 @@ func runArgBufTypeConfusion(log: FuzzLog, completion: @escaping () -> Void) {
         // Sentinel-fill, then encode
         for i in 0..<argBufLen { pArg[i] = 0x55 }
         argEnc.setArgumentBuffer(argBuf, offset: 0)
-        argEnc.setBuffer(legitBuf, offset: 0, atIndex: 0)
-        argEnc.setTexture(legitTex, atIndex: 1)
+        argEnc.setBuffer(legitBuf, offset: 0, index: 0)
+        argEnc.setTexture(legitTex, index: 1)
 
         // Scan encoded bytes: find texture handle offset (non-0x55 at higher offset)
         step("  encoded argBuf layout:")
