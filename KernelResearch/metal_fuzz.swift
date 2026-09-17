@@ -1827,14 +1827,14 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
 
         while totalRegions < 1500 && kernelPtrs < 150 {
             var size:    vm_size_t = 0
-            var info     = vm_region_extended_info_data_t()
-            var count    = mach_msg_type_number_t(VM_REGION_EXTENDED_INFO_COUNT)
+            var info     = vm_region_extended_info_compat_t()
+            var count    = mach_msg_type_number_t(VM_REGION_EXTENDED_INFO_COMPAT_COUNT)
             var objName: mach_port_t = 0
 
             let kr: kern_return_t = withUnsafeMutablePointer(to: &info) { ip in
                 ip.withMemoryRebound(to: Int32.self, capacity: Int(count)) { rp in
                     vm_region_64(mach_task_self_, &addr, &size,
-                                 VM_REGION_EXTENDED_INFO, rp, &count, &objName)
+                                 VM_REGION_EXTENDED_INFO_COMPAT, rp, &count, &objName)
                 }
             }
             guard kr == KERN_SUCCESS else { break }
