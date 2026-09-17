@@ -181,6 +181,81 @@ func runMetalFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// Heap boundary cross test.
+// Heaps are spaced exactly actual_size=16384 bytes apart (confirmed via spray).
+// Heaps are CONTIGUOUS — no padding. ptr[actual_size] of heap[0] = ptr[0] of heap[1].
+// Swift raw pointer writes don't bounds-check. Test if a one-past-end write
+// from heap[0] lands in heap[1]'s backing memory.
+func runHeapBoundaryCross(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ No Metal device"); completion(); return }
+        step("── Heap Boundary Cross ─────────────────────")
+
+        // Alloc 3 heaps — use middle one as victim so both sides are controlled
+        let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
+        guard let h0 = device.makeHeap(descriptor: hd),
+              let h1 = device.makeHeap(descriptor: hd),
+              let h2 = device.makeHeap(descriptor: hd) else { step("heap nil"); completion(); return }
+
+        let actual = h0.size
+        step("actual=\(actual)")
+
+        guard let b0 = h0.makeBuffer(length: actual, options: .storageModeShared),
+              let b1 = h1.makeBuffer(length: actual, options: .storageModeShared),
+              let b2 = h2.makeBuffer(length: actual, options: .storageModeShared) else { step("buf nil"); completion(); return }
+
+        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
+        let p1 = b1.contents().assumingMemoryBound(to: UInt8.self)
+        let p2 = b2.contents().assumingMemoryBound(to: UInt8.self)
+
+        let va0 = UInt(bitPattern: p0)
+        let va1 = UInt(bitPattern: p1)
+        let va2 = UInt(bitPattern: p2)
+        step("va0=0x\(String(va0,radix:16))")
+        step("va1=0x\(String(va1,radix:16)) dist=0x\(String(va1>va0 ? va1-va0 : va0-va1, radix:16))")
+        step("va2=0x\(String(va2,radix:16)) dist=0x\(String(va2>va1 ? va2-va1 : va1-va2, radix:16))")
+
+        // Clear all three heaps
+        for i in 0..<actual { p0[i] = 0x00; p1[i] = 0xAA; p2[i] = 0x00 }
+        step("h1 filled with 0xAA sentinel")
+
+        // Determine layout — find which heap is adjacent to h1
+        // Try writing one-past-end of h0 and one-past-end of h2
+        // If h0 is just before h1: p0[actual] == 0xAA (hits h1's byte 0)
+        // Use unsafe pointer arithmetic — raw memory access past buffer end
+        step("reading p0[actual] = p0[\(actual)] (one past h0 end)")
+        let v0end = p0[actual]   // UB but intentional — probing adjacent memory
+        step("p0[\(actual)] = 0x\(String(v0end, radix:16))")
+
+        step("reading p2[actual] (one past h2 end)")
+        let v2end = p2[actual]
+        step("p2[\(actual)] = 0x\(String(v2end, radix:16))")
+
+        if v0end == 0xAA {
+            step("*** h0 is BEFORE h1 — p0[actual] hits h1's memory ***")
+            // Write cross-heap: stamp 0xBB into h1 via h0's OOB
+            for i in 0..<min(64, actual) { p0[actual + i] = 0xBB }
+            var hits = 0
+            for i in 0..<actual { if p1[i] == 0xBB { hits += 1 } }
+            step("*** CROSS-HEAP WRITE: stamped 0xBB via h0 OOB — h1 shows \(hits)/64 matches ***")
+        } else if v2end == 0xAA {
+            step("*** h2 is BEFORE h1 — p2[actual] hits h1's memory ***")
+            for i in 0..<min(64, actual) { p2[actual + i] = 0xBB }
+            var hits = 0
+            for i in 0..<actual { if p1[i] == 0xBB { hits += 1 } }
+            step("*** CROSS-HEAP WRITE: stamped 0xBB via h2 OOB — h1 shows \(hits)/64 matches ***")
+        } else {
+            step("no direct adjacency. p0end=0x\(String(v0end,radix:16)) p2end=0x\(String(v2end,radix:16))")
+            step("spray showed 0x4000 gap — may need interleaved alloc pattern to force layout")
+        }
+
+        step("── Heap Boundary Cross complete ────────────")
+        completion()
+    }
+}
+
 // Heap spray adjacency test.
 // Alloc N heaps, record their VA addresses, find closest pair.
 // If any two heaps land within actual_size bytes of each other → cross-heap write.

@@ -50,6 +50,7 @@ struct ContentView: View {
                         ActionBtn("Heap\nOOB",          color: .yellow)  { runHeapOOBTest() }
                         ActionBtn("Heap\nAdjacency",    color: .orange)  { runHeapAdjTest() }
                         ActionBtn("Heap\nSpray",        color: .pink)    { runHeapSprayTest() }
+                        ActionBtn("Boundary\nCross",    color: .mint)    { runBoundaryCross() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
@@ -222,6 +223,15 @@ struct ContentView: View {
         running = true
         log.append("── Metal + IOSurface Framework Fuzz ────────")
         runMetalFuzz(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runBoundaryCross() {
+        guard !running else { return }
+        running = true
+        log.append("── Heap Boundary Cross ─────────────────────")
+        runHeapBoundaryCross(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
