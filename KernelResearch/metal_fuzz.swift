@@ -1710,9 +1710,8 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             step("IOSurface create failed"); completion(); return
         }
         let allocSize = surface.allocationSize
-        let globalID  = surface.globalID
         let baseAddr  = surface.baseAddress
-        step("IOSurface id=\(globalID) base=0x\(String(UInt(bitPattern: baseAddr), radix: 16)) alloc=\(allocSize)")
+        step("IOSurface base=0x\(String(UInt(bitPattern: baseAddr), radix: 16)) alloc=\(allocSize)")
 
         // Lock — forces kernel to write lock state into backing store
         var seed: UInt32 = 0
