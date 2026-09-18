@@ -1879,13 +1879,16 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 // Filter kernel sentinel/stack-guard values (top 60 bits all 1 — low nibble varies)
                 // e.g. 0xFFFFFFFFFFFFFFF8, FC, FD, FA, F0 — these are NOT pointers
                 guard (v & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
-                // Tighter VA classification:
-                //   KTEXT  0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF  (kernel code, KASLR target)
+                // VA classification:
+                //   KTEXT  0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF, 4-byte aligned (real code ptr)
+                //   KTEXTD 0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF, NOT aligned (data in text range)
                 //   KHEAP  0xFFFFFE0000000000–0xFFFFFEFFFFFFFFFF  (XNU zone heap, KASLR-sensitive)
                 //   KGAP   0xFFFFFF0000000000–0xFFFFFEFFFFFFFFFF  (driver/iommu gap)
                 //   KMMIO  0xFFFFFFF080000000+                     (IOKit HW regs, fixed)
                 let cat: String
-                if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 { cat = "KTEXT" }
+                if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
+                    cat = (v & 3) == 0 ? "KTEXT" : "KTEXTD"
+                }
                 else if v >= 0xFFFFFFF080000000                        { cat = "KMMIO" }
                 else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF { cat = "KHEAP" }
                 else                                                    { cat = "KGAP"  }
@@ -1905,15 +1908,19 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 step("RECURRING (\(_iosurfRunCount) runs total):")
                 for (v, cnt) in recurring.prefix(20) {
                     let cat: String
-                    if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 { cat = "KTEXT" }
+                    if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
+                        cat = (v & 3) == 0 ? "KTEXT" : "KTEXTD"
+                    }
                     else if v >= 0xFFFFFFF080000000                        { cat = "KMMIO" }
                     else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF { cat = "KHEAP" }
                     else                                                    { cat = "KGAP"  }
                     let unslidBase: UInt64 = 0xFFFFFFF007004000
                     var extra = ""
-                    if cat == "KTEXT" {
+                    if cat == "KTEXT" {  // only 4-byte aligned = real code ptr
                         let slide = v &- unslidBase
                         if slide <= 0x80000000 { extra = " *** KASLR slide=0x\(String(slide,radix:16))" }
+                    } else if cat == "KTEXTD" {
+                        extra = " (unaligned — data/stack residue, not a code ptr)"
                     }
                     step("  ×\(cnt) 0x\(String(v,radix:16)) [\(cat)]\(extra)")
                 }

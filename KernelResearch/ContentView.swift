@@ -116,10 +116,13 @@ struct ContentView: View {
             try lines.write(to: url, atomically: true, encoding: .utf8)
             let msg = "Saved: \(url.lastPathComponent)"
             log.append("✓ \(msg)")
+            log.append("  path: \(url.path)")
+            log.append("  Files app → On My iPhone → KernelResearch")
             saveMsg = msg
         } catch {
             let msg = "Save failed: \(error.localizedDescription)"
             log.append("✗ \(msg)")
+            log.append("  url: \(url.path)")
             saveMsg = msg
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveMsg = nil }
