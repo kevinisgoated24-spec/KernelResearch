@@ -1768,15 +1768,19 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         // Rotate IOSurface dimensions each run — must produce alloc > 16KB to avoid LIFO stiction
         // but < 64KB so the tail scan lands within the readable Metal driver mapping zone.
         // All variants produce 32KB (2 GPU pages) with different widths/strides for page diversity.
+        // 0x1077xxx VA zone is the golden zone — adjacent to Metal driver state.
+        // Only 32KB variants land there reliably. 49KB variants die at 0x10a3xxx.
+        // Keep 7 pure 32KB variants (bytesPerRow * height between 16385–32768)
+        // plus one 49KB for the occasional lucky golden-zone hit.
         let variants: [(w: Int, h: Int, rowBytes: Int)] = [
-            (256, 32, 1024),    // 32KB — baseline
-            (512, 16, 2048),    // 32KB — wider stride
-            (768,  6, 3072),    // 32KB — widest stride, different zone slot
-            (384, 22, 1536),    // 49KB — different size class
-            (1024, 9, 4096),    // 36KB → rounds to 49KB, very wide stride
-            (640, 14, 2560),    // 35KB → rounds to 49KB
-            (256, 40, 1024),    // 40KB → 49KB
-            (512, 24, 2048),    // 48KB → 49KB
+            (256, 32, 1024),    // 32KB — proven, primary
+            (512, 16, 2048),    // 32KB — proven, widest hit rate
+            (384, 16, 1536),    // 32KB — mid stride
+            (640,  9, 2560),    // ~23KB → 32KB
+            (320, 24, 1280),    // ~30KB → 32KB, different width
+            (448, 16, 1792),    // ~28KB → 32KB
+            (256, 28, 1024),    // ~28KB → 32KB, narrow + tall
+            (512, 24, 2048),    // 49KB — keep one, sometimes hits golden zone
         ]
         let v = variants[_iosurfRunCount % variants.count]
 
