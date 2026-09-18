@@ -1731,16 +1731,9 @@ var _iosurfPrevTailValues: [(offset: Int, val: UInt64)] = []
 var _iosurfValFreq: [UInt64: Int] = [:]
 var _iosurfRunCount: Int = 0
 
-// Cross-boot KHEAP delta: saved to disk, compared on next boot
-let _kheapSnapshotURL: URL = {
-    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    return docs.appendingPathComponent("kheap_prev_boot.bin")
-}()
+// Cross-boot KHEAP delta: stored in UserDefaults (always writable from sandbox, persists across reboots)
 var _prevBootKheap: Set<UInt64> = {
-    guard let data = try? Data(contentsOf: {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return docs.appendingPathComponent("kheap_prev_boot.bin")
-    }()) else { return [] }
+    guard let data = UserDefaults.standard.data(forKey: "kheap_prev_boot") else { return [] }
     var s = Set<UInt64>()
     data.withUnsafeBytes { ptr in
         let count = data.count / 8
@@ -2026,13 +2019,13 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 }
             }
 
-            // Save this boot's KHEAP set to disk every run (overwrite)
+            // Save this boot's KHEAP set to UserDefaults every run (overwrite)
             var saveData = Data(count: _thisBootKheap.count * 8)
             saveData.withUnsafeMutableBytes { ptr in
                 var i = 0
                 for v in _thisBootKheap { ptr.storeBytes(of: v, toByteOffset: i*8, as: UInt64.self); i += 1 }
             }
-            try? saveData.write(to: _kheapSnapshotURL)
+            UserDefaults.standard.set(saveData, forKey: "kheap_prev_boot")
 
             _iosurfPrevTailValues = currentPairs
         } else {
