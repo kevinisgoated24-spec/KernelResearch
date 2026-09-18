@@ -1770,13 +1770,13 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         // All variants produce 32KB (2 GPU pages) with different widths/strides for page diversity.
         let variants: [(w: Int, h: Int, rowBytes: Int)] = [
             (256, 32, 1024),    // 32KB — baseline
-            (512, 16, 2048),    // 32KB — wider stride, different VA neighborhood
-            (256, 17, 1024),    // ~17KB → rounds to 32KB, different padding
-            (512,  9, 2048),    // ~18KB → rounds to 32KB, different stride
-            (768,  6, 3072),    // ~18KB → rounds to 32KB, widest stride
-            (384, 22, 1536),    // ~33KB → 32KB or 48KB depending on GPU granule
-            (256, 40, 1024),    // ~40KB → 32KB or 48KB
-            (512, 24, 2048),    // ~48KB → 48KB, yet another bin
+            (512, 16, 2048),    // 32KB — wider stride
+            (768,  6, 3072),    // 32KB — widest stride, different zone slot
+            (384, 22, 1536),    // 49KB — different size class
+            (1024, 9, 4096),    // 36KB → rounds to 49KB, very wide stride
+            (640, 14, 2560),    // 35KB → rounds to 49KB
+            (256, 40, 1024),    // 40KB → 49KB
+            (512, 24, 2048),    // 48KB → 49KB
         ]
         let v = variants[_iosurfRunCount % variants.count]
 
