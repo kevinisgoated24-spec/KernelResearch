@@ -1765,18 +1765,18 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         for p in sprayPorts { mach_port_destroy(mach_task_self_, p) }
         step("port spray: \(sprayPorts.count) ports dirtied + freed")
 
-        // Rotate IOSurface dimensions each run — each variant produces a genuinely different
-        // allocationSize spanning different IOMalloc size classes → different physical pages.
-        // GPU page = 16KB; need bytesPerRow * height > 16384 for > 1 page.
+        // Rotate IOSurface dimensions each run — must produce alloc > 16KB to avoid LIFO stiction
+        // but < 64KB so the tail scan lands within the readable Metal driver mapping zone.
+        // All variants produce 32KB (2 GPU pages) with different widths/strides for page diversity.
         let variants: [(w: Int, h: Int, rowBytes: Int)] = [
-            (256,  32, 1024),   // 32KB  — 2 GPU pages
-            (512,  16, 2048),   // 32KB  — 2 GPU pages, wider stride
-            (256,  64, 1024),   // 64KB  — 4 GPU pages
-            (512,  32, 2048),   // 64KB  — 4 GPU pages, wider stride
-            (256, 128, 1024),   // 128KB — 8 GPU pages
-            (512,  64, 2048),   // 128KB — 8 GPU pages, wider stride
-            (512, 128, 2048),   // 256KB — 16 GPU pages
-            (1024, 64, 4096),   // 256KB — 16 GPU pages, wider stride
+            (256, 32, 1024),    // 32KB — baseline
+            (512, 16, 2048),    // 32KB — wider stride, different VA neighborhood
+            (256, 17, 1024),    // ~17KB → rounds to 32KB, different padding
+            (512,  9, 2048),    // ~18KB → rounds to 32KB, different stride
+            (768,  6, 3072),    // ~18KB → rounds to 32KB, widest stride
+            (384, 22, 1536),    // ~33KB → 32KB or 48KB depending on GPU granule
+            (256, 40, 1024),    // ~40KB → 32KB or 48KB
+            (512, 24, 2048),    // ~48KB → 48KB, yet another bin
         ]
         let v = variants[_iosurfRunCount % variants.count]
 
