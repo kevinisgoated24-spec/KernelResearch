@@ -1793,15 +1793,16 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KMMIO=\(kmmio)")
         }
 
-        scanRegion("pixel+tail", baseAddr, allocSize + 4096)
+        // Clamp to allocationSize — iOS does NOT map pages beyond it, causes crash
+        scanRegion("pixel+tail", baseAddr, allocSize)
 
-        // Scan 2: re-lock and scan again — kernel updates lock-state metadata in backing store
+        // Scan 2: re-lock — kernel updates lock-state metadata bytes in backing store
         var seed2: UInt32 = 0
         surface.lock(options: [], seed: &seed2)
         surface.unlock(options: [], seed: nil)
-        scanRegion("post_relock", surface.baseAddress, allocSize + 4096)
+        scanRegion("post_relock", surface.baseAddress, allocSize)
 
-        // Scan 3: second IOSurface from same allocator — may reuse freed pages with residue
+        // Scan 3: second IOSurface — allocator may hand back same physical pages
         let props2: [IOSurfacePropertyKey: Any] = [
             .width: 256, .height: 4, .bytesPerElement: 4, .bytesPerRow: 1024,
             .pixelFormat: 0x42475241
@@ -1810,7 +1811,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             var seed3: UInt32 = 0
             surf2.lock(options: [], seed: &seed3)
             surf2.unlock(options: [], seed: nil)
-            scanRegion("reuse_alloc", surf2.baseAddress, surf2.allocationSize + 4096)
+            scanRegion("reuse_alloc", surf2.baseAddress, surf2.allocationSize)
         }
 
         step("── IOSurface Leak complete ─────────────────")
