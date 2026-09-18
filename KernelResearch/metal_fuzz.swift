@@ -1731,6 +1731,25 @@ var _iosurfPrevTailValues: [(offset: Int, val: UInt64)] = []
 var _iosurfValFreq: [UInt64: Int] = [:]
 var _iosurfRunCount: Int = 0
 
+// Cross-boot KHEAP delta: saved to disk, compared on next boot
+let _kheapSnapshotURL: URL = {
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    return docs.appendingPathComponent("kheap_prev_boot.bin")
+}()
+var _prevBootKheap: Set<UInt64> = {
+    guard let data = try? Data(contentsOf: {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return docs.appendingPathComponent("kheap_prev_boot.bin")
+    }()) else { return [] }
+    var s = Set<UInt64>()
+    data.withUnsafeBytes { ptr in
+        let count = data.count / 8
+        for i in 0..<count { s.insert(ptr.load(fromByteOffset: i*8, as: UInt64.self)) }
+    }
+    return s
+}()
+var _thisBootKheap: Set<UInt64> = []
+
 func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         func step(_ s: String) { log.append(s) }
@@ -1986,6 +2005,34 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                     step("  ★ 0x\(String(v,radix:16)) [\(cat2)]\(extra2)")
                 }
             }
+
+            // Accumulate KHEAP values into this-boot set
+            for pair in currentPairs {
+                if pair.val >= 0xFFFFFE0000000000 && pair.val <= 0xFFFFFEFFFFFFFFFF {
+                    _thisBootKheap.insert(pair.val)
+                }
+            }
+
+            // Cross-boot delta: values in prev boot not in any run this boot yet (changed = KASLR-slid candidates)
+            if !_prevBootKheap.isEmpty && _iosurfRunCount == 0 {
+                let gone = _prevBootKheap.subtracting(_thisBootKheap)
+                let newOnes = _thisBootKheap.subtracting(_prevBootKheap)
+                if !gone.isEmpty || !newOnes.isEmpty {
+                    step("CROSS-BOOT DELTA (KASLR-slid candidates):")
+                    for v in gone.sorted() { step("  GONE  0x\(String(v,radix:16)) [was in prev boot]") }
+                    for v in newOnes.sorted() { step("  NEW   0x\(String(v,radix:16)) [new this boot]") }
+                } else {
+                    step("CROSS-BOOT DELTA: all KHEAP values identical to prev boot (fixed constants)")
+                }
+            }
+
+            // Save this boot's KHEAP set to disk every run (overwrite)
+            var saveData = Data(count: _thisBootKheap.count * 8)
+            saveData.withUnsafeMutableBytes { ptr in
+                var i = 0
+                for v in _thisBootKheap { ptr.storeBytes(of: v, toByteOffset: i*8, as: UInt64.self); i += 1 }
+            }
+            try? saveData.write(to: _kheapSnapshotURL)
 
             _iosurfPrevTailValues = currentPairs
         } else {
