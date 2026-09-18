@@ -35,6 +35,7 @@ private class CallbackBox {
 struct ContentView: View {
     @StateObject private var log = FuzzLog()
     @State private var running = false
+    @State private var saveMsg: String? = nil
 
     var body: some View {
         NavigationStack {
@@ -64,6 +65,7 @@ struct ContentView: View {
                         ActionBtn("VM\nRegion Scan",    color: .green)   { runVMScan() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
+                        ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
                         ActionBtn("Clear\nLog",         color: .gray)  { log.clear() }
                     }
                     .padding()
@@ -85,6 +87,16 @@ struct ContentView: View {
                 if running {
                     ProgressView("Fuzzing…").padding(6).foregroundColor(.yellow)
                 }
+                if let msg = saveMsg {
+                    Text(msg)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(Color.mint)
+                        .cornerRadius(6)
+                        .padding(.bottom, 4)
+                        .transition(.opacity)
+                }
             }
             .navigationTitle("KernelResearch")
             .navigationBarTitleDisplayMode(.inline)
@@ -94,6 +106,24 @@ struct ContentView: View {
     }
 
     // MARK: — Actions
+
+    private func saveLog() {
+        let lines = log.lines.reversed().joined(separator: "\n")
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let ts = Int(Date().timeIntervalSince1970)
+        let url = docs.appendingPathComponent("kernel_log_\(ts).txt")
+        do {
+            try lines.write(to: url, atomically: true, encoding: .utf8)
+            let msg = "Saved: \(url.lastPathComponent)"
+            log.append("✓ \(msg)")
+            saveMsg = msg
+        } catch {
+            let msg = "Save failed: \(error.localizedDescription)"
+            log.append("✗ \(msg)")
+            saveMsg = msg
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveMsg = nil }
+    }
 
     private func runBadQuery() {
         guard !running else { return }
