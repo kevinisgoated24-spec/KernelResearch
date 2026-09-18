@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: — Log model
 
@@ -32,10 +33,21 @@ private class CallbackBox {
 
 // ── ContentView ───────────────────────────────────────────────────────────────
 
+// UIActivityViewController wrapper for SwiftUI
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}
+
 struct ContentView: View {
     @StateObject private var log = FuzzLog()
     @State private var running = false
     @State private var saveMsg: String? = nil
+    @State private var shareURL: URL? = nil
+    @State private var showingShare = false
 
     var body: some View {
         NavigationStack {
@@ -103,29 +115,29 @@ struct ContentView: View {
             .background(Color.black)
         }
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showingShare) {
+            if let url = shareURL {
+                ShareSheet(items: [url])
+            }
+        }
     }
 
     // MARK: — Actions
 
     private func saveLog() {
-        let lines = log.lines.reversed().joined(separator: "\n")
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let ts = Int(Date().timeIntervalSince1970)
-        let url = docs.appendingPathComponent("kernel_log_\(ts).txt")
+        let content = log.lines.reversed().joined(separator: "\n")
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kernel_log_\(Int(Date().timeIntervalSince1970)).txt")
         do {
-            try lines.write(to: url, atomically: true, encoding: .utf8)
-            let msg = "Saved: \(url.lastPathComponent)"
-            log.append("✓ \(msg)")
-            log.append("  path: \(url.path)")
-            log.append("  Files app → On My iPhone → KernelResearch")
-            saveMsg = msg
+            try content.write(to: tmp, atomically: true, encoding: .utf8)
+            log.append("✓ Written: \(tmp.lastPathComponent) (\(content.utf8.count) bytes) — share sheet opening")
+            shareURL = tmp
+            showingShare = true
         } catch {
-            let msg = "Save failed: \(error.localizedDescription)"
-            log.append("✗ \(msg)")
-            log.append("  url: \(url.path)")
-            saveMsg = msg
+            log.append("✗ Write failed: \(error.localizedDescription)")
+            saveMsg = "Write failed"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveMsg = nil }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { saveMsg = nil }
     }
 
     private func runBadQuery() {
