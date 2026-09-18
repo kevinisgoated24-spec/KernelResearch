@@ -1934,7 +1934,6 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             step("  post_relock_tail total: \(currentPairs.count) vals (after sentinel filter)")
 
             // Frequency tracking: count how many runs each value has appeared in
-            _iosurfRunCount += 1
             for v in seenThisRun { _iosurfValFreq[v, default: 0] += 1 }
 
             // Print top recurring values (appear in 2+ runs)
@@ -1992,6 +1991,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         } else {
             step("  post_relock_tail: vm_read kr=\(prtKr)")
         }
+        _iosurfRunCount += 1
 
         // Scan 4: second IOSurface with DIFFERENT variant — allocator residue from freed pages
         let v2 = variants[(_iosurfRunCount + 1) % variants.count]
