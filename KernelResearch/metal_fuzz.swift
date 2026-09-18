@@ -1799,9 +1799,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         var seed2: UInt32 = 0
         surface.lock(options: [], seed: &seed2)
         surface.unlock(options: [], seed: nil)
-        if let valBase = surface.baseAddress {
-            scanRegion("post_relock", valBase, allocSize + 4096)
-        }
+        scanRegion("post_relock", surface.baseAddress, allocSize + 4096)
 
         // Scan 3: second IOSurface from same allocator — may reuse freed pages with residue
         let props2: [IOSurfacePropertyKey: Any] = [
