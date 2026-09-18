@@ -2007,7 +2007,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             }
 
             // Cross-boot delta: values in prev boot not in any run this boot yet (changed = KASLR-slid candidates)
-            if !_prevBootKheap.isEmpty && _iosurfRunCount == 0 {
+            if !_prevBootKheap.isEmpty && _iosurfRunCount == 5 {
                 let gone = _prevBootKheap.subtracting(_thisBootKheap)
                 let newOnes = _thisBootKheap.subtracting(_prevBootKheap)
                 if !gone.isEmpty || !newOnes.isEmpty {
