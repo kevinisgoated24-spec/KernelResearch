@@ -1690,6 +1690,9 @@ func runMismatchTest(log: FuzzLog) {
 // IOSurface maps its backing store into user space — we scan it after a GPU pass
 // to catch any kernel pointers or GPU VAs that the firmware wrote in.
 // Also scans the tail bytes (after pixel data) for dirty allocator residue.
+// Stores previous run's tail values for delta detection
+var _iosurfPrevTailValues: [UInt64] = []
+
 func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         func step(_ s: String) { log.append(s) }
@@ -1827,7 +1830,65 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             surf2.unlock(options: [], seed: nil)
             let base2 = UInt(bitPattern: surf2.baseAddress)
             scanAddr("reuse_alloc", base2, surf2.allocationSize)
-            scanAddr("reuse_tail", base2 + UInt(surf2.allocationSize), 65536)
+
+            // Collect reuse_tail values for delta comparison across runs
+            let tailLen = 65536
+            var tailBuf = [UInt8](repeating: 0, count: tailLen)
+            var tailOut: vm_size_t = 0
+            let tailKr: kern_return_t = tailBuf.withUnsafeMutableBytes { b in
+                vm_read_overwrite(mach_task_self_,
+                                  vm_address_t(base2 + UInt(surf2.allocationSize)),
+                                  vm_size_t(tailLen),
+                                  vm_address_t(bitPattern: b.baseAddress!),
+                                  &tailOut)
+            }
+            if tailKr == 0 {
+                var currentVals: [UInt64] = []
+                for qw in 0..<(Int(tailOut) / 8) {
+                    var v: UInt64 = 0
+                    for b in 0..<8 { v |= UInt64(tailBuf[qw*8+b]) << (b*8) }
+                    if v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF {
+                        let b0 = UInt8(v & 0xFF)
+                        if v != UInt64(b0) &* 0x0101010101010101 { currentVals.append(v) }
+                    }
+                }
+                // Delta vs previous run
+                let prev = _iosurfPrevTailValues
+                if prev.isEmpty {
+                    step("DELTA: first run — \(currentVals.count) kernel vals captured, run again to compare")
+                } else {
+                    let changed = currentVals.filter { !prev.contains($0) }
+                    let stable  = currentVals.filter {  prev.contains($0) }
+                    step("DELTA: stable=\(stable.count) CHANGED=\(changed.count)")
+                    if !changed.isEmpty {
+                        step("CHANGED (KASLR-sensitive candidates):")
+                        for v in changed.prefix(10) {
+                            step("  → 0x\(String(v,radix:16))")
+                        }
+                    }
+                    if !stable.isEmpty {
+                        step("STABLE (constants):")
+                        for v in Set(stable).prefix(5) {
+                            step("  = 0x\(String(v,radix:16))")
+                        }
+                    }
+                }
+                _iosurfPrevTailValues = currentVals
+                // Also log the raw tail
+                var found2 = 0
+                for qw in 0..<(Int(tailOut)/8) {
+                    var v: UInt64 = 0
+                    for b in 0..<8 { v |= UInt64(tailBuf[qw*8+b]) << (b*8) }
+                    guard v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF else { continue }
+                    let b0 = UInt8(v & 0xFF)
+                    guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
+                    let cat = (v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000) ? "KTEXT" : (v < 0xFFFFFFF000000000 ? "KHEAP" : "KMMIO")
+                    step("  reuse_tail[+0x\(String(qw*8,radix:16))] = 0x\(String(v,radix:16)) [\(cat)]")
+                    found2 += 1; if found2 >= 60 { step("  ...clipped"); break }
+                }
+            } else {
+                step("  reuse_tail: vm_read kr=\(tailKr)")
+            }
         }
 
         step("── IOSurface Leak complete ─────────────────")
