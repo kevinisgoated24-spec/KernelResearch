@@ -2018,13 +2018,16 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 }
             }
 
-            // Save this boot's KHEAP set to UserDefaults every run (overwrite)
-            var saveData = Data(count: _thisBootKheap.count * 8)
-            saveData.withUnsafeMutableBytes { ptr in
-                var i = 0
-                for v in _thisBootKheap { ptr.storeBytes(of: v, toByteOffset: i*8, as: UInt64.self); i += 1 }
+            // Save snapshot only after 20+ runs so the set is stable before becoming the next boot's baseline.
+            // Saving too early (e.g. run 1) evicts KASLR-slid candidates that only appeared in one early boot.
+            if _iosurfRunCount >= 20 {
+                var saveData = Data(count: _thisBootKheap.count * 8)
+                saveData.withUnsafeMutableBytes { ptr in
+                    var i = 0
+                    for v in _thisBootKheap { ptr.storeBytes(of: v, toByteOffset: i*8, as: UInt64.self); i += 1 }
+                }
+                UserDefaults.standard.set(saveData, forKey: "kheap_prev_boot")
             }
-            UserDefaults.standard.set(saveData, forKey: "kheap_prev_boot")
 
             _iosurfPrevTailValues = currentPairs
         } else {
