@@ -1795,22 +1795,22 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
 
         scanRegion("pixel+tail", baseAddr, allocSize + 4096)
 
-        // Scan 2: probe IOSurface value store — get/set a value key to probe the scratch buffer
-        // IOSurface value dictionary writes to a separate kernel-mapped region
-        // After setting a value, the backing blob contains metadata we can read back
-        surface.setValue(NSNumber(value: 0xDEADBEEF as UInt32), forKey: "probe_key")
+        // Scan 2: re-lock and scan again — kernel updates lock-state metadata in backing store
+        var seed2: UInt32 = 0
+        surface.lock(options: [], seed: &seed2)
+        surface.unlock(options: [], seed: nil)
         if let valBase = surface.baseAddress {
-            scanRegion("value_store", valBase, allocSize)
+            scanRegion("post_relock", valBase, allocSize + 4096)
         }
 
-        // Scan 3: create a second IOSurface that reuses allocator memory from the first
-        // Freed allocator chunks sometimes retain pointer residue from prior allocation
+        // Scan 3: second IOSurface from same allocator — may reuse freed pages with residue
         let props2: [IOSurfacePropertyKey: Any] = [
             .width: 256, .height: 4, .bytesPerElement: 4, .bytesPerRow: 1024,
             .pixelFormat: 0x42475241
         ]
         if let surf2 = IOSurface(properties: props2) {
-            surf2.lock(options: [], seed: nil)
+            var seed3: UInt32 = 0
+            surf2.lock(options: [], seed: &seed3)
             surf2.unlock(options: [], seed: nil)
             scanRegion("reuse_alloc", surf2.baseAddress, surf2.allocationSize + 4096)
         }
