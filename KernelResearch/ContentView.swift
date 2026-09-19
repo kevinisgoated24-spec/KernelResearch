@@ -371,7 +371,7 @@ struct ContentView: View {
         guard !running else { return }
         running = true
         log.append("── ICB Field Probe ──────────────────────────")
-        runICBFieldProbe(log: log) {
+        KernelResearch.runICBFieldProbe(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
