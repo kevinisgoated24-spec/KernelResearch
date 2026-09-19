@@ -75,6 +75,7 @@ struct ContentView: View {
                         ActionBtn("OOB\nInfo Leak",     color: .yellow)  { runOOBLeak() }
                         ActionBtn("IOSurf\nLeak",       color: .cyan)    { runIOSurfLeak() }
                         ActionBtn("VM\nRegion Scan",    color: .green)   { runVMScan() }
+                        ActionBtn("IOSurf\nOOB Esc",    color: .red)     { runIOSurfOOBEsc() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -342,6 +343,15 @@ struct ContentView: View {
         running = true
         log.append("── VM Region Scan ──────────────────────────")
         runVMRegionScan(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runIOSurfOOBEsc() {
+        guard !running else { return }
+        running = true
+        log.append("── IOSurface OOB Escalation ────────────────")
+        runIOSurfaceOOBEscalation(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
