@@ -379,7 +379,8 @@ func runArgBufferCorruption(log: FuzzLog, completion: @escaping () -> Void) {
                 // Verify: did AGX actually copy our poison bytes?
                 var after = [UInt8](repeating: 0, count: 8)
                 for i in 0..<8 { after[i] = p1[8 + i] }
-                step("  h1[8..15] after blit: \(after.map{String(format:"%02x",$0)}.joined(separator:" "))")
+                let afterHex = after.map { String(format: "%02x", $0) }.joined(separator: " ")
+                step("  h1[8..15] after blit: \(afterHex)")
                 if after == Array(poison[0..<8]) {
                     step("  *** POISON PROPAGATED: AGX copied 0xDEADBEEF bytes in GPU command ***")
                     step("  *** If b1 were used as indirect cmd buffer / arg buffer, this corrupts GPU state ***")
