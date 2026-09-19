@@ -2674,7 +2674,7 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
 
         // ── Create ICB (shared storage so CPU can read/write backing bytes) ──
         let icbDesc = MTLIndirectCommandBufferDescriptor()
-        icbDesc.commandTypes              = [.drawPrimitives]
+        icbDesc.commandTypes              = [.draw]
         icbDesc.inheritBuffers            = false
         icbDesc.maxVertexBufferBindCount  = 1
         icbDesc.maxFragmentBufferBindCount = 0
