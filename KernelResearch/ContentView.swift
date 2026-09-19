@@ -77,6 +77,7 @@ struct ContentView: View {
                         ActionBtn("VM\nRegion Scan",    color: .green)   { runVMScan() }
                         ActionBtn("IOSurf\nOOB Esc",    color: .red)     { runIOSurfOOBEsc() }
                         ActionBtn("ICB\nGPU Corrupt",   color: .red)     { runICBGPUCorrupt() }
+                        ActionBtn("ICB\nField Probe",   color: .orange)  { runICBFieldProbe() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -362,6 +363,15 @@ struct ContentView: View {
         running = true
         log.append("── ICB GPU-Address Corruption ──────────────")
         runICBCorruption(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runICBFieldProbe() {
+        guard !running else { return }
+        running = true
+        log.append("── ICB Field Probe ──────────────────────────")
+        runICBFieldProbe(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
