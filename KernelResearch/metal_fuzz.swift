@@ -2907,10 +2907,41 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return rt
         }()
 
-        // probeExecFull — returns (faulted, full error string including userInfo)
+        // ── ICB raw dump — search for hi GPU VA embedded as argument-buf pointer ──
+        // The ICB command should contain a pointer to the argument buffer at hi.gpuAddress.
+        // Finding it reveals the exact byte offset of the argument-buffer pointer in the command.
+        step("── ICB raw dump (first 256B, scanning for hi VA) ──")
+        let icbRaw = icb.contents().assumingMemoryBound(to: UInt8.self)
+        let hiVA   = hi.gpuAddress
+        var argBufPtrOff: Int? = nil
+        for row in 0..<16 {
+            let base = row * 16
+            var h = "  [+0x\(String(format:"%03x",base))]: "
+            for i in 0..<16 { h += String(format:"%02x ", icbRaw[base+i]) }
+            // Scan every 8-byte-aligned sub-word for hiVA
+            for i in stride(from: 0, to: 16, by: 1) {
+                guard base+i+7 < 256 else { break }
+                var v: UInt64 = 0
+                for bi in 0..<8 { v |= UInt64(icbRaw[base+i+bi]) << (bi*8) }
+                if v == hiVA { h += " ← HI_VA@+0x\(String(format:"%x",base+i))"; argBufPtrOff = base+i }
+            }
+            step(h)
+        }
+        if let off = argBufPtrOff {
+            step("  ★ arg-buf pointer found in ICB at byte offset +0x\(String(format:"%x",off))")
+        } else {
+            step("  (hi VA 0x\(String(hiVA,radix:16)) not found in first 256B of ICB)")
+        }
+
+        // probeExecFull — FRESH QUEUE per call + useResource(sentinelBuf)
+        // Fresh queue: avoids blacklisting after first GPU fault (code=4 "Ignored").
+        // useResource: makes sentinelBuf resident in GPU page table for ICB vertex fetch.
+        //   Without this, GPU faults accessing sentinelBuf even when hi has the right VA.
         func probeExecFull() -> (Bool, String) {
-            guard let cb  = queue.makeCommandBuffer(),
-                  let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return (false, "no cb") }
+            guard let freshQ = device.makeCommandQueue(),
+                  let cb     = freshQ.makeCommandBuffer(),
+                  let enc    = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return (false, "no cb") }
+            enc.useResource(sentinelBuf, usage: .read)   // ← mark vtxBuf resident for ICB
             enc.executeCommandsInBuffer(icb, range: 0..<1)
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
@@ -2920,46 +2951,66 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return (true, s)
         }
 
-        // ── Phase D: error userInfo dump ────────────────────────────────────────────
-        // Dump full NSError userInfo from a zeros-in-hi execution.
-        // GPU page fault details (including fault VA) may be in userInfo.
-        step("── phase D: error userInfo dump ──")
+        // ── Phase D: zeros baseline (fresh Q + useResource) ──────────────────────
+        step("── phase D: zeros baseline (fresh Q + useResource) ──")
         clearHi(0, BUF_LEN)
         let (_, zeroErrStr) = probeExecFull()
         step("  zeros err: \(zeroErrStr)")
 
-        // ── Phase E: unique canary per 8B slot, log full error ────────────────────
-        // Each slot gets a unique canary: 0xDEADC0DE_00000001 .. _00000040
-        // If the fault VA matches a canary, that slot is the GPU-derefed field.
-        step("── phase E: canary sweep (64 slots × 8B, log error per slot) ──")
+        // ── Phase E: canary sweep — FRESH QUEUE PER SLOT (no blacklisting) ───────
+        // Each slot: unique canary 0xDEADC0DE_00000001..40, rest zeros.
+        // Fresh queue = each slot gets a real GPU execution, not a rate-limited reject.
+        // DIFF★ = error string changed vs zeros → GPU hit canary address (wrong VA dereffed).
+        // SUCCESS (f=0) = canary at that slot not treated as a VA → ICB executed clean.
+        step("── phase E: canary sweep (64 slots × 8B, fresh Q per slot) ──")
         for slotIdx in 0..<64 {
             let off = slotIdx * 8
             clearHi(0, 512)
             let canary: UInt64 = 0xDEAD_C0DE_0000_0000 | UInt64(slotIdx + 1)
             fillHiVal(off, off + 8, val: canary)
             let (f, errStr) = probeExecFull()
-            // Print abbreviated: slot offset + canary + whether err string changed vs zeros
             let changed = errStr != zeroErrStr
-            step("  [\(String(format:"%02d",slotIdx))]+0x\(String(format:"%03x",off)) c=0x\(String(canary,radix:16)) f=\(f ? 1 : 0)\(changed ? " DIFF" : "") \(errStr.prefix(160))")
+            step("  [\(String(format:"%02d",slotIdx))]+0x\(String(format:"%03x",off)) c=0x\(String(canary,radix:16)) f=\(f ? 1:0)\(changed ? " DIFF★" : "")\(!f ? " ✓SUCCESS" : "") \(errStr.prefix(120))")
         }
         clearHi(0, BUF_LEN)
 
-        // ── Phase F: sentVA flood (all 512 bytes) — does ANY config of pure-VA work? ──
-        step("── phase F: sentVA flood (all 512B) ──")
+        // ── Phase F: sentVA flood — with useResource sentinelBuf is now resident ──
+        // Hypothesis: sentVA at slot[00] + useResource = SUCCESS (vtxBuf field correct).
+        // If Phase E didn't yield SUCCESS, this flood might work.
+        step("── phase F: sentVA flood (all 512B, fresh Q + useResource) ──")
         fillHiVal(0, 512, val: sentVA)
         let (floodF, floodErr) = probeExecFull()
-        step("  sentVA×64slots: f=\(floodF ? 1:0) \(floodErr.prefix(120))")
+        step("  sentVA×64slots: f=\(floodF ? 1:0)\(!floodF ? " ✓SUCCESS" : "") \(floodErr.prefix(120))")
         clearHi(0, BUF_LEN)
 
-        // ── Phase G: 16B-stride sweep (entries may be 16 bytes not 8) ────────────
-        // Try sentVA at every 16B-aligned offset in first 512 bytes
-        step("── phase G: 16B-stride sentVA sweep ──")
+        // ── Phase G: 16B-stride sentVA sweep (fresh Q) ───────────────────────────
+        step("── phase G: 16B-stride sentVA sweep (fresh Q) ──")
         for slotIdx in 0..<32 {
             let off = slotIdx * 16
             clearHi(0, 512)
             fillHiVal(off, off + 8, val: sentVA)
-            let (f, _) = probeExecFull()
-            if !f { step("  ★ 16B slot[\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → SUCCESS"); break }
+            let (f, errStr) = probeExecFull()
+            if !f {
+                step("  ★★★ 16B slot[\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → SUCCESS — vtxBuf field at +0x\(String(format:"%x",off))")
+                break
+            }
+            step("  [\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → FAULT \(errStr.prefix(60))")
+        }
+        clearHi(0, BUF_LEN)
+
+        // ── Phase H: 8B-stride sentVA sweep (fresh Q) ────────────────────────────
+        // Finer sweep in case 16B stride missed it.
+        step("── phase H: 8B-stride sentVA sweep (fresh Q) ──")
+        for slotIdx in 0..<64 {
+            let off = slotIdx * 8
+            clearHi(0, 512)
+            fillHiVal(off, off + 8, val: sentVA)
+            let (f, errStr) = probeExecFull()
+            if !f {
+                step("  ★★★ 8B slot[\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → SUCCESS — vtxBuf field CONFIRMED at +0x\(String(format:"%x",off))")
+                break
+            }
+            step("  [\(String(format:"%02d",slotIdx))]+0x\(String(format:"%03x",off)) sentVA → FAULT \(errStr.prefix(60))")
         }
         clearHi(0, BUF_LEN)
 
