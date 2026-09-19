@@ -2897,7 +2897,7 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             step("✗ dummy tex failed"); completion(); return
         }
         let texResID = dummyTex.gpuResourceID._impl
-        step("dummyTex resID=0x\(String(texResID,radix:16)) gpuVA≈0x\(String(dummyTex.gpuAddress,radix:16))")
+        step("dummyTex resID=0x\(String(texResID,radix:16))")
 
         let rtDesc: MTLRenderPassDescriptor = {
             let rt = MTLRenderPassDescriptor()
