@@ -2454,16 +2454,16 @@ private func iosFindU32LE(_ v: UInt32, _ buf: UnsafePointer<UInt8>, _ len: Int) 
 }
 
 private func iosDumpHex(_ buf: UnsafePointer<UInt8>, _ len: Int,
-                         step: (String) -> Void) {
+                         emit: (String) -> Void) {
     var line = ""
     for i in 0 ..< len {
         if i % 16 == 0 {
-            if !line.isEmpty { step("  \(line)") }
+            if !line.isEmpty { emit("  \(line)") }
             line = String(format: "+0x%04x: ", i)
         }
         line += String(format: "%02x ", buf[i])
     }
-    if !line.isEmpty { step("  \(line)") }
+    if !line.isEmpty { emit("  \(line)") }
 }
 
 // ── IOSurface Shared-Memory Escalation ───────────────────────────────────────
@@ -2534,12 +2534,12 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
 
         if headerOff > 0 {
             step("── header dump ──")
-            iosDumpHex(basePtr, min(headerOff, 256), step: step)
+            iosDumpHex(UnsafePointer(basePtr), min(headerOff, 256), emit: step)
         } else {
             step("── pixelbuf dump (hdrOff=0) ──")
             let surfPtr = UnsafeMutableRawPointer(bitPattern: surfVA)!
                              .assumingMemoryBound(to: UInt8.self)
-            iosDumpHex(surfPtr, min(256, allocSz), step: step)
+            iosDumpHex(UnsafePointer(surfPtr), min(256, allocSz), emit: step)
         }
 
         let POISON_BPR: UInt32 = 0x7FFFFFFF
