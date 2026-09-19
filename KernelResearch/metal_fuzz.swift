@@ -2619,9 +2619,8 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         }
         sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
         targetBuf.contents().initializeMemory(as: UInt8.self,   repeating: 0xCC, count: BUF_LEN)
-        let sentVA    = sentinelBuf.gpuAddress
-        let sentResID = sentinelBuf.gpuResourceID._impl
-        step("sentinelBuf gpuVA=0x\(String(sentVA,radix:16)) resID=0x\(String(sentResID,radix:16))")
+        let sentVA = sentinelBuf.gpuAddress
+        step("sentinelBuf gpuVA=0x\(String(sentVA,radix:16))")
         step("targetBuf   gpuVA=0x\(String(targetBuf.gpuAddress,radix:16))")
 
         // Shader
@@ -2703,31 +2702,27 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
 
         // Search hi[0..ICB_SLOT-1] for sentinelBuf GPU VA (LE 8-byte)
         var vtxBufOff: Int? = nil
-        var foundByResID = false
         for off in 0...(ICB_SLOT - 8) {
-            var vaHit = true, ridHit = true
+            var hit = true
             for bi in 0..<8 {
-                if q[off + bi] != UInt8((sentVA    >> (bi * 8)) & 0xFF) { vaHit  = false }
-                if q[off + bi] != UInt8((sentResID >> (bi * 8)) & 0xFF) { ridHit = false }
+                if q[off + bi] != UInt8((sentVA >> (bi * 8)) & 0xFF) { hit = false; break }
             }
-            if vaHit  { vtxBufOff = off; foundByResID = false; break }
-            if ridHit { vtxBufOff = off; foundByResID = true;  break }
+            if hit { vtxBufOff = off; break }
         }
         // Extended: search full 4096 bytes if slot-range missed
         if vtxBufOff == nil {
             step("  sentinel not in slot[0..63] — scanning full hi (4096 bytes)")
             for off in 0...(BUF_LEN - 8) {
-                var vaHit = true
+                var hit = true
                 for bi in 0..<8 {
-                    if q[off + bi] != UInt8((sentVA >> (bi * 8)) & 0xFF) { vaHit = false; break }
+                    if q[off + bi] != UInt8((sentVA >> (bi * 8)) & 0xFF) { hit = false; break }
                 }
-                if vaHit { vtxBufOff = off; break }
+                if hit { vtxBufOff = off; break }
             }
         }
 
         if let voff = vtxBufOff {
-            let tag = foundByResID ? "resID" : "gpuVA"
-            step("✓ sentinelBuf \(tag) @ hi[+0x\(String(format:"%x",voff))] → vtxBuf field offset confirmed")
+            step("✓ sentinelBuf VA @ hi[+0x\(String(format:"%x",voff))] → vtxBuf field offset confirmed")
         } else {
             step("✗ sentinelBuf VA not found in hi — ICB backing may not be adjacent")
             step("  will flood full hi as fallback")
