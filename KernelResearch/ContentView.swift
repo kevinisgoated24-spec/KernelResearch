@@ -76,6 +76,7 @@ struct ContentView: View {
                         ActionBtn("IOSurf\nLeak",       color: .cyan)    { runIOSurfLeak() }
                         ActionBtn("VM\nRegion Scan",    color: .green)   { runVMScan() }
                         ActionBtn("IOSurf\nOOB Esc",    color: .red)     { runIOSurfOOBEsc() }
+                        ActionBtn("ICB\nGPU Corrupt",   color: .red)     { runICBGPUCorrupt() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -352,6 +353,15 @@ struct ContentView: View {
         running = true
         log.append("── IOSurface OOB Escalation ────────────────")
         runIOSurfaceOOBEscalation(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runICBGPUCorrupt() {
+        guard !running else { return }
+        running = true
+        log.append("── ICB GPU-Address Corruption ──────────────")
+        runICBCorruption(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
