@@ -2907,31 +2907,7 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return rt
         }()
 
-        // ── ICB raw dump — search for hi GPU VA embedded as argument-buf pointer ──
-        // The ICB command should contain a pointer to the argument buffer at hi.gpuAddress.
-        // Finding it reveals the exact byte offset of the argument-buffer pointer in the command.
-        step("── ICB raw dump (first 256B, scanning for hi VA) ──")
-        let icbRaw = icb.contents().assumingMemoryBound(to: UInt8.self)
-        let hiVA   = hi.gpuAddress
-        var argBufPtrOff: Int? = nil
-        for row in 0..<16 {
-            let base = row * 16
-            var h = "  [+0x\(String(format:"%03x",base))]: "
-            for i in 0..<16 { h += String(format:"%02x ", icbRaw[base+i]) }
-            // Scan every 8-byte-aligned sub-word for hiVA
-            for i in stride(from: 0, to: 16, by: 1) {
-                guard base+i+7 < 256 else { break }
-                var v: UInt64 = 0
-                for bi in 0..<8 { v |= UInt64(icbRaw[base+i+bi]) << (bi*8) }
-                if v == hiVA { h += " ← HI_VA@+0x\(String(format:"%x",base+i))"; argBufPtrOff = base+i }
-            }
-            step(h)
-        }
-        if let off = argBufPtrOff {
-            step("  ★ arg-buf pointer found in ICB at byte offset +0x\(String(format:"%x",off))")
-        } else {
-            step("  (hi VA 0x\(String(hiVA,radix:16)) not found in first 256B of ICB)")
-        }
+        step("hi gpuVA=0x\(String(hi.gpuAddress,radix:16)) (arg-buf target)")
 
         // probeExecFull — FRESH QUEUE per call + useResource(sentinelBuf)
         // Fresh queue: avoids blacklisting after first GPU fault (code=4 "Ignored").
