@@ -2519,10 +2519,14 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
         let fmtOff    = findU32LE(SURF_FMT,          basePtr, totalLen)
 
         step("── Geometry scan ──")
-        step("  width  (0x\(String(SURF_W,  radix:16))): \(widthOff .map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
-        step("  height (0x\(String(SURF_H,  radix:16))): \(heightOff.map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
-        step("  BPR    (0x\(String(SURF_BPR,radix:16))): \(bprOff   .map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
-        step("  fmt    (0x\(String(SURF_FMT,radix:16))): \(fmtOff   .map{"@ hdr+0x"+String($0,radix:16)} ?? "NOT FOUND")")
+        let wStr   = widthOff  == nil ? "NOT FOUND" : "@ hdr+0x\(String(widthOff!,  radix:16))"
+        let hStr   = heightOff == nil ? "NOT FOUND" : "@ hdr+0x\(String(heightOff!, radix:16))"
+        let bprStr = bprOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(bprOff!,   radix:16))"
+        let fmtStr = fmtOff    == nil ? "NOT FOUND" : "@ hdr+0x\(String(fmtOff!,   radix:16))"
+        step("  width  (0x\(String(SURF_W,  radix:16))): \(wStr)")
+        step("  height (0x\(String(SURF_H,  radix:16))): \(hStr)")
+        step("  BPR    (0x\(String(SURF_BPR,radix:16))): \(bprStr)")
+        step("  fmt    (0x\(String(SURF_FMT,radix:16))): \(fmtStr)")
 
         // Dump first 256B of header (pre-pixel region)
         if headerOff > 0 {
