@@ -2657,7 +2657,7 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
         let slot = icb.indirectRenderCommandAt(0)
         slot.setRenderPipelineState(pso)
         slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
-        slot.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
+        slot.drawPrimitives(.point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
         step("ICB slot 0 encoded: vtxBuf[0]=sentinelBuf, 1 point draw")
 
         // Spray GPU-adjacent pairs — OOB write target VA into hi buf
