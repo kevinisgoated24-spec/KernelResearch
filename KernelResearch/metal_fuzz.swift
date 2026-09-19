@@ -641,7 +641,7 @@ func runICBCorruptFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         enc.useResource(icbBuf,    usage: .read)
         enc.useResource(dataBuf,   usage: .write)
         enc.useResource(targetBuf, usage: .write)
-        enc.executeCommandsInBuffer(icb, range: NSRange(location: 0, length: 1))
+        enc.executeCommandsInBuffer(icb, range: 0..<1)
         enc.endEncoding()
         sl.write("CONTROLLED WRITE — committing ICB execute")
         cmd.addCompletedHandler { [pTarget, targetBuf] cb in
@@ -2700,7 +2700,7 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
 
         guard let cb  = queue.makeCommandBuffer()                      else { step("✗ no cmd buf"); completion(); return }
         guard let enc = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { step("✗ no encoder"); completion(); return }
-        enc.executeCommandsInBuffer(icb, range: NSRange(location: 0, length: 1))
+        enc.executeCommandsInBuffer(icb, range: 0..<1)
         enc.endEncoding()
         cb.addCompletedHandler { buf in
             if let err = buf.error {
