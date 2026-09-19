@@ -2468,7 +2468,7 @@ private func iosDumpHex(_ buf: UnsafePointer<UInt8>, _ len: Int,
 
 // ── IOSurface Shared-Memory Escalation ───────────────────────────────────────
 func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
-    DispatchQueue.global(qos: .userInitiated).async {
+    DispatchQueue.global(qos: .userInitiated).async(execute: {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
 
@@ -2592,14 +2592,14 @@ func runIOSurfaceOOBEscalation(log: FuzzLog, completion: @escaping () -> Void) {
 
         step("── IOSurface Escalation complete ──────────")
         completion()
-    }
+    })
 }
 
 // ── ICB GPU-Address Corruption ────────────────────────────────────────────────
 // Spray GPU-adjacent MTLBuffer pairs; OOB-write a target GPU VA into the hi buf.
 // If the hi buf happens to be (or alias) an ICB slot, the GPU dereferences our VA.
 func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
-    DispatchQueue.global(qos: .userInitiated).async {
+    DispatchQueue.global(qos: .userInitiated).async(execute: {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
 
@@ -2723,5 +2723,5 @@ func runICBCorruption(log: FuzzLog, completion: @escaping () -> Void) {
 
         step("── ICB Corruption complete ──────────────")
         completion()
-    }
+    })
 }
