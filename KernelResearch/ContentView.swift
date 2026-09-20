@@ -81,6 +81,7 @@ struct ContentView: View {
                         ActionBtn("GPU\nPtr Redir",    color: .purple)  { runGPUPtrRedir() }
                         ActionBtn("GPU\nWrite Redir", color: .red)     { runGPUWriteRedir() }
                         ActionBtn("IOSurf\nGPU Wr",  color: .yellow)  { runIOSurfaceGPUWrite() }
+                        ActionBtn("GPU VA\nScan",   color: .teal)    { runGPUVAScan() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -393,6 +394,15 @@ struct ContentView: View {
         running = true
         log.append("── IOSurface GPU Write ───────────────────────")
         KernelResearch.runIOSurfaceGPUWrite(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runGPUVAScan() {
+        guard !running else { return }
+        running = true
+        log.append("── GPU VA Scan ───────────────────────────────")
+        KernelResearch.runGPUVAScan(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
