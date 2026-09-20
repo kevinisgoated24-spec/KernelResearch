@@ -90,6 +90,7 @@ struct ContentView: View {
                         ActionBtn("New Hit\nDump", color: .green)   { runNewHitDump() }
                         ActionBtn("Wide VA\nScan", color: .pink)    { runWideVAScan() }
                         ActionBtn("IOSurf\nPropFuzz", color: .red) { runIOSurfacePropFuzz() }
+                        ActionBtn("Depth\nProbe", color: .cyan) { runDepthProbe() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -483,6 +484,15 @@ struct ContentView: View {
         running = true
         log.append("── IOSurface Property Fuzzer ─────────────────")
         KernelResearch.runIOSurfacePropFuzz(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runDepthProbe() {
+        guard !running else { return }
+        running = true
+        log.append("── IOSurface Depth Probe ─────────────────────")
+        KernelResearch.runIOSurfaceDepthProbe(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }

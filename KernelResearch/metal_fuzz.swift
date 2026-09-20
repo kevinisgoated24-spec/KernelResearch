@@ -4920,3 +4920,123 @@ func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     }
 }
+
+// ── stage20: IOSurface Depth Probe ────────────────────────────────────────────
+// Binary-searches the exact nesting depth cutoff the IOSurface kext enforces.
+// stage19 showed: depth=50 accepted, depth=100 rejected.
+//
+// Sub-tests:
+//   A: binary search pure CFDictionary nesting — finds exact limit N
+//   B: test N-1, N, N+1 (off-by-one probe around exact boundary)
+//   C: mixed nesting dict->array->dict->array — bypass candidate if counter is type-specific
+//   D: binary search key length cutoff (4096 accepted, 1048576 rejected)
+//   E: exact key length boundary +/-1
+// ─────────────────────────────────────────────────────────────────────────────
+private func _depthProbeBody(surfRef: IOSurfaceRef, log: FuzzLog) {
+    func step(_ s: String) { log.append(s) }
+
+    func setProp(_ key: String, _ val: CFTypeRef) -> Bool {
+        IOSurfaceSetValue(surfRef, key as CFString, val)
+        let rb = IOSurfaceCopyValue(surfRef, key as CFString)
+        if rb != nil { IOSurfaceRemoveValue(surfRef, key as CFString) }
+        return rb != nil
+    }
+
+    // ── A: binary search pure dict nesting ──────────────────────────────────
+    step("── A: binary search dict nesting cutoff ──")
+    var lo = 51, hi2 = 99, cutoff = 99
+    while lo <= hi2 {
+        let mid = (lo + hi2) / 2
+        var inner: AnyObject = "leaf" as NSString
+        for _ in 0..<mid { inner = NSDictionary(object: inner, forKey: "k" as NSString) }
+        if setProp("depth_bsearch", inner as CFTypeRef) {
+            step("  depth=\(mid) ok")
+            lo = mid + 1
+        } else {
+            step("  depth=\(mid) rej")
+            cutoff = mid
+            hi2 = mid - 1
+        }
+    }
+    step("  cutoff=\(cutoff) (first rejected)")
+
+    // ── B: off-by-one probe ──────────────────────────────────────────────────
+    step("── B: off-by-one probe (cutoff=\(cutoff)) ──")
+    for d in [cutoff - 2, cutoff - 1, cutoff, cutoff + 1] {
+        guard d > 0 else { continue }
+        var inner: AnyObject = "leaf" as NSString
+        for _ in 0..<d { inner = NSDictionary(object: inner, forKey: "k" as NSString) }
+        let ok = setProp("obo_\(d)", inner as CFTypeRef)
+        step("  depth=\(d) \(ok ? "ok" : "rej")")
+    }
+
+    // ── C: mixed dict/array nesting ─────────────────────────────────────────
+    step("── C: mixed dict/array nesting ──")
+    for totalDepth in [cutoff - 1, cutoff, cutoff + 1, cutoff * 2, cutoff * 4] {
+        var inner: AnyObject = "leaf" as NSString
+        for i in 0..<totalDepth {
+            if i % 2 == 0 {
+                inner = NSDictionary(object: inner, forKey: "k" as NSString)
+            } else {
+                inner = NSArray(object: inner)
+            }
+        }
+        let ok = setProp("mixed_\(totalDepth)", inner as CFTypeRef)
+        step("  mixed depth=\(totalDepth) \(ok ? "ok" : "rej")")
+    }
+
+    // ── D: binary search key length cutoff ──────────────────────────────────
+    step("── D: binary search key length cutoff ──")
+    let tinyVal: CFData = Data([0x41]) as CFData
+    var klo = 4097, khi = 1_048_576, kCutoff = 1_048_576
+    while klo <= khi {
+        let mid = (klo + khi) / 2
+        let key = String(repeating: "K", count: mid)
+        IOSurfaceSetValue(surfRef, key as CFString, tinyVal)
+        let rb = IOSurfaceCopyValue(surfRef, key as CFString)
+        if rb != nil {
+            IOSurfaceRemoveValue(surfRef, key as CFString)
+            step("  keyLen=\(mid) ok")
+            klo = mid + 1
+        } else {
+            step("  keyLen=\(mid) rej")
+            kCutoff = mid
+            khi = mid - 1
+        }
+    }
+    step("  key cutoff=\(kCutoff) (first rejected)")
+
+    // ── E: key boundary +/-1 ────────────────────────────────────────────────
+    step("── E: key boundary probe ──")
+    for klen in [kCutoff - 2, kCutoff - 1, kCutoff, kCutoff + 1] {
+        guard klen > 0 else { continue }
+        let key = String(repeating: "E", count: klen)
+        IOSurfaceSetValue(surfRef, key as CFString, tinyVal)
+        let rb = IOSurfaceCopyValue(surfRef, key as CFString)
+        let ok = rb != nil
+        if ok { IOSurfaceRemoveValue(surfRef, key as CFString) }
+        step("  keyLen=\(klen) \(ok ? "ok" : "rej")")
+    }
+
+    step("── Depth Probe complete ──")
+    step("  mixed-depth > dict-cutoff = bypass candidate")
+    step("  key cutoff at non-power-of-2 = malloc size field truncation candidate")
+}
+
+func runIOSurfaceDepthProbe(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── IOSurface Depth Probe (stage20) ──")
+        guard let surf = IOSurface(properties: [
+            .width:           64,
+            .height:          64,
+            .pixelFormat:     0x42475241,
+            .bytesPerElement: 4,
+            .bytesPerRow:     256,
+        ]) else { step("X IOSurface alloc failed"); completion(); return }
+        let surfRef = surf as! IOSurfaceRef
+        step("ok IOSurface @ \(surfRef)")
+        _depthProbeBody(surfRef: surfRef, log: log)
+        completion()
+    }
+}
