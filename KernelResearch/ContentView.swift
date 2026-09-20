@@ -88,6 +88,7 @@ struct ContentView: View {
                         ActionBtn("Ring Buf\nDump", color: .purple) { runRingBufDump() }
                         ActionBtn("Fine VA\nScan", color: .indigo)  { runFineVAScan() }
                         ActionBtn("New Hit\nDump", color: .green)   { runNewHitDump() }
+                        ActionBtn("Wide VA\nScan", color: .pink)    { runWideVAScan() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -463,6 +464,15 @@ struct ContentView: View {
         running = true
         log.append("── New Hit Dump ──────────────────────────────")
         KernelResearch.runNewHitDump(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runWideVAScan() {
+        guard !running else { return }
+        running = true
+        log.append("── Wide VA Scan (64MB) ───────────────────────")
+        KernelResearch.runWideVAScan(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }

