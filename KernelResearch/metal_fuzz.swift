@@ -3884,11 +3884,11 @@ func runDenseMapAndWrite(log: FuzzLog, completion: @escaping () -> Void) {
                 readback = outRead.contents().assumingMemoryBound(to: UInt64.self)[0]
             }
             if readback == CANARY {
-                step("  ★ WRITABLE VA=0x\(String(hit.va,radix:16)) orig=0x\(String(hit.origVal,radix:16))")
-                writableVAs.append((hit.va, hit.origVal))
+                step("  ★ WRITABLE VA=0x\(String(hit.va,radix:16)) orig=0x\(String(hit.val,radix:16))")
+                writableVAs.append((hit.va, hit.val))
                 // Restore original value
                 oobWriteVA(0, hit.va)
-                srcBuf.contents().assumingMemoryBound(to: UInt64.self)[0] = hit.origVal
+                srcBuf.contents().assumingMemoryBound(to: UInt64.self)[0] = hit.val
                 if let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
                    let enc = cb.makeComputeCommandEncoder() {
                     enc.setComputePipelineState(wPso)
