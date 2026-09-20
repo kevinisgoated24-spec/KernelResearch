@@ -84,6 +84,7 @@ struct ContentView: View {
                         ActionBtn("GPU VA\nScan",   color: .teal)    { runGPUVAScan() }
                         ActionBtn("GPU\nStruct Dump", color: .orange) { runGPUStructDump() }
                         ActionBtn("Hit2\nWrite",    color: .red)    { runHit2Write() }
+                        ActionBtn("Dense Map\n+Write", color: .brown) { runDenseMapAndWrite() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -423,6 +424,15 @@ struct ContentView: View {
         running = true
         log.append("── Hit2 Resource Token Write ─────────────────")
         KernelResearch.runHit2Write(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runDenseMapAndWrite() {
+        guard !running else { return }
+        running = true
+        log.append("── Dense Map + Writability Probe ─────────────")
+        KernelResearch.runDenseMapAndWrite(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }

