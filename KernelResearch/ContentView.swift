@@ -85,6 +85,7 @@ struct ContentView: View {
                         ActionBtn("GPU\nStruct Dump", color: .orange) { runGPUStructDump() }
                         ActionBtn("Hit2\nWrite",    color: .red)    { runHit2Write() }
                         ActionBtn("Dense Map\n+Write", color: .brown) { runDenseMapAndWrite() }
+                        ActionBtn("Ring Buf\nDump", color: .purple) { runRingBufDump() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -433,6 +434,15 @@ struct ContentView: View {
         running = true
         log.append("── Dense Map + Writability Probe ─────────────")
         KernelResearch.runDenseMapAndWrite(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runRingBufDump() {
+        guard !running else { return }
+        running = true
+        log.append("── Ring Buffer Full Dump ─────────────────────")
+        KernelResearch.runRingBufDump(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
