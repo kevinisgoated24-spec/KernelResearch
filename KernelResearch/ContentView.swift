@@ -87,6 +87,7 @@ struct ContentView: View {
                         ActionBtn("Dense Map\n+Write", color: .brown) { runDenseMapAndWrite() }
                         ActionBtn("Ring Buf\nDump", color: .purple) { runRingBufDump() }
                         ActionBtn("Fine VA\nScan", color: .indigo)  { runFineVAScan() }
+                        ActionBtn("New Hit\nDump", color: .green)   { runNewHitDump() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -453,6 +454,15 @@ struct ContentView: View {
         running = true
         log.append("── Fine VA Scan ──────────────────────────────")
         KernelResearch.runFineVAScan(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runNewHitDump() {
+        guard !running else { return }
+        running = true
+        log.append("── New Hit Dump ──────────────────────────────")
+        KernelResearch.runNewHitDump(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }

