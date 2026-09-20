@@ -4086,12 +4086,11 @@ func runIOSurfacePropFuzz(log: FuzzLog, completion: @escaping () -> Void) {
         func step(_ s: String) { log.append(s) }
         step("── IOSurface Property Fuzzer ──")
         guard let surf = IOSurface(properties: [
-            .allocSize:      65536,
-            .width:          256,
-            .height:         256,
-            .pixelFormat:    0x42475241,
+            .width:           256,
+            .height:          256,
+            .pixelFormat:     0x42475241,
             .bytesPerElement: 4,
-            .bytesPerRow:    1024,
+            .bytesPerRow:     1024,
         ]) else { step("✗ IOSurface alloc failed"); completion(); return }
         let surfRef = surf as! IOSurfaceRef
         step("✓ IOSurface @ \(surfRef)")
