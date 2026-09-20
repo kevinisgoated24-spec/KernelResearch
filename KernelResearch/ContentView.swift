@@ -83,6 +83,7 @@ struct ContentView: View {
                         ActionBtn("IOSurf\nGPU Wr",  color: .yellow)  { runIOSurfaceGPUWrite() }
                         ActionBtn("GPU VA\nScan",   color: .teal)    { runGPUVAScan() }
                         ActionBtn("GPU\nStruct Dump", color: .orange) { runGPUStructDump() }
+                        ActionBtn("Hit2\nWrite",    color: .red)    { runHit2Write() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -413,6 +414,15 @@ struct ContentView: View {
         running = true
         log.append("── GPU Struct Dump ───────────────────────────")
         KernelResearch.runGPUStructDump(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runHit2Write() {
+        guard !running else { return }
+        running = true
+        log.append("── Hit2 Resource Token Write ─────────────────")
+        KernelResearch.runHit2Write(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
