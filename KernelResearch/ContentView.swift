@@ -78,6 +78,7 @@ struct ContentView: View {
                         ActionBtn("IOSurf\nOOB Esc",    color: .red)     { runIOSurfOOBEsc() }
                         ActionBtn("ICB\nGPU Corrupt",   color: .red)     { runICBGPUCorrupt() }
                         ActionBtn("ICB\nField Probe",   color: .orange)  { runICBFieldProbe() }
+                        ActionBtn("GPU\nPtr Redir",    color: .purple)  { runGPUPtrRedir() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -363,6 +364,15 @@ struct ContentView: View {
         running = true
         log.append("── ICB GPU-Address Corruption ──────────────")
         runICBCorruption(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runGPUPtrRedir() {
+        guard !running else { return }
+        running = true
+        log.append("── GPU Ptr Redirect ──────────────────────────")
+        KernelResearch.runArgBufCorrupt(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }

