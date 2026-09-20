@@ -3937,185 +3937,165 @@ func runDenseMapAndWrite(log: FuzzLog, completion: @escaping () -> Void) {
 // If the device reboots during any test: that test number triggered a kernel
 // panic.  Retrieve the crash log (Crash Log button) and paste it.
 // ─────────────────────────────────────────────────────────────────────────────
+private func _ioSurfaceFuzzBody(surfRef: IOSurfaceRef, log: FuzzLog, completion: @escaping () -> Void) {
+    func step(_ s: String) { log.append(s) }
+
+    func setProp(_ key: String, _ val: CFTypeRef) -> Bool {
+        IOSurfaceSetValue(surfRef, key as CFString, val)
+        return IOSurfaceCopyValue(surfRef, key as CFString) != nil
+    }
+    func rmProp(_ key: String) { IOSurfaceRemoveValue(surfRef, key as CFString) }
+
+    // ── T1: kalloc zone boundary sizes ──────────────────────────────────
+    step("── T1: kalloc zone boundary CFData ──")
+    let zoneSizes: [Int] = [16, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096,
+                             15, 31, 47, 63, 95, 127, 191, 255, 511, 1023, 2047, 4095,
+                             17, 33, 49, 65, 97, 129, 193, 257, 513, 1025, 2049, 4097]
+    for sz in zoneSizes {
+        let blob = Data(repeating: 0xAB, count: sz)
+        let ok = setProp("fuzz_t1_\(sz)", blob as CFData)
+        step("  sz=\(sz) → \(ok ? "✓ stored" : "✗ rejected")")
+        rmProp("fuzz_t1_\(sz)")
+    }
+
+    // ── T2: deeply nested CFDictionary ──────────────────────────────────
+    step("── T2: nested CFDictionary depth ──")
+    for depth in [10, 50, 100, 500, 1000, 2000] {
+        var inner: AnyObject = "leaf" as NSString
+        for _ in 0..<depth {
+            inner = NSDictionary(object: inner, forKey: "k" as NSString)
+        }
+        let ok = setProp("fuzz_t2_d\(depth)", inner as CFTypeRef)
+        step("  depth=\(depth) → \(ok ? "✓ stored" : "✗ rejected")")
+        rmProp("fuzz_t2_d\(depth)")
+    }
+
+    // ── T3: large CFData blobs ───────────────────────────────────────────
+    step("── T3: large blob sizes ──")
+    for szKB in [8, 64, 256, 1024, 4096, 16384] {
+        let blob = Data(repeating: 0xCC, count: szKB * 1024)
+        let ok = setProp("fuzz_t3_\(szKB)k", blob as CFData)
+        step("  \(szKB)KB → \(ok ? "✓ stored" : "✗ rejected")")
+        rmProp("fuzz_t3_\(szKB)k")
+    }
+
+    // ── T4: key attacks ──────────────────────────────────────────────────
+    step("── T4: key attacks ──")
+    let keyAttacks: [(String, String)] = [
+        ("empty",          ""),
+        ("single_null",    "\0"),
+        ("embedded_null",  "abc\0def"),
+        ("long_1KB",       String(repeating: "A", count: 1024)),
+        ("long_4KB",       String(repeating: "B", count: 4096)),
+        ("long_1MB",       String(repeating: "C", count: 1_048_576)),
+        ("reserved_global","IOSurfaceIsGlobal"),
+        ("reserved_seed",  "IOSurfaceSeed"),
+        ("unicode_emoji",  "🔥💀⚡️🧠"),
+        ("rtl_override",   "\u{202E}fuzz"),
+    ]
+    let tinyVal: CFData = Data([0x42]) as CFData
+    for (label, key) in keyAttacks {
+        IOSurfaceSetValue(surfRef, key as CFString, tinyVal)
+        let rb = IOSurfaceCopyValue(surfRef, key as CFString)
+        step("  key[\(label)] → \(rb != nil ? "✓ stored+read" : "✗ rejected")")
+        if rb != nil { IOSurfaceRemoveValue(surfRef, key as CFString) }
+    }
+
+    // ── T5: CFNumber extreme values ──────────────────────────────────────
+    step("── T5: CFNumber extremes ──")
+    let numCases: [(String, NSNumber)] = [
+        ("zero",     NSNumber(value: Int64(0))),
+        ("neg1",     NSNumber(value: Int64(-1))),
+        ("int64min", NSNumber(value: Int64.min)),
+        ("int64max", NSNumber(value: Int64.max)),
+        ("uint32max",NSNumber(value: UInt32.max)),
+        ("nan",      NSNumber(value: Float.nan)),
+        ("inf",      NSNumber(value: Float.infinity)),
+        ("neginf",   NSNumber(value: -Float.infinity)),
+    ]
+    for (label, num) in numCases {
+        let ok = setProp("fuzz_t5_\(label)", num as CFNumber)
+        step("  \(label) → \(ok ? "✓" : "✗")")
+        rmProp("fuzz_t5_\(label)")
+    }
+
+    // ── T6: mass property spray (count overflow) ─────────────────────────
+    step("── T6: mass property spray ──")
+    let sprayCount = 70_000
+    step("  spraying \(sprayCount) unique keys...")
+    let smallVal: CFData = Data([0xFF, 0x00]) as CFData
+    for i in 0..<sprayCount {
+        IOSurfaceSetValue(surfRef, "spray_\(i)" as CFString, smallVal)
+        if i % 10_000 == 9_999 { step("  ... \(i+1)/\(sprayCount) sprayed") }
+    }
+    step("  spray done — reading back sample keys")
+    var misses = 0
+    for i in stride(from: 0, to: sprayCount, by: 1000) {
+        if IOSurfaceCopyValue(surfRef, "spray_\(i)" as CFString) == nil { misses += 1 }
+    }
+    step("  readback misses: \(misses)/\(sprayCount/1000) sampled → \(misses == 0 ? "✓ all present" : "⚠ some lost")")
+
+    // ── T7: concurrent set/remove race ───────────────────────────────────
+    step("── T7: concurrent set/remove race ──")
+    let raceKey: CFString = "race_key" as CFString
+    let raceVal: CFData   = Data(repeating: 0xDE, count: 256) as CFData
+    let raceGroup = DispatchGroup()
+    let raceQ1 = DispatchQueue(label: "fuzz.set",    qos: .userInteractive)
+    let raceQ2 = DispatchQueue(label: "fuzz.remove", qos: .userInteractive)
+    let raceIters = 2000
+    var setCount = 0, rmCount = 0
+    raceGroup.enter()
+    raceQ1.async {
+        for _ in 0..<raceIters { IOSurfaceSetValue(surfRef, raceKey, raceVal); setCount += 1 }
+        raceGroup.leave()
+    }
+    raceGroup.enter()
+    raceQ2.async {
+        for _ in 0..<raceIters { IOSurfaceRemoveValue(surfRef, raceKey); rmCount += 1 }
+        raceGroup.leave()
+    }
+    raceGroup.wait()
+    step("  set=\(setCount) remove=\(rmCount) — survived ✓ (kernel panic = race found UAF)")
+
+    // ── T8: binary CFData with null bytes ────────────────────────────────
+    step("── T8: binary data / unicode key edge cases ──")
+    var binaryBlob = Data(count: 4096)
+    binaryBlob.withUnsafeMutableBytes { (ptr: UnsafeMutableRawBufferPointer) in
+        for i in 0..<4096 { ptr[i] = i % 2 == 0 ? 0x00 : 0xFF }
+        ptr[0] = 0xFE; ptr[1] = 0xFF
+        ptr[4094] = 0x00; ptr[4095] = 0x00
+    }
+    step("  binary_4KB → \(setProp("fuzz_t8_binary", binaryBlob as CFData) ? "✓" : "✗")")
+
+    var arr = [CFData]()
+    for _ in 0..<1024 { arr.append(Data(repeating: 0xAA, count: 64) as CFData) }
+    step("  CFArray[1024×64B] → \(setProp("fuzz_t8_array_1024", arr as CFArray) ? "✓" : "✗")")
+
+    let dictNS = NSMutableDictionary()
+    for i in 0..<512 { dictNS["k\(i)"] = Data(repeating: UInt8(i & 0xFF), count: i + 1) as CFData }
+    step("  CFDict[512 mixed-size values] → \(setProp("fuzz_t8_dict_512", dictNS as CFDictionary) ? "✓" : "✗")")
+
+    step("── IOSurface Property Fuzzer complete ──")
+    step("  if device rebooted during any test → kernel panic found")
+    step("  note which T# button press caused the reboot, then check Crash Log")
+    completion()
+}
+
 func runIOSurfacePropFuzz(log: FuzzLog, completion: @escaping () -> Void) {
     DispatchQueue.global(qos: .userInitiated).async {
         func step(_ s: String) { log.append(s) }
         step("── IOSurface Property Fuzzer ──")
-
         guard let surf = IOSurface(properties: [
-            .allocSize:     65536,
-            .width:         256,
-            .height:        256,
-            .pixelFormat:   0x42475241,  // BGRA
+            .allocSize:      65536,
+            .width:          256,
+            .height:         256,
+            .pixelFormat:    0x42475241,
             .bytesPerElement: 4,
-            .bytesPerRow:   1024
+            .bytesPerRow:    1024,
         ]) else { step("✗ IOSurface alloc failed"); completion(); return }
-
         let surfRef = surf as! IOSurfaceRef
         step("✓ IOSurface @ \(surfRef)")
-
-        func setProp(_ key: String, _ val: CFTypeRef) -> Bool {
-            IOSurfaceSetValue(surfRef, key as CFString, val)
-            let rb = IOSurfaceCopyValue(surfRef, key as CFString)
-            return rb != nil
-        }
-        func rmProp(_ key: String) { IOSurfaceRemoveValue(surfRef, key as CFString) }
-
-        // ── T1: kalloc zone boundary sizes ──────────────────────────────────
-        step("── T1: kalloc zone boundary CFData ──")
-        let zoneSizes = [16, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096,
-                         15, 31, 47, 63, 95, 127, 191, 255, 511, 1023, 2047, 4095,
-                         17, 33, 49, 65, 97, 129, 193, 257, 513, 1025, 2049, 4097]
-        for sz in zoneSizes {
-            let blob = Data(repeating: 0xAB, count: sz)
-            let ok = setProp("fuzz_t1_\(sz)", blob as CFData)
-            step("  sz=\(sz) → \(ok ? "✓ stored" : "✗ rejected")")
-            rmProp("fuzz_t1_\(sz)")
-        }
-
-        // ── T2: deeply nested CFDictionary ──────────────────────────────────
-        step("── T2: nested CFDictionary depth ──")
-        for depth in [10, 50, 100, 500, 1000, 2000] {
-            var inner: CFTypeRef = "leaf" as CFString
-            for _ in 0..<depth {
-                inner = ["k": inner] as CFDictionary
-            }
-            let ok = setProp("fuzz_t2_d\(depth)", inner)
-            step("  depth=\(depth) → \(ok ? "✓ stored" : "✗ rejected")")
-            rmProp("fuzz_t2_d\(depth)")
-        }
-
-        // ── T3: large CFData blobs ───────────────────────────────────────────
-        step("── T3: large blob sizes ──")
-        for szKB in [8, 64, 256, 1024, 4096, 16384] {
-            let blob = Data(repeating: 0xCC, count: szKB * 1024)
-            let ok = setProp("fuzz_t3_\(szKB)k", blob as CFData)
-            step("  \(szKB)KB → \(ok ? "✓ stored" : "✗ rejected")")
-            rmProp("fuzz_t3_\(szKB)k")
-        }
-
-        // ── T4: key attacks ──────────────────────────────────────────────────
-        step("── T4: key attacks ──")
-        let keyAttacks: [(String, String)] = [
-            ("empty",         ""),
-            ("single_null",   "\0"),
-            ("embedded_null", "abc\0def"),
-            ("long_1KB",      String(repeating: "A", count: 1024)),
-            ("long_4KB",      String(repeating: "B", count: 4096)),
-            ("long_1MB",      String(repeating: "C", count: 1_048_576)),
-            ("reserved_global","IOSurfaceIsGlobal"),
-            ("reserved_seed",  "IOSurfaceSeed"),
-            ("unicode_emoji",  "🔥💀⚡️🧠"),
-            ("rtl_override",   "\u{202E}fuzz"),
-        ]
-        let tinyVal = Data([0x42]) as CFData
-        for (label, key) in keyAttacks {
-            IOSurfaceSetValue(surfRef, key as CFString, tinyVal)
-            let rb = IOSurfaceCopyValue(surfRef, key as CFString)
-            step("  key[\(label)] → \(rb != nil ? "✓ stored+read" : "✗ rejected")")
-            if rb != nil { IOSurfaceRemoveValue(surfRef, key as CFString) }
-        }
-
-        // ── T5: CFNumber extreme values ──────────────────────────────────────
-        step("── T5: CFNumber extremes ──")
-        let nums: [(String, CFNumber)] = [
-            ("zero",    0 as CFNumber),
-            ("neg1",   (-1) as CFNumber),
-            ("int64min", Int64.min as CFNumber),
-            ("int64max", Int64.max as CFNumber),
-            ("uint32max", UInt32.max as CFNumber),
-        ]
-        for (label, num) in nums {
-            let ok = setProp("fuzz_t5_\(label)", num)
-            step("  \(label) → \(ok ? "✓" : "✗")")
-            rmProp("fuzz_t5_\(label)")
-        }
-        // Float specials via raw bits
-        let floatSpecials: [(String, Float)] = [
-            ("nan",     Float.nan),
-            ("inf",     Float.infinity),
-            ("neginf", -Float.infinity),
-        ]
-        for (label, f) in floatSpecials {
-            let num = NSNumber(value: f)
-            IOSurfaceSetValue(surfRef, "fuzz_t5_\(label)" as CFString, num)
-            let rb = IOSurfaceCopyValue(surfRef, "fuzz_t5_\(label)" as CFString)
-            step("  float.\(label) → \(rb != nil ? "✓" : "✗")")
-            IOSurfaceRemoveValue(surfRef, "fuzz_t5_\(label)" as CFString)
-        }
-
-        // ── T6: mass property spray (count overflow) ─────────────────────────
-        step("── T6: mass property spray ──")
-        let sprayCount = 70_000
-        step("  spraying \(sprayCount) unique keys...")
-        let smallVal = Data([0xFF, 0x00]) as CFData
-        for i in 0..<sprayCount {
-            IOSurfaceSetValue(surfRef, "spray_\(i)" as CFString, smallVal)
-            if i % 10_000 == 9_999 { step("  ... \(i+1)/\(sprayCount) sprayed") }
-        }
-        step("  spray done — reading back sample keys")
-        var misses = 0
-        for i in stride(from: 0, to: sprayCount, by: 1000) {
-            if IOSurfaceCopyValue(surfRef, "spray_\(i)" as CFString) == nil { misses += 1 }
-        }
-        step("  readback misses: \(misses)/\(sprayCount/1000) sampled → \(misses == 0 ? "✓ all present" : "⚠ some lost")")
-
-        // ── T7: concurrent set/remove race ───────────────────────────────────
-        step("── T7: concurrent set/remove race ──")
-        let raceKey = "race_key" as CFString
-        let raceVal = Data(repeating: 0xDE, count: 256) as CFData
-        let raceGroup = DispatchGroup()
-        let raceQ1 = DispatchQueue(label: "fuzz.set",    qos: .userInteractive)
-        let raceQ2 = DispatchQueue(label: "fuzz.remove", qos: .userInteractive)
-        let RACE_ITERS = 2000
-        var setCount = 0, rmCount = 0
-        raceGroup.enter()
-        raceQ1.async {
-            for _ in 0..<RACE_ITERS {
-                IOSurfaceSetValue(surfRef, raceKey, raceVal)
-                setCount += 1
-            }
-            raceGroup.leave()
-        }
-        raceGroup.enter()
-        raceQ2.async {
-            for _ in 0..<RACE_ITERS {
-                IOSurfaceRemoveValue(surfRef, raceKey)
-                rmCount += 1
-            }
-            raceGroup.leave()
-        }
-        raceGroup.wait()
-        step("  set=\(setCount) remove=\(rmCount) — survived ✓ (kernel panic = race found UAF)")
-
-        // ── T8: binary CFData with null bytes + high-unicode keys ────────────
-        step("── T8: binary data / unicode key edge cases ──")
-        var binaryBlob = Data(count: 4096)
-        binaryBlob.withUnsafeMutableBytes { ptr in
-            // Pattern: 0x00, 0xFF alternating, with embedded 0xFE 0xFF (BOM), and NUL runs
-            for i in 0..<4096 { ptr[i] = i % 2 == 0 ? 0x00 : 0xFF }
-            ptr[0] = 0xFE; ptr[1] = 0xFF  // UTF-16 BOM
-            ptr[4094] = 0x00; ptr[4095] = 0x00  // double-NUL terminator pattern
-        }
-        let blobSet = setProp("fuzz_t8_binary", binaryBlob as CFData)
-        step("  binary_4KB → \(blobSet ? "✓" : "✗")")
-        // Large CFArray of CFData
-        var arr: [CFData] = []
-        for _ in 0..<1024 { arr.append(Data(repeating: 0xAA, count: 64) as CFData) }
-        let cfArr = arr as CFArray
-        let arrSet = setProp("fuzz_t8_array_1024", cfArr)
-        step("  CFArray[1024×64B] → \(arrSet ? "✓" : "✗")")
-        // CFDictionary with CFData values of varied sizes
-        var dict: [String: CFData] = [:]
-        for i in 0..<512 { dict["k\(i)"] = Data(repeating: UInt8(i & 0xFF), count: i + 1) as CFData }
-        let cfDict = dict as CFDictionary
-        let dictSet = setProp("fuzz_t8_dict_512", cfDict)
-        step("  CFDict[512 mixed-size values] → \(dictSet ? "✓" : "✗")")
-
-        step("── IOSurface Property Fuzzer complete ──")
-        step("  if device rebooted during any test → kernel panic found")
-        step("  note which T# button press caused the reboot, then check Crash Log")
-        completion()
+        _ioSurfaceFuzzBody(surfRef: surfRef, log: log, completion: completion)
     }
 }
 
