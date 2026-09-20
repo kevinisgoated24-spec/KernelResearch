@@ -5162,7 +5162,18 @@ private func _planeFuzzBody(log: FuzzLog) {
         }
     }
 
-    func makePlane(_ d: [IOSurfacePlanePropertyKey: Any]) -> [IOSurfacePlanePropertyKey: Any] { d }
+    // Plane sub-dicts use raw string keys on iOS (IOSurfacePlanePropertyKey doesn't exist)
+    func plane(_ w: Int, _ h: Int, _ bpr: Int, _ bpe: Int, _ off: Int, _ sz: Int) -> [String: Any] {
+        ["IOSurfacePlaneWidth": w, "IOSurfacePlaneHeight": h,
+         "IOSurfacePlaneBytesPerRow": bpr, "IOSurfacePlaneBytesPerElement": bpe,
+         "IOSurfacePlaneOffset": off, "IOSurfacePlaneSize": sz]
+    }
+    func planeBase(_ w: Int, _ h: Int, _ bpr: Int, _ bpe: Int, _ off: Int, _ sz: Int, _ base: Int) -> [String: Any] {
+        ["IOSurfacePlaneWidth": w, "IOSurfacePlaneHeight": h,
+         "IOSurfacePlaneBytesPerRow": bpr, "IOSurfacePlaneBytesPerElement": bpe,
+         "IOSurfacePlaneOffset": off, "IOSurfacePlaneSize": sz,
+         "IOSurfacePlaneBase": base]
+    }
 
     let baseProp: [IOSurfacePropertyKey: Any] = [
         .width: 256, .height: 256, .pixelFormat: 0x42475241,
@@ -5172,23 +5183,20 @@ private func _planeFuzzBody(log: FuzzLog) {
     // ── A: zero-size plane ───────────────────────────────────────────────────
     step("── A: zero-size plane ──")
     tryCreate("zero w/h/sz", baseProp.merging([
-        .planeInfo: [makePlane([.width: 0, .height: 0, .bytesPerRow: 0,
-                                .bytesPerElement: 0, .offset: 0, .size: 0])]
+        .planeInfo: [plane(0, 0, 0, 0, 0, 0)]
     ]) { $1 })
 
     // ── B: plane offset > alloc size ─────────────────────────────────────────
     step("── B: plane offset > alloc ──")
     for offset in [262144, 1048576, Int(UInt32.max), Int(UInt32.max) - 1] {
         tryCreate("offset=\(offset)", baseProp.merging([
-            .planeInfo: [makePlane([.width: 256, .height: 256, .bytesPerRow: 1024,
-                                    .bytesPerElement: 4, .offset: offset, .size: 262144])]
+            .planeInfo: [plane(256, 256, 1024, 4, offset, 262144)]
         ]) { $1 })
     }
 
     // ── C: overlapping planes ────────────────────────────────────────────────
     step("── C: overlapping planes at same offset ──")
-    let planeSame = makePlane([.width: 256, .height: 256, .bytesPerRow: 1024,
-                               .bytesPerElement: 4, .offset: 0, .size: 262144])
+    let planeSame = plane(256, 256, 1024, 4, 0, 262144)
     tryCreate("2 planes same offset=0", baseProp.merging([
         .planeInfo: [planeSame, planeSame]
     ]) { $1 })
@@ -5197,57 +5205,41 @@ private func _planeFuzzBody(log: FuzzLog) {
     step("── D: plane size > alloc ──")
     for sz in [524288, 1048576, Int(UInt32.max)] {
         tryCreate("planeSize=\(sz)", baseProp.merging([
-            .planeInfo: [makePlane([.width: 256, .height: 256, .bytesPerRow: 1024,
-                                    .bytesPerElement: 4, .offset: 0, .size: sz])]
+            .planeInfo: [plane(256, 256, 1024, 4, 0, sz)]
         ]) { $1 })
     }
 
     // ── E: width*height*bpe integer overflow ─────────────────────────────────
     step("── E: width*height*bpe overflow ──")
-    // 65536 * 65536 * 4 = 2^34 → wraps to 0 in uint32
     tryCreate("w=65536 h=65536 bpe=4", [
         .width: 65536, .height: 65536, .pixelFormat: 0x42475241,
         .bytesPerElement: 4, .bytesPerRow: 262144,
-    ])
-    // 0x8001 * 0x8001 = 0x40018001 → lower 32 bits = 0x18001
+    ] as [IOSurfacePropertyKey: Any])
     tryCreate("w=32769 h=32769 bpe=4", [
         .width: 32769, .height: 32769, .pixelFormat: 0x42475241,
         .bytesPerElement: 4, .bytesPerRow: 131076,
-    ])
+    ] as [IOSurfacePropertyKey: Any])
 
     // ── F: maximum plane count ───────────────────────────────────────────────
-    step("── F: 32-plane count ──")
-    let smallPlane = makePlane([.width: 8, .height: 8, .bytesPerRow: 32,
-                                .bytesPerElement: 4, .offset: 0, .size: 256])
-    tryCreate("32 planes", baseProp.merging([
-        .planeInfo: Array(repeating: smallPlane, count: 32)
-    ]) { $1 })
-    tryCreate("64 planes", baseProp.merging([
-        .planeInfo: Array(repeating: smallPlane, count: 64)
-    ]) { $1 })
-    tryCreate("256 planes", baseProp.merging([
-        .planeInfo: Array(repeating: smallPlane, count: 256)
-    ]) { $1 })
+    step("── F: plane count stress ──")
+    let smallPlane = plane(8, 8, 32, 4, 0, 256)
+    tryCreate("32 planes", baseProp.merging([.planeInfo: Array(repeating: smallPlane, count: 32)]) { $1 })
+    tryCreate("64 planes", baseProp.merging([.planeInfo: Array(repeating: smallPlane, count: 64)]) { $1 })
+    tryCreate("256 planes", baseProp.merging([.planeInfo: Array(repeating: smallPlane, count: 256)]) { $1 })
 
     // ── G: offset near page boundary ─────────────────────────────────────────
     step("── G: offset near page boundary ──")
     for offset in [4095, 4096, 4097, 8191, 8192] {
         tryCreate("offset=\(offset)", baseProp.merging([
-            .planeInfo: [makePlane([.width: 256, .height: 255, .bytesPerRow: 1024,
-                                    .bytesPerElement: 4, .offset: offset,
-                                    .size: 261120])]
+            .planeInfo: [plane(256, 255, 1024, 4, offset, 261120)]
         ]) { $1 })
     }
 
     // ── H: plane base field extremes ─────────────────────────────────────────
     step("── H: plane base field ──")
-    // .base is a documented IOSurfacePlanePropertyKey — it sets the plane's
-    // base VA; feeding kernel-looking values probes whether the kext validates it
     for base in [0, 1, 0xFFFFFFFF, Int.max] {
-        tryCreate("base=\(String(base, radix:16))", baseProp.merging([
-            .planeInfo: [makePlane([.width: 256, .height: 256, .bytesPerRow: 1024,
-                                    .bytesPerElement: 4, .offset: 0, .size: 262144,
-                                    .base: base])]
+        tryCreate("base=0x\(String(base, radix:16))", baseProp.merging([
+            .planeInfo: [planeBase(256, 256, 1024, 4, 0, 262144, base)]
         ]) { $1 })
     }
 
@@ -5255,8 +5247,7 @@ private func _planeFuzzBody(log: FuzzLog) {
     step("── I: concurrent create/destroy race ──")
     let raceGroup = DispatchGroup()
     let raceProp = baseProp.merging([
-        .planeInfo: [makePlane([.width: 256, .height: 256, .bytesPerRow: 1024,
-                                .bytesPerElement: 4, .offset: 0, .size: 262144])]
+        .planeInfo: [plane(256, 256, 1024, 4, 0, 262144)]
     ]) { $1 }
     var created = 0, destroyed = 0
     for _ in 0..<4 {
