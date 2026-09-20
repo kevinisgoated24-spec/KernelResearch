@@ -79,6 +79,7 @@ struct ContentView: View {
                         ActionBtn("ICB\nGPU Corrupt",   color: .red)     { runICBGPUCorrupt() }
                         ActionBtn("ICB\nField Probe",   color: .orange)  { runICBFieldProbe() }
                         ActionBtn("GPU\nPtr Redir",    color: .purple)  { runGPUPtrRedir() }
+                        ActionBtn("GPU\nWrite Redir", color: .red)     { runGPUWriteRedir() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -373,6 +374,15 @@ struct ContentView: View {
         running = true
         log.append("── GPU Ptr Redirect ──────────────────────────")
         KernelResearch.runArgBufCorrupt(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runGPUWriteRedir() {
+        guard !running else { return }
+        running = true
+        log.append("── GPU Write Redirect ────────────────────────")
+        KernelResearch.runArgBufWrite(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
