@@ -2915,11 +2915,15 @@ func runICBFieldProbe(log: FuzzLog, completion: @escaping () -> Void) {
 
         step("driver arg-buf target gpuVA=0x\(String(nextGPUVA,radix:16))")
 
-        // probeExecFull — fresh queue per call + useResource(sentinelBuf)
+        // probeExecFull — fresh queue per call + encoder PSO + useResource(sentinelBuf)
+        // Metal requires the render encoder to have a PSO set even when the ICB command
+        // provides its own PSO (inheritPipelineState=false). Without this the GPU has
+        // no pipeline state for the render pass → code=3 page fault on every execution.
         func probeExecFull() -> (Bool, String) {
             guard let freshQ = device.makeCommandQueue(),
                   let cb     = freshQ.makeCommandBuffer(),
                   let enc    = cb.makeRenderCommandEncoder(descriptor: rtDesc) else { return (false, "no cb") }
+            enc.setRenderPipelineState(pso)      // ← required: encoder needs its own PSO
             enc.useResource(sentinelBuf, usage: .read)
             enc.executeCommandsInBuffer(icb, range: 0..<1)
             enc.endEncoding()
