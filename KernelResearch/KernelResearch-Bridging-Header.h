@@ -4,6 +4,13 @@
 #import "bad_query.h"
 #import "iokit_fuzz.h"
 #import "metal_trampoline.h"
+#import <IOSurface/IOSurfaceRef.h>
+
+// IOSurface property C API (available on iOS, not always declared in SDK headers)
+extern void        IOSurfaceSetValue(IOSurfaceRef surface, CFStringRef key, CFTypeRef value);
+extern CFTypeRef   IOSurfaceCopyValue(IOSurfaceRef surface, CFStringRef key);
+extern void        IOSurfaceRemoveValue(IOSurfaceRef surface, CFStringRef key);
+extern uint32_t    IOSurfaceGetPropertyMaximum(CFStringRef property);
 
 // vm_region_64 is callable on iOS but Apple marks all *_COUNT macros
 // and info structs as "unavailable: structure not supported" in the SDK.
