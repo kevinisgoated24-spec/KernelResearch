@@ -1,0 +1,609 @@
+<!doctype html>
+<html>
+<head>
+<meta charset=utf8>
+<meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SVG Filter Fuzzer</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap">
+<style>
+:root{--bg:#0c0c0c;--surf:#161616;--card:#1e1e1e;--border:#2a2a2a;--text:#e4e4e4;--muted:#888;--dim:#444;--red:#ff453a;--amber:#ff9f0a;--green:#32d74b;--red-dim:rgba(255,69,58,.12);--amber-dim:rgba(255,159,10,.1);--green-dim:rgba(50,215,75,.1)}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;font-size:14px;line-height:1.6;padding:16px;min-height:100%}
+.wrap{max-width:600px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{font-size:18px;font-weight:700;color:var(--red)}
+.sub{font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:4px}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.card-head{padding:10px 14px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--muted);text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.dot.red{background:var(--red)}.dot.amber{background:var(--amber)}.dot.green{background:var(--green);animation:blink 1.4s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.log{padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.9;min-height:200px;max-height:360px;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
+.log-line{display:flex;gap:8px}
+.log-line .p{color:var(--dim);flex-shrink:0}
+.log-line .m{word-break:break-word}
+.ok .m{color:var(--green)}.err .m{color:var(--red)}.warn .m{color:var(--amber)}.dim .m{color:var(--muted)}
+.btn-row{padding:12px 14px;display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid var(--border)}
+.btn{display:inline-flex;align-items:center;gap:6px;font-family:'Inter',sans-serif;font-size:12px;font-weight:600;padding:7px 14px;border-radius:6px;border:none;cursor:pointer;transition:opacity .15s}
+.btn:active{opacity:.7}.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-red{background:var(--red);color:#fff}
+.btn-amber{background:var(--amber);color:#000}
+.btn-dark{background:var(--card);border:1px solid var(--border);color:var(--text)}
+.info-grid{display:grid;grid-template-columns:auto 1fr}
+.info-row{display:contents}
+.info-row .lb,.info-row .vl{padding:8px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;border-bottom:1px solid var(--border)}
+.info-row:last-child .lb,.info-row:last-child .vl{border-bottom:none}
+.info-row .lb{color:var(--muted);white-space:nowrap}
+.info-row .vl{color:var(--text);word-break:break-all}
+.info-row .vl.red{color:var(--red)}.info-row .vl.green{color:var(--green)}.info-row .vl.amber{color:var(--amber)}
+.status{padding:10px 14px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;gap:8px}
+.status.idle{background:var(--amber-dim);border:1px solid rgba(255,159,10,.25);color:var(--amber)}
+.status.running{background:var(--green-dim);border:1px solid rgba(50,215,75,.25);color:var(--green)}
+.status.crashed{background:var(--red-dim);border:1px solid rgba(255,69,58,.5);color:var(--red)}
+.tabs{display:flex;border-bottom:1px solid var(--border)}
+.tab{padding:10px 14px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}
+.tab.active{color:var(--text);border-bottom-color:var(--red)}
+.tab-content{display:none;padding:12px}
+.tab-content.active{display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div>
+    <h1>🔺 SVG Filter Fuzzer</h1>
+    <div class="sub">iOS 26.5.2 · WebKit 8624.2.5.10.8 · 8 SVG attack surfaces · new crash surface</div>
+  </div>
+
+  <div class="status idle" id="statusBar">
+    <span>◆</span><span id="statusTxt">READY — FRESH ATTACK SURFACE</span>
+  </div>
+
+  <div class="card">
+    <div class="tabs">
+      <div class="tab active" id="tab-run" onclick="switchTab('run')">▶ Run</div>
+      <div class="tab" id="tab-info" onclick="switchTab('info')">ℹ Info</div>
+    </div>
+
+    <div class="tab-content active" id="content-run">
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div class="info-grid" style="margin:-12px -12px 0">
+          <div class="info-row"><div class="lb">Tests run</div><div class="vl" id="statTests">0</div></div>
+          <div class="info-row"><div class="lb">Interesting</div><div class="vl amber" id="statInt">0</div></div>
+          <div class="info-row"><div class="lb">Current test</div><div class="vl" id="statCurrent">—</div></div>
+          <div class="info-row"><div class="lb">Slowest (ms)</div><div class="vl" id="statSlow">—</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-content" id="content-info">
+      <div class="info-grid" style="margin:-12px -12px 0">
+        <div class="info-row"><div class="lb">Bug class</div><div class="vl red">SVG filter recursion / layout crash</div></div>
+        <div class="info-row"><div class="lb">Why new</div><div class="vl amber">Different renderer than CSS flex</div></div>
+        <div class="info-row"><div class="lb">SVG renderer</div><div class="vl">RenderSVGRoot → RenderSVGContainer</div></div>
+        <div class="info-row"><div class="lb">Filter chain</div><div class="vl">feFlood→feComposite→feBlend (chained)</div></div>
+        <div class="info-row"><div class="lb">VoiceOver</div><div class="vl green">NOT needed</div></div>
+        <div class="info-row"><div class="lb">Check</div><div class="vl">Settings → Privacy → Analytics Data</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><span class="dot green"></span>Live Log</div>
+    <div class="log" id="log"></div>
+    <div class="btn-row">
+      <button class="btn btn-red" id="runAllBtn" onclick="runAll()">▶ Run All Tests</button>
+      <button class="btn btn-amber" id="crashBtn" onclick="runCrashTest()">💥 Deep Crash Test</button>
+      <button class="btn btn-dark" onclick="clearLog()">🗑 Clear</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><span class="dot red"></span>Crash Triage</div>
+    <div class="info-grid">
+      <div class="info-row"><div class="lb">SIGSEGV stack guard</div><div class="vl amber">Recursion overflow — new bug ✅</div></div>
+      <div class="info-row"><div class="lb">EXC_BAD_ACCESS heap</div><div class="vl green">UAF → exploitable 🔥</div></div>
+      <div class="info-row"><div class="lb">Slow but no crash</div><div class="vl">Increase depth — submit anyway</div></div>
+      <div class="info-row"><div class="lb">Where</div><div class="vl">Settings → Privacy → Analytics Data</div></div>
+    </div>
+  </div>
+
+</div>
+
+<div id="svgPayload" style="position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0.001"></div>
+
+<script>
+'use strict';
+
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+let _tests=0, _interesting=0;
+
+function log(msg,cls=''){
+    const el=document.getElementById('log');
+    const d=document.createElement('div');
+    d.className='log-line '+cls;
+    const ts=new Date().toTimeString().slice(0,8);
+    d.innerHTML='<span class="p">'+ts+'</span><span class="m">'+msg+'</span>';
+    el.appendChild(d);el.scrollTop=el.scrollHeight;
+}
+function clearLog(){document.getElementById('log').innerHTML=''}
+function setStatus(t,k){
+    document.getElementById('statusBar').className='status '+k;
+    document.getElementById('statusTxt').textContent=t;
+}
+function setStat(id,v){document.getElementById(id).textContent=v}
+function switchTab(t){
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(x=>x.classList.remove('active'));
+    document.getElementById('tab-'+t).classList.add('active');
+    document.getElementById('content-'+t).classList.add('active');
+}
+
+function interesting(msg){
+    _interesting++;
+    setStat('statInt',_interesting);
+    log('[!!!] INTERESTING: '+msg,'warn');
+}
+
+function tick(name, dt){
+    _tests++;
+    setStat('statTests',_tests);
+    setStat('statCurrent',name);
+    if(dt>2000){
+        const slow=document.getElementById('statSlow').textContent;
+        if(slow==='—'||dt>parseFloat(slow)){
+            setStat('statSlow',dt.toFixed(0)+'ms ('+name+')');
+        }
+        interesting(name+' took '+dt.toFixed(0)+'ms — possible hang/recursion');
+    }
+}
+
+const payload = document.getElementById('svgPayload');
+
+// ================================================================
+// SVG FILTER ATTACK SURFACES
+// ================================================================
+
+// 1. Deeply chained SVG filter references (feFlood→feComposite loop)
+async function testFilterChain(){
+    log('[*] Test 1: Deep filter chain recursion...','dim');
+    payload.innerHTML='';
+
+    let defs='<defs>';
+    // Chain N filters where each references the previous
+    const N=200;
+    for(let i=0;i<N;i++){
+        defs+=`<filter id="f${i}">
+            <feFlood flood-color="red" result="r${i}"/>
+            <feComposite in="r${i}" in2="${i>0?'r'+(i-1):'SourceGraphic'}" operator="over"/>
+            <feGaussianBlur stdDeviation="${i%5+1}"/>
+        </filter>`;
+    }
+    defs+='</defs>';
+
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        ${defs}
+        <rect width="100" height="100" filter="url(#f${N-1})" fill="blue"/>
+    </svg>`;
+
+    const T=performance.now();
+    payload.innerHTML=svg;
+    try{
+        const h=payload.querySelector('svg').getBoundingClientRect();
+        const dt=performance.now()-T;
+        log('[1] Filter chain: '+dt.toFixed(1)+'ms','ok');
+        tick('filter-chain',dt);
+    }catch(e){
+        log('[1] threw: '+e.message,'err');
+        interesting('filter-chain threw: '+e.message);
+    }
+    payload.innerHTML='';
+}
+
+// 2. Circular filter reference (filter references itself)
+async function testCircularFilter(){
+    log('[*] Test 2: Circular filter reference...','dim');
+    payload.innerHTML='';
+
+    // Two filters referencing each other
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <defs>
+            <filter id="fa">
+                <feImage href="#svg_with_fb" result="img"/>
+                <feComposite in="img" in2="SourceGraphic"/>
+            </filter>
+            <filter id="fb">
+                <feImage href="#svg_with_fa" result="img"/>
+                <feComposite in="img" in2="SourceGraphic"/>
+            </filter>
+        </defs>
+        <g id="svg_with_fa">
+            <rect width="50" height="50" filter="url(#fa)" fill="red"/>
+        </g>
+        <g id="svg_with_fb">
+            <rect x="50" y="50" width="50" height="50" filter="url(#fb)" fill="blue"/>
+        </g>
+    </svg>`;
+
+    const T=performance.now();
+    payload.innerHTML=svg;
+    try{
+        const h=payload.querySelector('svg').getBoundingClientRect();
+        const dt=performance.now()-T;
+        log('[2] Circular filter: '+dt.toFixed(1)+'ms','ok');
+        tick('circular-filter',dt);
+    }catch(e){
+        log('[2] threw: '+e.message,'err');
+        interesting('circular-filter: '+e.message);
+    }
+    payload.innerHTML='';
+}
+
+// 3. SVG filter on deeply nested SVG elements
+async function testNestedSVGFilter(){
+    log('[*] Test 3: Nested SVG + filter recursion...','dim');
+    payload.innerHTML='';
+
+    let html='<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="blur"><feGaussianBlur stdDeviation="2"/></filter></defs>';
+    const DEPTH=300;
+    for(let i=0;i<DEPTH;i++){
+        html+=`<svg x="${i%10}" y="${i%10}" width="${100-i%50}" height="${100-i%50}" filter="url(#blur)">`;
+    }
+    html+='<rect width="10" height="10" fill="red"/>';
+    for(let i=0;i<DEPTH;i++) html+='</svg>';
+    html+='</svg>';
+
+    const T=performance.now();
+    payload.innerHTML=html;
+    try{
+        const el=payload.querySelector('svg');
+        const h=el.getBoundingClientRect();
+        const dt=performance.now()-T;
+        log('[3] Nested SVG filter: '+dt.toFixed(1)+'ms','ok');
+        tick('nested-svg-filter',dt);
+    }catch(e){
+        log('[3] threw: '+e.message,'err');
+        interesting('nested-svg-filter: '+e.message);
+    }
+    payload.innerHTML='';
+}
+
+// 4. feImage referencing another SVG element with filter
+async function testFeImageRecursion(){
+    log('[*] Test 4: feImage self-reference recursion...','dim');
+    payload.innerHTML='';
+
+    // feImage pointing at an element that has a filter
+    // which itself uses feImage pointing back
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
+        <defs>
+            <filter id="f1" x="0" y="0" width="200%" height="200%">
+                <feImage href="#target" x="0" y="0" width="200" height="200" result="img"/>
+                <feTurbulence type="fractalNoise" baseFrequency="0.5" numOctaves="4" result="noise"/>
+                <feDisplacementMap in="img" in2="noise" scale="50" xChannelSelector="R" yChannelSelector="G"/>
+            </filter>
+        </defs>
+        <g id="target" filter="url(#f1)">
+            <rect width="200" height="200" fill="blue"/>
+            <circle cx="100" cy="100" r="50" fill="red"/>
+            <text x="50" y="100" font-size="20">Hello</text>
+        </g>
+    </svg>`;
+
+    const T=performance.now();
+    payload.innerHTML=svg;
+    try{
+        const h=payload.querySelector('svg').getBoundingClientRect();
+        const dt=performance.now()-T;
+        log('[4] feImage recursion: '+dt.toFixed(1)+'ms','ok');
+        tick('feImage-recursion',dt);
+    }catch(e){
+        log('[4] threw: '+e.message,'err');
+        interesting('feImage-recursion: '+e.message);
+    }
+    payload.innerHTML='';
+}
+
+// 5. Animated SVG filter values during layout
+async function testAnimatedFilter(){
+    log('[*] Test 5: Animated filter during layout...','dim');
+    payload.innerHTML='';
+
+    // SMIL animation changing filter params rapidly
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <defs>
+            <filter id="animated">
+                <feGaussianBlur stdDeviation="0">
+                    <animate attributeName="stdDeviation" values="0;50;0" dur="0.001s" repeatCount="indefinite"/>
+                </feGaussianBlur>
+                <feColorMatrix type="saturate" values="0">
+                    <animate attributeName="values" values="0;10;0" dur="0.001s" repeatCount="indefinite"/>
+                </feColorMatrix>
+                <feDisplacementMap scale="0">
+                    <animate attributeName="scale" values="0;200;0" dur="0.001s" repeatCount="indefinite"/>
+                </feDisplacementMap>
+            </filter>
+        </defs>
+        <rect width="100" height="100" filter="url(#animated)" fill="green"/>
+    </svg>`;
+
+    const T=performance.now();
+    payload.innerHTML=svg;
+    await sleep(200); // Let animation run
+    try{
+        const h=payload.querySelector('svg').getBoundingClientRect();
+        const dt=performance.now()-T;
+        log('[5] Animated filter: '+dt.toFixed(1)+'ms','ok');
+        tick('animated-filter',dt);
+    }catch(e){
+        log('[5] threw: '+e.message,'err');
+        interesting('animated-filter: '+e.message);
+    }
+    payload.innerHTML='';
+}
+
+// 6. SVG clip-path recursion
+async function testClipPathRecursion(){
+    log('[*] Test 6: ClipPath recursion...','dim');
+    payload.innerHTML='';
+
+    let defs='<defs>';
+    const N=200;
+    for(let i=0;i<N;i++){
+        defs+=`<clipPath id="cp${i}">
+            <rect width="${100-i%90}" height="${100-i%90}" 
+                  clip-path="${i>0?'url(#cp'+(i-1)+')'+'':'none'}"/>
+        </clipPath>`;
+    }
+    defs+='</defs>';
+
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        ${defs}
+        <rect width="100" height="100" fill="red" clip-path="url(#cp${N-1})"/>
+    </svg>`;
+
+    const T=performance.now();
+    payload.innerHTML=svg;
+    try{
+        const h=payload.querySelector('svg').getBoundingClientRect();
+        const dt=performance.now()-T;
+        log('[6] ClipPath recursion: '+dt.toFixed(1)+'ms','ok');
+        tick('clippath-recursion',dt);
+    }catch(e){
+        log('[6] threw: '+e.message,'err');
+        interesting('clippath-recursion: '+e.message);
+    }
+    payload.innerHTML='';
+}
+
+// 7. SVG mask + filter combination
+async function testMaskFilter(){
+    log('[*] Test 7: Mask + filter deep chain...','dim');
+    payload.innerHTML='';
+
+    let defs='<defs>';
+    const N=150;
+    for(let i=0;i<N;i++){
+        defs+=`
+        <mask id="m${i}">
+            <rect width="100" height="100" fill="white" 
+                  filter="${i>0?'url(#mf'+(i-1)+')':'none'}"/>
+        </mask>
+        <filter id="mf${i}">
+            <feGaussianBlur stdDeviation="${(i%5)+0.5}"/>
+            <feComposite in2="SourceAlpha" operator="in"/>
+        </filter>`;
+    }
+    defs+='</defs>';
+
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        ${defs}
+        <rect width="100" height="100" fill="blue" mask="url(#m${N-1})"/>
+    </svg>`;
+
+    const T=performance.now();
+    payload.innerHTML=svg;
+    try{
+        const h=payload.querySelector('svg').getBoundingClientRect();
+        const dt=performance.now()-T;
+        log('[7] Mask+filter chain: '+dt.toFixed(1)+'ms','ok');
+        tick('mask-filter-chain',dt);
+    }catch(e){
+        log('[7] threw: '+e.message,'err');
+        interesting('mask-filter-chain: '+e.message);
+    }
+    payload.innerHTML='';
+}
+
+// 8. feTurbulence + feDisplacementMap extreme values
+async function testTurbulenceOOB(){
+    log('[*] Test 8: feTurbulence extreme values...','dim');
+    payload.innerHTML='';
+
+    // Extreme values that could cause OOB in filter processing
+    const extremeValues=[
+        {bd:'0.000001', oct:'99', scale:'999999'},
+        {bd:'99999',    oct:'1',  scale:'0.000001'},
+        {bd:'NaN',      oct:'8',  scale:'100'},
+        {bd:'Infinity', oct:'4',  scale:'50'},
+        {bd:'-1',       oct:'0',  scale:'-999'},
+    ];
+
+    for(let i=0;i<extremeValues.length;i++){
+        const {bd,oct,scale}=extremeValues[i];
+        const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <defs>
+                <filter id="t${i}">
+                    <feTurbulence type="turbulence" baseFrequency="${bd}"
+                        numOctaves="${oct}" seed="${i*12345}" result="t"/>
+                    <feDisplacementMap in="SourceGraphic" in2="t"
+                        scale="${scale}" xChannelSelector="R" yChannelSelector="G"/>
+                </filter>
+            </defs>
+            <rect width="100" height="100" fill="red" filter="url(#t${i})"/>
+        </svg>`;
+
+        const T=performance.now();
+        payload.innerHTML=svg;
+        try{
+            const h=payload.querySelector('svg').getBoundingClientRect();
+            const dt=performance.now()-T;
+            if(dt>500) log('[8.'+i+'] Turbulence ('+bd+','+oct+'): '+dt.toFixed(0)+'ms','warn');
+            else log('[8.'+i+'] Turbulence ('+bd+','+oct+'): '+dt.toFixed(1)+'ms','dim');
+            tick('turbulence-'+i,dt);
+        }catch(e){
+            log('[8.'+i+'] threw: '+e.message,'err');
+            interesting('turbulence OOB: '+e.message+' (bd='+bd+' oct='+oct+')');
+        }
+        payload.innerHTML='';
+        await sleep(50);
+    }
+}
+
+// ================================================================
+// DEEP CRASH TEST — max depth attempt
+// ================================================================
+async function runCrashTest(){
+    const btn=document.getElementById('crashBtn');
+    btn.disabled=true;
+    clearLog();
+    setStatus('RUNNING DEEP CRASH TEST...','running');
+
+    log('=== Deep SVG Filter Crash Test ===','ok');
+    log('Pushing filter recursion to maximum depth...','dim');
+    log('─'.repeat(44),'dim');
+
+    // Build maximum depth filter chain
+    // More aggressive than runAll version
+    const depths=[300, 500, 700, 1000];
+
+    for(const depth of depths){
+        log('[*] Trying depth: '+depth+'...','dim');
+        payload.innerHTML='';
+
+        let defs='<defs>';
+        for(let i=0;i<depth;i++){
+            defs+=`<filter id="df${i}" x="-50%" y="-50%" width="200%" height="200%">
+                <feGaussianBlur stdDeviation="${(i%3)+1}" result="blur${i}"/>
+                <feComposite in="blur${i}" in2="${i>0?'blur'+(i-1):'SourceGraphic'}" operator="over"/>
+                <feColorMatrix type="saturate" values="${(i%5)+1}"/>
+            </filter>`;
+        }
+        defs+='</defs>';
+
+        const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
+            ${defs}
+            <rect width="200" height="200" filter="url(#df${depth-1})" fill="red"/>
+            <circle cx="100" cy="100" r="50" filter="url(#df${Math.floor(depth/2)})" fill="blue"/>
+        </svg>`;
+
+        const T=performance.now();
+        payload.innerHTML=svg;
+        try{
+            // Force synchronous layout
+            const el=payload.querySelector('svg');
+            const rect=el.getBoundingClientRect();
+            const scrollH=el.scrollHeight;
+            const dt=performance.now()-T;
+            log('[depth='+depth+'] Layout: '+dt.toFixed(1)+'ms rect='+rect.width+'x'+rect.height,'ok');
+
+            if(dt>3000){
+                interesting('depth='+depth+' took '+dt.toFixed(0)+'ms — near crash');
+            }
+            tick('deep-filter-'+depth,dt);
+        }catch(e){
+            log('[depth='+depth+'] THREW: '+e.message,'err');
+            interesting('depth='+depth+' threw: '+e.message);
+        }
+
+        payload.innerHTML='';
+        await sleep(200);
+    }
+
+    // Also test: SVG inside CSS that's inside SVG
+    log()
+    log('[*] Testing SVG-in-CSS-in-SVG recursion...','dim');
+    payload.innerHTML='';
+    try{
+        let html='<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><defs><filter id="big"><feGaussianBlur stdDeviation="2"/></filter></defs>';
+        // Nest 500 foreignObject elements each with SVG
+        for(let i=0;i<100;i++){
+            html+=`<foreignObject x="${i%50}" y="${i%50}" width="${200-i%150}" height="${200-i%150}">
+                <div xmlns="http://www.w3.org/1999/xhtml" style="display:flex;width:100%;height:100%;filter:blur(${i%5}px)">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%">
+                        <rect width="100%" height="100%" fill="hsl(${i*3},70%,50%)" filter="url(#big)"/>
+                    </svg>
+                </div>
+            </foreignObject>`;
+        }
+        html+='</svg>';
+
+        const T=performance.now();
+        payload.innerHTML=html;
+        const el=payload.querySelector('svg');
+        const dt=performance.now()-T;
+        log('[SVG-in-CSS-in-SVG] '+dt.toFixed(1)+'ms','ok');
+        tick('svg-css-svg',dt);
+        if(dt>2000) interesting('SVG-in-CSS-in-SVG hung '+dt.toFixed(0)+'ms');
+    }catch(e){
+        log('[SVG-in-CSS-in-SVG] threw: '+e.message,'err');
+        interesting('SVG-in-CSS-in-SVG: '+e.message);
+    }
+    payload.innerHTML='';
+
+    log('─'.repeat(44),'dim');
+    if(_interesting>0){
+        log('[!!!] '+_interesting+' interesting finds — CHECK ANALYTICS','warn');
+        setStatus('INTERESTING FINDS — CHECK ANALYTICS','crashed');
+    }else{
+        log('[*] No crashes — check Analytics anyway','dim');
+        setStatus('DONE — CHECK ANALYTICS DATA','idle');
+    }
+    btn.disabled=false;
+}
+
+// ================================================================
+// RUN ALL
+// ================================================================
+async function runAll(){
+    const btn=document.getElementById('runAllBtn');
+    btn.disabled=true;
+    clearLog();
+    _tests=0;_interesting=0;
+    setStat('statTests',0);setStat('statInt',0);setStat('statSlow','—');
+    setStatus('RUNNING ALL SVG TESTS...','running');
+
+    log('=== SVG Filter Fuzzer ===','ok');
+    log('iOS 26.5.2 · 8 attack surfaces · different renderer than CSS','dim');
+    log('─'.repeat(44),'dim');
+
+    await testFilterChain();   await sleep(100);
+    await testCircularFilter(); await sleep(100);
+    await testNestedSVGFilter(); await sleep(100);
+    await testFeImageRecursion(); await sleep(100);
+    await testAnimatedFilter(); await sleep(300);
+    await testClipPathRecursion(); await sleep(100);
+    await testMaskFilter(); await sleep(100);
+    await testTurbulenceOOB(); await sleep(100);
+
+    log('─'.repeat(44),'dim');
+    log('[*] All tests complete: '+_tests+' run, '+_interesting+' interesting','dim');
+
+    if(_interesting>0){
+        log('[!!!] Check Analytics Data for WebContent crash','warn');
+        setStatus('FINDS: '+_interesting+' — CHECK ANALYTICS','crashed');
+    }else{
+        log('[*] No obvious crashes — try Deep Crash Test','dim');
+        setStatus('DONE — TRY DEEP CRASH TEST','idle');
+    }
+
+    btn.disabled=false;
+}
+
+setStatus('READY — FRESH ATTACK SURFACE','idle');
+log('SVG Filter Fuzzer loaded','ok');
+log('8 tests: filter chain, circular, nested, feImage,','dim');
+log('animated, clippath, mask+filter, turbulence OOB','dim');
+log('Tap Run All or Deep Crash Test','dim');
+</script>
+</body>
+</html>
